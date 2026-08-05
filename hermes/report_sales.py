@@ -28,6 +28,9 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
     lines.append(f"📊 Продажи {period_str} ({days} дн.){store_label}")
+    if store_name == "СОБРАНИЕ":
+        lines.append("ℹ️ СОБРАНИЕ работает через перемещения — прибыль считается "
+                     "по отгрузкам, поступление товара см. в «🔄 Перемещения».")
     lines.append("")
 
     # ── Итоги по складам ──

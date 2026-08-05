@@ -26,6 +26,7 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
     "expenses": ["period", "store"],  # фильтр по складу через project_name
+    "move":     ["period", "store"],  # перемещения между складами
     "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
     "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
@@ -39,6 +40,7 @@ _SECTION_TITLE = {
     "loss":     "🗑 Списания",
     "reserves": "🎯 Резервы",
     "expenses": "💸 Расходы",
+    "move":     "🔄 Перемещения",
     "audit":    "🔍 Изменения",
     "clients":  "👥 Клиенты",
     "forecast": "🛒 Прогноз",
@@ -52,6 +54,7 @@ _BUTTON_TO_SECTION = {
     "🗑 списания":   "loss",
     "🎯 резервы":    "reserves",
     "💸 расходы":    "expenses",
+    "🔄 перемещения": "move",
     "🔍 изменения":  "audit",
     "👥 клиенты":    "clients",
     "🛒 прогноз":    "forecast",
@@ -87,6 +90,7 @@ _HELP_TEXT = """\
   🗑 Списания   — все документы с позициями
   🎯 Резервы    — товары отложены под клиента
   💸 Расходы    — все платежи за период
+  🔄 Перемещения — движение товара между складами
   📄 Отчёт PDF  — полный отчёт одним файлом
 
 Клавиатуру можно скрыть стрелкой ↓ внизу
@@ -360,6 +364,9 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "expenses":
             text = _run_expenses(conn_factory, client_factory, d_from, d_to, store_name,
                                  bot_token, chat_id)
+        elif section == "move":
+            text = _run_move(conn_factory, client_factory, d_from, d_to, store_name,
+                             bot_token, chat_id)
         elif section == "clients":
             text = _run_clients(conn_factory, client_factory, d_from, d_to, store_name,
                                 bot_token, chat_id)
@@ -476,6 +483,22 @@ def _run_expenses(conn_factory, client_factory, d_from, d_to, store_name, bot_to
             tg.send_message(bot_token, chat_id, "⏳ Подгружаю платежи из МойСклад…")
             etl_cashflow(client, conn, d_from, d_to)
     return build_expenses_report(conn, d_from, d_to, store_name)
+
+
+def _run_move(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
+    from .etl_move import run as etl_move
+    from .report_move import build_move_report
+    conn   = conn_factory()
+    client = client_factory()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s",
+            (d_from, d_to),
+        )
+        if cur.fetchone()[0] == 0:
+            tg.send_message(bot_token, chat_id, "⏳ Подгружаю перемещения из МойСклад…")
+            etl_move(client, conn, d_from, d_to)
+    return build_move_report(conn, d_from, d_to, store_name)
 
 
 def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):

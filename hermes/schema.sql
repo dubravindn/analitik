@@ -203,3 +203,36 @@ INSERT INTO holiday (holiday_date, name, lead_days, fallback_multiplier) VALUES
     ('2027-11-28', 'День матери',      2, 2.0),
     ('2027-12-31', 'Новый год',        3, 2.0)
 ON CONFLICT (holiday_date) DO NOTHING;
+
+-- Перемещения между складами (/entity/move).
+-- Канал «ресторан» (СОБРАНИЕ) работает через перемещения, поэтому без них
+-- цифры по СОБРАНИЮ недостоверны, а управленческая прибыль невозможна.
+CREATE TABLE IF NOT EXISTS move_doc (
+    doc_id           text        PRIMARY KEY,
+    moment           timestamptz NOT NULL,
+    day              date        NOT NULL,
+    store_from_id    text        NOT NULL DEFAULT '',
+    store_from_name  text        NOT NULL DEFAULT '',
+    store_to_id      text        NOT NULL DEFAULT '',
+    store_to_name    text        NOT NULL DEFAULT '',
+    description      text,
+    total_kop        bigint      NOT NULL DEFAULT 0,   -- сумма перемещения (по себест.)
+    synced_at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- Перемещения: позиции
+CREATE TABLE IF NOT EXISTS move_item (
+    doc_id       text        NOT NULL REFERENCES move_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_name text        NOT NULL,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    cost_kop     bigint      NOT NULL DEFAULT 0,   -- себест. единицы в копейках
+    total_kop    bigint      NOT NULL DEFAULT 0,   -- qty × cost
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_move_doc_day       ON move_doc (day);
+CREATE INDEX IF NOT EXISTS ix_move_doc_from       ON move_doc (store_from_id, day);
+CREATE INDEX IF NOT EXISTS ix_move_doc_to         ON move_doc (store_to_id, day);
+CREATE INDEX IF NOT EXISTS ix_move_item_product   ON move_item (product_name);

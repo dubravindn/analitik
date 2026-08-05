@@ -22,6 +22,7 @@ from .etl_loss import run as run_sync_loss
 from .etl_supply import run as run_sync_supply
 from .etl_cashflow import run as run_sync_cashflow
 from .etl_clients import run as run_sync_clients
+from .etl_move import run as run_sync_move
 from .logging_setup import setup
 from .moysklad import MoyskladClient
 from .report_sales import build_day_report
@@ -30,6 +31,7 @@ from .report_loss import build_loss_report
 from .report_supply import build_supply_report
 from .report_cashflow import build_cashflow_report
 from .report_employees import build_employee_report
+from .report_move import build_move_report
 
 
 def _parse_date(s: str) -> date:
@@ -79,6 +81,10 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_clients.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_sync_clients.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
+    p_sync_move = sub.add_parser("sync-move", help="Выгрузить перемещения за период")
+    p_sync_move.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_move.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
     p_rep_loss = sub.add_parser("report-loss", help="Отчёт по списаниям (в stdout)")
     p_rep_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_rep_loss.add_argument("--to", dest="d_to", required=True, type=_parse_date)
@@ -90,6 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     p_rep_cf = sub.add_parser("report-cashflow", help="Отчёт ДДС (в stdout)")
     p_rep_cf.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_rep_cf.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_rep_move = sub.add_parser("report-move", help="Отчёт по перемещениям (в stdout)")
+    p_rep_move.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_rep_move.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+    p_rep_move.add_argument("--store", dest="store", default=None)
 
     p_rep_emp = sub.add_parser("report-employees", help="Аналитика сотрудников (в stdout)")
     p_rep_emp.add_argument("--from", dest="d_from", required=True, type=_parse_date)
@@ -188,6 +199,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Выгружено отгрузок: {n} документов за {args.d_from}..{args.d_to}")
         return 0
 
+    if args.cmd == "sync-move":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_move(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено перемещений: {n} документов за {args.d_from}..{args.d_to}")
+        return 0
+
     if args.cmd == "report-loss":
         conn = db.connect(config.DATABASE_URL())
         print(build_loss_report(conn, args.d_from, args.d_to))
@@ -201,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report-cashflow":
         conn = db.connect(config.DATABASE_URL())
         print(build_cashflow_report(conn, args.d_from, args.d_to))
+        return 0
+
+    if args.cmd == "report-move":
+        conn = db.connect(config.DATABASE_URL())
+        print(build_move_report(conn, args.d_from, args.d_to, args.store))
         return 0
 
     if args.cmd == "report-employees":
