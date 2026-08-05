@@ -62,10 +62,10 @@ def test_loss_header_equals_total():
             return []
         if "i.product_name, SUM" in sql:                    # топ
             return [("Роза", 500, 4_940_000)]
-        if "d.doc_id, d.moment" in sql:                     # документы
-            return [("doc1", None, "Склад", "", "")]
-        if "product_name, qty, cost_kop" in sql:            # позиции (мелкая сумма!)
-            return [("Лента", 5, 1900, 9500)]
+        if "d.doc_id, d.moment" in sql:                     # документы (+d.day = 6 колонок)
+            return [("doc1", None, date(2026, 8, 1), "Склад", "", "")]
+        if "i.cost_kop, i.total_kop" in sql:                # позиции +pp.price_kop (5 колонок)
+            return [("Лента", 5, 1900, 9500, 1900)]
         return []
     text = report_loss.build_loss_report(_Conn(script), date(2026, 8, 1), date(2026, 8, 5))
     h, t = _header_and_total(text)
