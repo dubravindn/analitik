@@ -112,7 +112,7 @@ def build_cashflow_report(conn, d_from: date, d_to: date) -> str:
     return "\n".join(lines)
 
 
-def build_expenses_report(conn, d_from: date, d_to: date) -> str:
+def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
     """Расходы: только исходящие платежи (cashout + paymentout) со статьёй расходов."""
     period_str = (
         d_from.strftime("%d.%m.%Y") if d_from == d_to
@@ -123,12 +123,20 @@ def build_expenses_report(conn, d_from: date, d_to: date) -> str:
     lines.append("(кассовые и банковские исходящие документы)")
     lines.append("")
 
+    if store_name:
+        _proj_filter = "AND project_name = %s"
+        _extra: tuple = (store_name,)
+    else:
+        _proj_filter = "AND project_name IS NOT NULL AND project_name != ''"
+        _extra = ()
+
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT SUM(amount_kop), COUNT(*)
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
-        """, (d_from, d_to))
+            {_proj_filter}
+        """, (d_from, d_to) + _extra)
         row = cur.fetchone()
         out_kop = float(row[0] or 0)
         out_cnt = int(row[1] or 0)
@@ -142,14 +150,15 @@ def build_expenses_report(conn, d_from: date, d_to: date) -> str:
 
     # Разбивка по статьям расходов
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT COALESCE(NULLIF(expense_item_name, ''), 'Без статьи'),
                    SUM(amount_kop), COUNT(*)
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
+            {_proj_filter}
             GROUP BY 1
             ORDER BY 2 DESC
-        """, (d_from, d_to))
+        """, (d_from, d_to) + _extra)
         by_item = cur.fetchall()
 
     if len(by_item) > 1:
@@ -160,14 +169,15 @@ def build_expenses_report(conn, d_from: date, d_to: date) -> str:
 
     # Разбивка по проектам (склад/подразделение)
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COALESCE(NULLIF(project_name, ''), 'Без проекта'),
+        cur.execute(f"""
+            SELECT project_name,
                    SUM(amount_kop), COUNT(*)
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
+            {_proj_filter}
             GROUP BY 1
             ORDER BY 2 DESC
-        """, (d_from, d_to))
+        """, (d_from, d_to) + _extra)
         by_project = cur.fetchall()
 
     if len(by_project) > 1:
@@ -178,13 +188,14 @@ def build_expenses_report(conn, d_from: date, d_to: date) -> str:
 
     # Каждый документ
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT moment, doc_type, agent_name, description,
                    expense_item_name, project_name, amount_kop
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
+            {_proj_filter}
             ORDER BY moment
-        """, (d_from, d_to))
+        """, (d_from, d_to) + _extra)
         out_docs = cur.fetchall()
 
     lines.append(f"── 📋 Документы ({len(out_docs)}) ──")

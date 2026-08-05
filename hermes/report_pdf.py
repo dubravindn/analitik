@@ -180,6 +180,6 @@ def build_pdf(
 
     # ── Секция 5: Расходы ──────────────────────────────────────────────────────
     from .report_cashflow import build_expenses_report
-    _section("5. РАСХОДЫ", build_expenses_report(conn, d_from, d_to))
+    _section("5. РАСХОДЫ", build_expenses_report(conn, d_from, d_to, store_name))
 
     return bytes(pdf.output())

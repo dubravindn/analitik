@@ -358,7 +358,7 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
             text = _run_reserves(conn_factory, client_factory, d_from, store_name,
                                  bot_token, chat_id)
         elif section == "expenses":
-            text = _run_expenses(conn_factory, client_factory, d_from, d_to,
+            text = _run_expenses(conn_factory, client_factory, d_from, d_to, store_name,
                                  bot_token, chat_id)
         elif section == "clients":
             text = _run_clients(conn_factory, client_factory, d_from, d_to, store_name,
@@ -462,7 +462,7 @@ def _run_audit(client_factory, d_from, d_to, bot_token, chat_id):
     return build_audit_report(client, d_from, d_to)
 
 
-def _run_expenses(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
+def _run_expenses(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_cashflow import run as etl_cashflow
     from .report_cashflow import build_expenses_report
     conn   = conn_factory()
@@ -475,7 +475,7 @@ def _run_expenses(conn_factory, client_factory, d_from, d_to, bot_token, chat_id
         if cur.fetchone()[0] == 0:
             tg.send_message(bot_token, chat_id, "⏳ Подгружаю платежи из МойСклад…")
             etl_cashflow(client, conn, d_from, d_to)
-    return build_expenses_report(conn, d_from, d_to)
+    return build_expenses_report(conn, d_from, d_to, store_name)
 
 
 def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
