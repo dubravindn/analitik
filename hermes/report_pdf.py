@@ -96,11 +96,11 @@ def build_pdf(
     pdf.set_font("DejaVu", size=9)
     pdf.set_text_color(100, 100, 100)
     for s in [
-        "1. Продажи  — выручка, прибыль, топ позиций",
-        "2. Остатки  — свободный остаток на дату",
-        "3. Залежалые — позиции без движения",
-        "4. Списания — документы с позициями",
-        "5. Расходы  — движение денег",
+        "1. Продажи   — выручка, прибыль, топ позиций",
+        "2. Остатки   — СРЕЗКА без резерва на дату",
+        "3. Залежалые — СРЕЗКА без движения",
+        "4. Списания  — документы с позициями",
+        "5. Расходы   — движение денег",
     ]:
         pdf.set_x(_MARGIN)
         pdf.cell(eff_w, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
@@ -166,13 +166,13 @@ def build_pdf(
     from .report_sales import build_sales_analytics
     _section("1. ПРОДАЖИ", build_sales_analytics(conn, d_from, d_to, store_name))
 
-    # ── Секция 2: Остатки (на последний день периода) ──────────────────────────
+    # ── Секция 2: Остатки СРЕЗКА (на последний день периода) ──────────────────
     from .report_stock import build_stock_by_qty
-    _section("2. ОСТАТКИ", build_stock_by_qty(conn, d_to, store_name))
+    _section("2. ОСТАТКИ (СРЕЗКА)", build_stock_by_qty(conn, d_to, store_name, "СРЕЗКА"))
 
-    # ── Секция 3: Залежалые ────────────────────────────────────────────────────
+    # ── Секция 3: Залежалые СРЕЗКА ────────────────────────────────────────────
     from .report_stock import build_stock_report
-    _section("3. ЗАЛЕЖАЛЫЕ", build_stock_report(conn, d_to, store_name))
+    _section("3. ЗАЛЕЖАЛЫЕ (СРЕЗКА)", build_stock_report(conn, d_to, store_name, "СРЕЗКА"))
 
     # ── Секция 4: Списания ─────────────────────────────────────────────────────
     from .report_loss import build_loss_report

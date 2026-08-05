@@ -10,7 +10,7 @@ from .moysklad import MoyskladClient
 log = logging.getLogger("hermes.report_forecast")
 
 _PAGE = 100
-_PROJECT_KEYWORD = "ближайшие заказы"
+_PROJECT_KEYWORD = "ближайшая поставка"
 _STATE_KEYWORD   = "под заказ"
 
 

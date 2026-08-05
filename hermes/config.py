@@ -83,4 +83,4 @@ STORE_CHANNELS: dict[str, str] = {
 # Московские поставщики (точные имена контрагентов из МойСклад).
 # По этим именам определяются даты фургонов для прогноза закупки.
 # Заполнить после того, как посмотришь в supply_doc: SELECT DISTINCT agent_name FROM supply_doc
-MOSCOW_SUPPLIERS: list[str] = ["ООО Поставщик"]
+MOSCOW_SUPPLIERS: list[str] = ['ООО "Поставщик"']
