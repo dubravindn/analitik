@@ -86,7 +86,9 @@ def run(client: MoyskladClient, conn, day: date | None = None) -> int:
             # Пропускаем услуги и комплекты — только физические товары
             if not meta_href or "/entity/product/" not in meta_href:
                 continue
-            product_id = meta_href.split("/")[-1]
+            # href может содержать query-строку (…/{id}?expand=supplier) — отрезаем,
+            # иначе product_id не совпадёт с sales_by_product_day/supply_item.
+            product_id = meta_href.split("/")[-1].split("?")[0]
 
             stock_qty = float(r.get("stock", 0) or 0)
             if stock_qty <= 0:
