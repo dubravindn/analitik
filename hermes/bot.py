@@ -506,6 +506,8 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
     from .etl_stock import run as etl_stock
     from .etl_loss import run as etl_loss
     from .etl_cashflow import run as etl_cashflow
+    from .etl_clients import run as etl_clients
+    from .etl_move import run as etl_move
     from .report_pdf import build_pdf
     try:
         conn   = conn_factory()
@@ -541,8 +543,24 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
                 tg.send_message(bot_token, chat_id, "⏳ Загружаю платежи…")
                 etl_cashflow(client, conn, d_from, d_to)
 
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM sales_doc WHERE day BETWEEN %s AND %s", (d_from, d_to)
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю отгрузки (клиенты)…")
+                etl_clients(client, conn, d_from, d_to)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s", (d_from, d_to)
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю перемещения…")
+                etl_move(client, conn, d_from, d_to)
+
         tg.send_message(bot_token, chat_id, "📝 Формирую PDF…")
-        pdf_bytes = build_pdf(conn, d_from, d_to, store_name)
+        pdf_bytes = build_pdf(conn, client, d_from, d_to, store_name)
 
         period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
         filename    = f"hermes_{period_safe}.pdf"   # только ASCII, без кириллицы
