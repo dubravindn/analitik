@@ -19,10 +19,13 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     sf = "AND store_name = %s" if store_name else ""
     p  = [d_from, d_to] + ([store_name] if store_name else [])
 
-    # Сводка за период
+    # Сводка за период. Сумма — нетто (отгрузки минус возвраты); «заказы» —
+    # только отгрузки (возврат не заказ).
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COUNT(DISTINCT agent_id), COUNT(*), COALESCE(SUM(sum_kop), 0)
+            SELECT COUNT(DISTINCT agent_id),
+                   COUNT(*) FILTER (WHERE doc_type = 'demand'),
+                   COALESCE(SUM(sum_kop), 0)
             FROM sales_doc
             WHERE day BETWEEN %s AND %s {sf}
               AND agent_id IS NOT NULL AND agent_id != ''
@@ -45,7 +48,9 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     # Топ-20 по выручке за период
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT agent_name, COUNT(*) AS orders, SUM(sum_kop) AS rev
+            SELECT agent_name,
+                   COUNT(*) FILTER (WHERE doc_type = 'demand') AS orders,
+                   SUM(sum_kop) AS rev
             FROM sales_doc
             WHERE day BETWEEN %s AND %s {sf}
               AND agent_id IS NOT NULL AND agent_id != ''
@@ -74,7 +79,8 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
                 FROM (
                     SELECT DISTINCT agent_id, agent_name, day
                     FROM sales_doc
-                    WHERE channel = 'опт' AND day >= CURRENT_DATE - 180
+                    WHERE channel = 'опт' AND doc_type = 'demand'
+                      AND day >= CURRENT_DATE - 180
                 ) d
             ),
             avg_gap AS (
@@ -88,7 +94,7 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
             ),
             last_seen AS (
                 SELECT agent_id, MAX(day) AS last_day
-                FROM sales_doc WHERE channel = 'опт'
+                FROM sales_doc WHERE channel = 'опт' AND doc_type = 'demand'
                 GROUP BY agent_id
             )
             SELECT a.agent_name, a.avg_gap_days, l.last_day,

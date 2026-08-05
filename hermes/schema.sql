@@ -161,6 +161,9 @@ CREATE TABLE IF NOT EXISTS sales_doc (
 );
 ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS store_name text;
 ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS positions  integer NOT NULL DEFAULT 0;
+-- Тип документа: 'demand' (отгрузка) | 'salesreturn' (возврат, sum_kop < 0).
+-- Для нетто-сумм по клиенту и корректного детектора оттока (интервалы — только по demand).
+ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS doc_type text NOT NULL DEFAULT 'demand';
 
 CREATE INDEX IF NOT EXISTS ix_sales_doc_day   ON sales_doc (day);
 CREATE INDEX IF NOT EXISTS ix_sales_doc_agent ON sales_doc (agent_id, day);
