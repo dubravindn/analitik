@@ -16,6 +16,49 @@ def _qty(q: float) -> str:
     return f"{q:,.1f}".replace(",", " ")
 
 
+def _active_holiday(conn, d_from: date, d_to: date) -> str | None:
+    """Название праздника, чьё окно [дата − lead_days, дата] пересекает период."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT name FROM holiday
+            WHERE holiday_date >= %s AND (holiday_date - lead_days) <= %s
+            ORDER BY holiday_date LIMIT 1
+        """, (d_from, d_to))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _purchase_profit(conn, d_from: date, d_to: date,
+                     store_id: str | None = None) -> tuple[int, float, int]:
+    """Прибыль по закупочным ценам из приёмок за период (фолбэк на себест. МойСклад).
+
+    Returns (profit_kop, coverage_pct, revenue_kop). Цена берётся на дату продажи
+    (purchase_price_at); строки без приёмки считаются по cost_kop МойСклад.
+    """
+    sf = "AND spd.store_id = %s" if store_id else ""
+    params = [d_from, d_to] + ([store_id] if store_id else [])
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT spd.sell_qty, spd.revenue_kop, spd.cost_kop,
+                   (SELECT pp.price_kop FROM purchase_price_asof pp
+                    WHERE pp.product_id = spd.assortment_id AND pp.priced_from <= spd.day
+                    ORDER BY pp.priced_from DESC LIMIT 1)
+            FROM sales_by_product_day spd
+            WHERE spd.day BETWEEN %s AND %s {sf} AND spd.sell_qty > 0
+        """, params)
+        rows = cur.fetchall()
+    rev = pc = cov = 0
+    for q, rk, ck, pp in rows:
+        q = float(q); rk = int(rk or 0); ck = int(ck or 0)
+        rev += rk
+        if pp and pp > 0:
+            pc += round(q * int(pp)); cov += rk
+        else:
+            pc += ck
+    coverage = (cov / rev * 100) if rev else 0.0
+    return rev - pc, coverage, rev
+
+
 # ─── Основной аналитический отчёт: лучшие позиции ────────────────────────────
 
 def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
@@ -96,6 +139,28 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         f"  Прибыль от продаж: {_rub(gp_t)} ₽ ({mg_t:.0f}%)\n"
         f"  Чеков: {grand_chk} · Ср.чек: {_rub(ac_t)} ₽"
     )
+
+    # Праздничный триггер: в период смены цен (праздник в отчёте или в
+    # предшествующие lead_days) средневзвешенная себестоимость МойСклад завышает
+    # прибыль. Показываем рядом прибыль по закупочным ценам из приёмок + покрытие.
+    holiday = _active_holiday(conn, d_from, d_to)
+    if holiday:
+        store_id = None
+        if store_name:
+            with conn.cursor() as cur:
+                cur.execute("SELECT store_id FROM sales_by_store_day WHERE store_name=%s LIMIT 1",
+                            (store_name,))
+                r = cur.fetchone()
+                store_id = r[0] if r else None
+        pp_profit, pp_cov, pp_rev = _purchase_profit(conn, d_from, d_to, store_id)
+        if pp_rev > 0:
+            pp_margin = pp_profit / pp_rev * 100
+            lines.append(
+                f"  📅 «{holiday}» в окне — цены меняются, себест. МойСклад «размазана».\n"
+                f"     Прибыль по закупочным из приёмок: {_rub(pp_profit)} ₽ ({pp_margin:.0f}%)"
+                f" — точнее в период смены цен\n"
+                f"     Покрытие приёмками: {pp_cov:.0f}% выручки"
+            )
     lines.append("")
 
     # ── Топ товаров ──
