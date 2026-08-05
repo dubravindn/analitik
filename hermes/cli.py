@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
         db.apply_schema(conn)
-        snap_date = args.d or date.today()
+        snap_date = args.d or config.msk_today()
         n = run_sync_stock(client, conn, snap_date)
         print(f"Снимок остатков на {snap_date}: {n} позиций")
         return 0
@@ -253,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "daily":
-        today = date.today()
+        today = config.msk_today()
         yesterday = today - timedelta(days=1)
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())

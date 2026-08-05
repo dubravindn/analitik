@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from .moysklad import MoyskladClient
+from . import config
 
 log = logging.getLogger("hermes.etl_move")
 
@@ -74,10 +75,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         # moment приходит как "2026-07-01 12:34:00.000" без timezone
         try:
             moment = datetime.strptime(moment_str[:19], "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
+                tzinfo=config.MSK
             )
         except ValueError:
-            moment = datetime.now(timezone.utc)
+            moment = config.msk_now()
         doc_day = moment.date()
 
         src = doc.get("sourceStore", {}) or {}

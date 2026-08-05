@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from .moysklad import MoyskladClient
+from . import config
 
 log = logging.getLogger("hermes.etl_cashflow")
 
@@ -66,10 +67,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
             moment_str = doc.get("moment", "")
             try:
                 moment = datetime.strptime(moment_str[:19], "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
+                    tzinfo=config.MSK
                 )
             except ValueError:
-                moment = datetime.now(timezone.utc)
+                moment = config.msk_now()
             doc_day = moment.date()
 
             agent = doc.get("agent", {})

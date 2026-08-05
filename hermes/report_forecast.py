@@ -205,7 +205,7 @@ def _rub(kop: float) -> str:
 # ─── Главная функция ──────────────────────────────────────────────────────────
 
 def build_forecast_report(client: MoyskladClient, conn) -> str:
-    today = date.today()
+    today = config.msk_today()
     state_note = " · статус «Под заказ»" if True else ""
     lines: list[str] = ["🛒 Прогноз закупки — ближайшие заказы", ""]
 

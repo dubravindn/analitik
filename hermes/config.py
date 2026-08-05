@@ -9,7 +9,24 @@
 from __future__ import annotations
 
 import os
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+# Московская зона (UTC+3, без переходов на летнее время).
+# МойСклад отдаёт moment в московском времени без указания зоны, поэтому
+# помечаем именно MSK, а не UTC. Дата «сегодня» тоже считается по Москве —
+# иначе с 00:00 до 03:00 МСК кнопка «сегодня» показывала бы вчерашний день.
+MSK = timezone(timedelta(hours=3))
+
+
+def msk_now() -> datetime:
+    """Текущий момент в московской зоне."""
+    return datetime.now(MSK)
+
+
+def msk_today() -> date:
+    """Сегодняшняя дата по Москве."""
+    return msk_now().date()
 
 
 def _load_env_file(path: Path) -> None:

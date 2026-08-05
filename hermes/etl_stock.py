@@ -65,7 +65,7 @@ def run(client: MoyskladClient, conn, day: date | None = None) -> int:
     Возвращает суммарное количество записей.
     """
     if day is None:
-        day = date.today()
+        day = config.msk_today()
 
     folder_idx = _build_folder_index(client)
 

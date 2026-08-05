@@ -649,7 +649,7 @@ def _exec_employees(client_factory, d_from, d_to, bot_token, chat_id):
 # ─── вспомогательные ─────────────────────────────────────────────────────────
 
 def _parse_period_button(norm: str) -> tuple[date, date] | None:
-    today = date.today()
+    today = config.msk_today()
     code  = _PERIOD_BUTTONS.get(norm)
     if not code:
         return None
@@ -698,7 +698,7 @@ def _fmt_period(d_from: date | None, d_to: date | None) -> str:
 
 def _parse_last_n(args: list[str], n: int = 30) -> tuple[date, date]:
     if not args:
-        today = date.today()
+        today = config.msk_today()
         return today - timedelta(days=n - 1), today
     import re
     found = re.findall(r"\d{4}-\d{2}-\d{2}", " ".join(args))
@@ -712,7 +712,7 @@ def _parse_last_n(args: list[str], n: int = 30) -> tuple[date, date]:
             return d, d
     except ValueError:
         pass
-    today = date.today()
+    today = config.msk_today()
     return today - timedelta(days=n - 1), today
 
 
