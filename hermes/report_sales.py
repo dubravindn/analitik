@@ -28,6 +28,8 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
     lines.append(f"📊 Продажи {period_str} ({days} дн.){store_label}")
+    lines.append("Прибыль от продаж = выручка − себестоимость "
+                 "(без учёта расходов и списаний)")
     if store_name == "СОБРАНИЕ":
         lines.append("ℹ️ СОБРАНИЕ работает через перемещения — прибыль считается "
                      "по отгрузкам, поступление товара см. в «🔄 Перемещения».")
@@ -77,7 +79,7 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
             sa = calc.avg_check(rev, chk)
             lines.append(
                 f"  📍 {sn}\n"
-                f"     Выручка {_rub(rev)} ₽ · Прибыль {_rub(sp)} ₽ ({sm:.0f}%)\n"
+                f"     Выручка {_rub(rev)} ₽ · Приб. от продаж {_rub(sp)} ₽ ({sm:.0f}%)\n"
                 f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽"
             )
         lines.append(
@@ -91,7 +93,7 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     lines.append("── ИТОГО ──")
     lines.append(
         f"  Выручка: {_rub(grand_rev)} ₽\n"
-        f"  Прибыль: {_rub(gp_t)} ₽ ({mg_t:.0f}%)\n"
+        f"  Прибыль от продаж: {_rub(gp_t)} ₽ ({mg_t:.0f}%)\n"
         f"  Чеков: {grand_chk} · Ср.чек: {_rub(ac_t)} ₽"
     )
     lines.append("")
@@ -163,7 +165,7 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         top_profit = cur.fetchall()
 
     if top_profit:
-        lines.append("💎 Топ-10 по прибыли:")
+        lines.append("💎 Топ-10 по прибыли от продаж:")
         for i, (name, qty, rev, profit) in enumerate(top_profit, 1):
             mg = profit / rev * 100 if rev else 0
             lines.append(
