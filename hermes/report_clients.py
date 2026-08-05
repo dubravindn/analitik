@@ -101,8 +101,10 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
         """)
         churned = cur.fetchall()
 
+    lines.append("")
+    lines.append("⚠️ Возможный отток (оптовики):")
+    lines.append("Отток — всегда за последние 180 дней, не зависит от выбранного периода.")
     if churned:
-        lines.append("⚠️ Возможный отток (оптовики):")
         for name, avg_gap, last_day, days_since, ratio in churned:
             last_str = last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day)
             avg_str = f"{float(avg_gap):.0f}"
@@ -111,5 +113,7 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
                 f" ({int(days_since)} дн. назад, обычно кажд. {avg_str} дн."
                 f" — просрочка ×{float(ratio):.1f})"
             )
+    else:
+        lines.append("✅ Отставших оптовиков не обнаружено")
 
     return "\n".join(lines)
