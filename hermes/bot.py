@@ -25,7 +25,7 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "stale":    ["period", "store", "group"],
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
-    "expenses": ["period"],           # нет фильтра по складу у кассовых документов
+    "expenses": ["period", "store"],  # фильтр по складу через project_name
     "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
     "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
@@ -207,7 +207,7 @@ def _ask_step(
     if step == "period":
         if section in ("stale", "stock", "reserves"):
             prompt = f"{title}\n\n📅 На какую дату показать снимок остатков?"
-        elif section in ("expenses", "audit"):
+        elif section == "audit":
             prompt = f"{title}\n\n📅 За какой период?"
         elif section == "pdf":
             prompt = f"{title}\n\n📅 За какой период сформировать отчёт?"
@@ -320,8 +320,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     store_name   = params.get("store_name")    # None = все склады
     folder_group = params.get("folder_group")  # None = все группы
 
-    # Для expenses/audit — нет фильтра по складу
-    if section in ("expenses", "audit"):
+    # Для audit — нет фильтра по складу
+    if section == "audit":
         tg.send_message(bot_token, chat_id,
                         f"⏳ Запрашиваю данные…\nПериод: {_fmt_period(d_from, d_to)}")
     elif section == "pdf":

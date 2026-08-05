@@ -119,15 +119,20 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
         else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
     )
     lines: list[str] = []
-    lines.append(f"💸 Расходы {period_str}")
+    store_label = store_name or "Все склады"
+    lines.append(f"💸 Расходы {period_str} · {store_label}")
     lines.append("(кассовые и банковские исходящие документы)")
     lines.append("")
 
+    # Фильтр по складу.
+    #  • Конкретный склад → только его project_name.
+    #  • Все склады → БЕЗ фильтра: показываем все расходы, в т.ч. без проекта,
+    #    чтобы итог бился с ДДС. Расходы без проекта выделяем группой «Без проекта».
     if store_name:
         _proj_filter = "AND project_name = %s"
         _extra: tuple = (store_name,)
     else:
-        _proj_filter = "AND project_name IS NOT NULL AND project_name != ''"
+        _proj_filter = ""
         _extra = ()
 
     with conn.cursor() as cur:
@@ -167,22 +172,24 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
             lines.append(f"  {item_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
         lines.append("")
 
-    # Разбивка по проектам (склад/подразделение)
+    # Разбивка по проектам (склад/подразделение).
+    # Строки без проекта попадают в группу «⚠️ Без проекта», сортируем их в конец.
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT project_name,
-                   SUM(amount_kop), COUNT(*)
+            SELECT COALESCE(NULLIF(project_name, ''), '⚠️ Без проекта'),
+                   SUM(amount_kop), COUNT(*),
+                   (project_name IS NULL OR project_name = '') AS no_proj
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
             {_proj_filter}
-            GROUP BY 1
-            ORDER BY 2 DESC
+            GROUP BY 1, 4
+            ORDER BY no_proj ASC, 2 DESC
         """, (d_from, d_to) + _extra)
         by_project = cur.fetchall()
 
     if len(by_project) > 1:
         lines.append("── По проектам (складам) ──")
-        for proj_name, kop, cnt in by_project:
+        for proj_name, kop, cnt, _no_proj in by_project:
             lines.append(f"  📍 {proj_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
         lines.append("")
 
