@@ -259,22 +259,42 @@ def main(argv: list[str] | None = None) -> int:
         conn = db.connect(config.DATABASE_URL())
         db.apply_schema(conn)
 
-        # 1. Продажи за вчера
-        log.info("Выгрузка продаж за %s", yesterday)
-        run_sync(client, conn, yesterday, yesterday)
-        _send_telegram(build_day_report(conn, yesterday), log)
+        # 1. Сначала синкаем ВСЕ сущности за вчера (+ остатки на сегодня).
+        # Каждый синк изолирован: падение одного не останавливает остальные —
+        # иначе в истории появляются дыры (ложный отток клиентов и т.п.).
+        def _safe(name: str, fn, *a) -> None:
+            try:
+                log.info("daily-sync: %s", name)
+                fn(*a)
+            except Exception as e:
+                log.exception("daily-sync %s упал: %s", name, e)
 
-        # 2. Остатки на сегодня (утром — актуальный снимок)
-        log.info("Снимок остатков на %s", today)
-        run_sync_stock(client, conn, today)
-        _send_telegram(build_stock_report(conn, today), log)
+        _safe("продажи",     run_sync,          client, conn, yesterday, yesterday)
+        _safe("остатки",     run_sync_stock,    client, conn, today)
+        _safe("списания",    run_sync_loss,     client, conn, yesterday, yesterday)
+        _safe("ДДС",         run_sync_cashflow, client, conn, yesterday, yesterday)
+        _safe("клиенты",     run_sync_clients,  client, conn, yesterday, yesterday)
+        _safe("поставки",    run_sync_supply,   client, conn, yesterday, yesterday)
+        _safe("перемещения", run_sync_move,     client, conn, yesterday, yesterday)
 
-        # 3. Алерты по выручке за вчера
+        # 2. Потом отчёты и алерты (каждый тоже изолирован).
+        def _safe_send(name: str, build_fn) -> None:
+            try:
+                _send_telegram(build_fn(), log)
+            except Exception as e:
+                log.exception("daily-отчёт %s упал: %s", name, e)
+
+        _safe_send("продажи вчера", lambda: build_day_report(conn, yesterday))
+        _safe_send("остатки сегодня", lambda: build_stock_report(conn, today))
+
         from .alerts import build_alerts
-        alert_text = build_alerts(conn, yesterday)
-        if alert_text:
-            log.info("Отправляем алерт выручки")
-            _send_telegram(alert_text, log)
+        try:
+            alert_text = build_alerts(conn, yesterday)
+            if alert_text:
+                log.info("Отправляем алерт выручки")
+                _send_telegram(alert_text, log)
+        except Exception as e:
+            log.exception("daily-алерты упали: %s", e)
 
         return 0
 
