@@ -74,7 +74,16 @@ def _fetch_order_positions(client: MoyskladClient, order_id: str) -> list[dict]:
 
 # ─── БД: фургоны, категории, праздники ───────────────────────────────────────
 
-def _van_dates(conn, limit: int = 10) -> list[date]:
+def _van_dates(conn, limit: int = 10, cluster_gap: int = 2) -> list[date]:
+    """Даты приходов московского фургона (контрагенты MOSCOW_SUPPLIERS).
+
+    Одна машина дробится на несколько документов приёмки в течение нескольких
+    дней (плюс мелкие корректировки между рейсами), поэтому считать каждый
+    документ отдельной поставкой нельзя — иначе цикл выходит ~2 дня вместо
+    недели. Кластеризуем: приёмки в пределах cluster_gap календарных дней —
+    одна поставка, дата фургона = первый день кластера. Возвращаем последние
+    ~limit кластеров по возрастанию.
+    """
     suppliers = config.MOSCOW_SUPPLIERS
     if not suppliers:
         return []
@@ -82,10 +91,18 @@ def _van_dates(conn, limit: int = 10) -> list[date]:
         cur.execute("""
             SELECT DISTINCT day FROM supply_doc
             WHERE agent_name = ANY(%s)
-            ORDER BY day DESC
-            LIMIT %s
-        """, (suppliers, limit))
-        return sorted([r[0] for r in cur.fetchall()])
+            ORDER BY day
+        """, (suppliers,))
+        days = [r[0] for r in cur.fetchall()]
+    if not days:
+        return []
+    clusters: list[date] = [days[0]]   # первый день первого кластера
+    prev = days[0]
+    for d in days[1:]:
+        if (d - prev).days > cluster_gap:
+            clusters.append(d)         # разрыв больше окна → новый фургон
+        prev = d
+    return clusters[-limit:]
 
 
 def _categories(conn) -> list[str]:
@@ -207,7 +224,12 @@ def _rub(kop: float) -> str:
 def build_forecast_report(client: MoyskladClient, conn) -> str:
     today = config.msk_today()
     state_note = " · статус «Под заказ»" if True else ""
-    lines: list[str] = ["🛒 Прогноз закупки — ближайшие заказы", ""]
+    lines: list[str] = [
+        "🛒 Прогноз закупки",
+        f"Прогноз. Основан на заказах в проекте «{_PROJECT_KEYWORD}» и остатках "
+        f"на {today.strftime('%d.%m.%Y')}. Не учитывает незафиксированные договорённости.",
+        "",
+    ]
 
     # ── 1. Заказы проект «Ближайшие заказы» + статус «Под заказ» ────────────
     project_href = _find_project_href(client)
@@ -269,6 +291,8 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
 
                 total_ordered = sum(d["qty"]     for d in demand.values())
                 total_kop     = sum(d["sum_kop"] for d in demand.values())
+                lines.append("═══ ПОД ОФОРМЛЕННЫЕ ЗАКАЗЫ ═══")
+                lines.append("(дефицит по уже оформленным заказам клиентов, не средний расход)")
                 lines.append(f"Всего заказано: {_qty(total_ordered)} ед. · ≈{_rub(total_kop)} ₽")
                 lines.append("")
 
@@ -312,10 +336,11 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
         next_van  = last_van + timedelta(days=avg_cycle)
         days_left = (next_van - today).days
 
-        lines.append("── Категорийный прогноз по циклам ──")
+        lines.append("═══ ПРОГНОЗ ПО СРЕДНЕМУ РАСХОДУ ═══")
+        lines.append("(сколько брать под цикл фургона, по среднему расходу категории)")
         lines.append(
             f"  Последняя приемка: {last_van.strftime('%d.%m.%Y')}"
-            f" | Цикл: ~{avg_cycle} дн."
+            f" | Цикл фургона: ~{avg_cycle} дн. (еженедельно)"
             f" | Следующая: ~{next_van.strftime('%d.%m.%Y')}"
             f" (через {max(days_left, 0)} дн.)"
         )
