@@ -152,14 +152,15 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, cost_kop, total_kop in positions:
-            doc_total += float(total_kop)
-            cost_str = f" × {_rub(cost_kop)} ₽/ед." if cost_kop else ""
+        for pname, qty, pos_cost_kop, pos_total_kop in positions:
+            doc_total += float(pos_total_kop)
+            cost_str = f" × {_rub(pos_cost_kop)} ₽/ед." if pos_cost_kop else ""
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = {_rub(float(total_kop))} ₽"
+                f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = {_rub(float(pos_total_kop))} ₽"
             )
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")
         lines.append("")
 
+    # total_qty/total_kop — из сводного запроса (не затирать переменной цикла!)
     lines.append(f"═══ ИТОГО: {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
     return "\n".join(lines)
