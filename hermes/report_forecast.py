@@ -1,4 +1,4 @@
-"""Прогноз закупки: заказы «Ближайшая поставка» + категорийный прогноз с поправкой на праздники."""
+"""Прогноз закупки: заказы «Ближайшие заказы» (статус «Под заказ») + прогноз по циклам с праздниками."""
 from __future__ import annotations
 
 import logging
@@ -10,7 +10,8 @@ from .moysklad import MoyskladClient
 log = logging.getLogger("hermes.report_forecast")
 
 _PAGE = 100
-_PROJECT_KEYWORD = "ближайшая поставка"
+_PROJECT_KEYWORD = "ближайшие заказы"
+_STATE_KEYWORD   = "под заказ"
 
 
 # ─── МойСклад: заказы ────────────────────────────────────────────────────────
@@ -23,13 +24,26 @@ def _find_project_href(client: MoyskladClient) -> Optional[str]:
     return None
 
 
-def _fetch_orders(client: MoyskladClient, project_href: str) -> list[dict]:
+def _find_state_href(client: MoyskladClient) -> Optional[str]:
+    """Найти href статуса «Под заказ» из метаданных заказов покупателей."""
+    meta = client._get("/entity/customerorder/metadata", {})
+    for state in meta.get("states", []):
+        if _STATE_KEYWORD in state.get("name", "").lower():
+            return state.get("meta", {}).get("href", "")
+    return None
+
+
+def _fetch_orders(client: MoyskladClient, project_href: str,
+                  state_href: Optional[str] = None) -> list[dict]:
     orders: list[dict] = []
     offset = 0
+    flt = f"project={project_href}"
+    if state_href:
+        flt += f";state={state_href}"
     while True:
         page = client._get("/entity/customerorder", {
             "limit": _PAGE, "offset": offset,
-            "filter": f"project={project_href}",
+            "filter": flt,
             "order": "moment,desc",
         })
         batch = page.get("rows", [])
@@ -192,12 +206,14 @@ def _rub(kop: float) -> str:
 
 def build_forecast_report(client: MoyskladClient, conn) -> str:
     today = date.today()
-    lines: list[str] = ["🛒 Прогноз закупки — ближайшая поставка", ""]
+    state_note = " · статус «Под заказ»" if True else ""
+    lines: list[str] = ["🛒 Прогноз закупки — ближайшие заказы", ""]
 
-    # ── 1. Заказы с проектом «Ближайшая поставка» ────────────────────────────
+    # ── 1. Заказы проект «Ближайшие заказы» + статус «Под заказ» ────────────
     project_href = _find_project_href(client)
+    state_href   = _find_state_href(client)
     if project_href:
-        orders = _fetch_orders(client, project_href)
+        orders = _fetch_orders(client, project_href, state_href)
         if orders:
             lines.append(f"📋 Заказов в проекте: {len(orders)}")
 
