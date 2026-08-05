@@ -44,3 +44,23 @@ CREATE TABLE IF NOT EXISTS sync_log (
 
 CREATE INDEX IF NOT EXISTS ix_sales_store_day_channel ON sales_by_store_day (channel, day);
 CREATE INDEX IF NOT EXISTS ix_sales_product_day ON sales_by_product_day (day, store_id);
+
+-- Снимок остатков по товару за день (агрегат по всем складам).
+-- Себестоимость: price из report/stock/all (средневзвешенная закупочная цена).
+CREATE TABLE IF NOT EXISTS stock_snapshot (
+    day              date             NOT NULL,
+    product_id       text             NOT NULL,
+    product_name     text             NOT NULL,
+    folder_id        text,
+    folder_path      text,                          -- полный путь группы (для поиска СРЕЗКИ)
+    is_srezka        boolean          NOT NULL DEFAULT false,
+    stock_qty        numeric(14,3)    NOT NULL DEFAULT 0,
+    reserve_qty      numeric(14,3)    NOT NULL DEFAULT 0,
+    available_qty    numeric(14,3)    NOT NULL DEFAULT 0,
+    cost_price_kop   bigint           NOT NULL DEFAULT 0,  -- себест. единицы в копейках
+    synced_at        timestamptz      NOT NULL DEFAULT now(),
+    PRIMARY KEY (day, product_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_stock_snapshot_day        ON stock_snapshot (day);
+CREATE INDEX IF NOT EXISTS ix_stock_snapshot_srezka_day ON stock_snapshot (is_srezka, day);
