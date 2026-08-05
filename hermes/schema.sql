@@ -174,3 +174,32 @@ CREATE TABLE IF NOT EXISTS product_dim (
     is_srezka    boolean     NOT NULL DEFAULT false,
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
+
+-- Праздничный календарь: конкретные даты (не правило «каждый год»).
+-- lead_days — за сколько дней до даты начинается ажиотажный спрос.
+-- fallback_multiplier — используется, если истории прошлого года нет.
+-- Дима пополняет список раз в год под каждый следующий год.
+CREATE TABLE IF NOT EXISTS holiday (
+    holiday_date        date           PRIMARY KEY,
+    name                text           NOT NULL,
+    lead_days           integer        NOT NULL DEFAULT 3,
+    fallback_multiplier numeric(4, 2)  NOT NULL DEFAULT 2.0
+);
+
+-- Стартовый набор праздников 2026–2027 (корректировать по факту):
+INSERT INTO holiday (holiday_date, name, lead_days, fallback_multiplier) VALUES
+    ('2026-02-14', '14 февраля',       3, 1.5),
+    ('2026-03-08', '8 марта',          5, 4.0),
+    ('2026-05-25', 'Последний звонок', 2, 2.0),
+    ('2026-09-01', '1 сентября',       2, 2.0),
+    ('2026-10-04', 'День учителя',     2, 1.5),
+    ('2026-11-29', 'День матери',      2, 2.0),
+    ('2026-12-31', 'Новый год',        3, 2.0),
+    ('2027-02-14', '14 февраля',       3, 1.5),
+    ('2027-03-08', '8 марта',          5, 4.0),
+    ('2027-05-25', 'Последний звонок', 2, 2.0),
+    ('2027-09-01', '1 сентября',       2, 2.0),
+    ('2027-10-03', 'День учителя',     2, 1.5),
+    ('2027-11-28', 'День матери',      2, 2.0),
+    ('2027-12-31', 'Новый год',        3, 2.0)
+ON CONFLICT (holiday_date) DO NOTHING;
