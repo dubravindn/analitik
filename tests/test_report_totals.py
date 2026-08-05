@@ -74,16 +74,17 @@ def test_loss_header_equals_total():
 
 def test_move_header_equals_total():
     def script(sql):
+        # сводка: cnt, qty, покупная сумма, покрытая-МС, вся-МС
         if "SELECT COUNT(DISTINCT d.doc_id)" in sql:
-            return [(12, 2473, 25_225_800)]
+            return [(12, 2473, 25_225_800, 25_225_800, 25_225_800)]
         if "store_from_name, d.store_to_name" in sql and "GROUP BY" in sql:
             return [("A", "B", 12, 2473, 25_225_800)]
-        if "i.product_name, SUM" in sql:
+        if "i.product_name, SUM(i.qty)" in sql:
             return [("Роза", 2000, 25_000_000)]
-        if "d.doc_id, d.moment" in sql:
-            return [("doc1", None, "A", "B", "")]
-        if "product_name, qty, cost_kop" in sql:
-            return [("Лента", 2, 9500, 19000)]
+        if "d.doc_id, d.moment" in sql:               # +d.day (6 колонок)
+            return [("doc1", None, date(2026, 8, 1), "A", "B", "")]
+        if "i.cost_kop, i.total_kop" in sql:          # позиции +pp.price_kop (5 колонок)
+            return [("Лента", 2, 9500, 19000, 9500)]
         return []
     text = report_move.build_move_report(_Conn(script), date(2026, 8, 1), date(2026, 8, 5))
     h, t = _header_and_total(text)

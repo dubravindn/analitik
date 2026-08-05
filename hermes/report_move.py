@@ -18,6 +18,24 @@ def _qty(q: float) -> str:
     return f"{q:,.1f}".replace(",", " ")
 
 
+# Суммы перемещений — в закупочных ценах из приёмок (методика E), на дату документа.
+# Фолбэк на cost_kop МойСклад для позиций без приёмки.
+_MV_JOIN = """
+    FROM move_doc d
+    JOIN move_item i ON i.doc_id = d.doc_id
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM purchase_price_asof p
+        WHERE p.product_id = i.product_id AND p.priced_from <= d.day
+        ORDER BY p.priced_from DESC LIMIT 1
+    ) pp ON true
+"""
+# Закупочная стоимость позиции (фолбэк на total_kop МойСклад).
+_MV_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
+             "THEN round(i.qty * pp.price_kop) ELSE i.total_kop END")
+# Выручка-покрытие: total_kop только по покрытым приёмками позициям.
+_MV_COVERED = "CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 THEN i.total_kop ELSE 0 END"
+
+
 def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None,
                       max_docs: int | None = 50) -> str:
     """Полный отчёт по перемещениям: сводка по складам + документы с позициями.
@@ -34,7 +52,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
     lines.append(f"🔄 Перемещения {period_str}{store_label}")
-    lines.append("")
+    lines.append("Суммы в закупочных ценах из приёмок.")
 
     # Сводка (учитываем документ, если он касается выбранного склада как источник ИЛИ приёмник)
     store_cond = ""
@@ -47,33 +65,35 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
         cur.execute(f"""
             SELECT COUNT(DISTINCT d.doc_id),
                    COALESCE(SUM(i.qty), 0),
+                   COALESCE(SUM({_MV_TOTAL}), 0),
+                   COALESCE(SUM({_MV_COVERED}), 0),
                    COALESCE(SUM(i.total_kop), 0)
-            FROM move_doc d
-            JOIN move_item i ON i.doc_id = d.doc_id
+            {_MV_JOIN}
             WHERE d.day BETWEEN %s AND %s {store_cond}
         """, base_params)
-        cnt, total_qty, total_kop = cur.fetchone()
+        cnt, total_qty, total_kop, covered_ms, all_ms = cur.fetchone()
 
     if not cnt:
         lines.append("Данных о перемещениях за этот период нет.")
         return "\n".join(lines)
 
+    coverage = (float(covered_ms) / float(all_ms) * 100) if all_ms else 0.0
+    lines.append(f"По закупочным ценам: {coverage:.0f}% стоимости · МойСклад: {100 - coverage:.0f}% (нет приёмок)")
     lines.append(f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. · Сумма: {_rub(float(total_kop))} ₽")
     lines.append("")
 
     if store_name:
         # Исходящие со склада
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT d.store_to_name,
                        COUNT(DISTINCT d.doc_id),
                        COALESCE(SUM(i.qty), 0),
-                       COALESCE(SUM(i.total_kop), 0)
-                FROM move_doc d
-                JOIN move_item i ON i.doc_id = d.doc_id
+                       COALESCE(SUM({_MV_TOTAL}), 0)
+                {_MV_JOIN}
                 WHERE d.day BETWEEN %s AND %s AND d.store_from_name = %s
                 GROUP BY d.store_to_name
-                ORDER BY SUM(i.total_kop) DESC
+                ORDER BY 4 DESC
             """, [d_from, d_to, store_name])
             outgoing = cur.fetchall()
         if outgoing:
@@ -85,16 +105,15 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
 
         # Входящие на склад
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT d.store_from_name,
                        COUNT(DISTINCT d.doc_id),
                        COALESCE(SUM(i.qty), 0),
-                       COALESCE(SUM(i.total_kop), 0)
-                FROM move_doc d
-                JOIN move_item i ON i.doc_id = d.doc_id
+                       COALESCE(SUM({_MV_TOTAL}), 0)
+                {_MV_JOIN}
                 WHERE d.day BETWEEN %s AND %s AND d.store_to_name = %s
                 GROUP BY d.store_from_name
-                ORDER BY SUM(i.total_kop) DESC
+                ORDER BY 4 DESC
             """, [d_from, d_to, store_name])
             incoming = cur.fetchall()
         if incoming:
@@ -106,16 +125,15 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     else:
         # Потоки между складами: источник → приёмник
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT d.store_from_name, d.store_to_name,
                        COUNT(DISTINCT d.doc_id),
                        COALESCE(SUM(i.qty), 0),
-                       COALESCE(SUM(i.total_kop), 0)
-                FROM move_doc d
-                JOIN move_item i ON i.doc_id = d.doc_id
+                       COALESCE(SUM({_MV_TOTAL}), 0)
+                {_MV_JOIN}
                 WHERE d.day BETWEEN %s AND %s
                 GROUP BY d.store_from_name, d.store_to_name
-                ORDER BY SUM(i.total_kop) DESC
+                ORDER BY 5 DESC
             """, [d_from, d_to])
             flows = cur.fetchall()
         if flows:
@@ -127,12 +145,11 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # Топ-10 перемещаемых товаров
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT i.product_name, SUM(i.qty), SUM(i.total_kop)
-            FROM move_doc d
-            JOIN move_item i ON i.doc_id = d.doc_id
+            SELECT i.product_name, SUM(i.qty), SUM({_MV_TOTAL})
+            {_MV_JOIN}
             WHERE d.day BETWEEN %s AND %s {store_cond}
             GROUP BY i.product_name
-            ORDER BY SUM(i.total_kop) DESC
+            ORDER BY 3 DESC
             LIMIT 10
         """, base_params)
         top = cur.fetchall()
@@ -146,7 +163,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # Все документы с позициями
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT d.doc_id, d.moment, d.store_from_name, d.store_to_name, d.description
+            SELECT d.doc_id, d.moment, d.day, d.store_from_name, d.store_to_name, d.description
             FROM move_doc d
             WHERE d.day BETWEEN %s AND %s {store_cond}
             ORDER BY d.moment
@@ -161,32 +178,46 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     else:
         lines.append(f"── Все документы ({total_docs}) ──")
     lines.append("")
-    for doc_id, moment, from_name, to_name, description in docs:
+    any_star = False
+    for doc_id, moment, doc_day, from_name, to_name, description in docs:
         moment_str = moment.strftime("%d.%m.%Y %H:%M") if hasattr(moment, "strftime") else str(moment)[:16]
         header = f"📅 {moment_str} · {from_name} → {to_name}"
         if description:
             header += f" · {description}"
         lines.append(header)
 
+        # Закупочная цена позиции на дату документа (фолбэк на cost_kop).
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT product_name, qty, cost_kop, total_kop
-                FROM move_item
-                WHERE doc_id = %s
-                ORDER BY total_kop DESC
-            """, [doc_id])
+                SELECT i.product_name, i.qty, i.cost_kop, i.total_kop, pp.price_kop
+                FROM move_item i
+                LEFT JOIN LATERAL (
+                    SELECT price_kop FROM purchase_price_asof p
+                    WHERE p.product_id = i.product_id AND p.priced_from <= %s
+                    ORDER BY p.priced_from DESC LIMIT 1
+                ) pp ON true
+                WHERE i.doc_id = %s
+                ORDER BY i.total_kop DESC
+            """, [doc_day, doc_id])
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, pos_cost_kop, pos_total_kop in positions:
-            doc_total += float(pos_total_kop)
-            cost_str = f" × {_rub(pos_cost_kop)} ₽/ед." if pos_cost_kop else ""
+        for pname, qty, ms_cost, ms_total, purch_price in positions:
+            covered = purch_price is not None and purch_price > 0
+            unit = int(purch_price) if covered else int(ms_cost or 0)
+            pos_total = round(float(qty) * unit) if covered else float(ms_total)
+            doc_total += float(pos_total)
+            star = "" if covered else " *"
+            any_star = any_star or not covered
+            cost_str = f" × {_rub(unit)} ₽/ед." if unit else ""
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = {_rub(float(pos_total_kop))} ₽"
+                f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = {_rub(float(pos_total))} ₽{star}"
             )
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")
         lines.append("")
 
     # total_qty/total_kop — из сводного запроса (не затирать переменной цикла!)
     lines.append(f"═══ ИТОГО: {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
+    if any_star:
+        lines.append("* себестоимость МойСклад — нет данных о приёмке")
     return "\n".join(lines)
