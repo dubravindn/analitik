@@ -116,11 +116,13 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         for pos in positions:
             pos_id = pos["id"]
             assort = pos.get("assortment", {}) or {}
+            # id берём чистым (без хвоста ?expand=…), иначе join сломается (урок D)
+            product_id = (assort.get("id", "") if isinstance(assort, dict) else "").split("?")[0]
             product_name = assort.get("name", "") if isinstance(assort, dict) else ""
             qty = float(pos.get("quantity", 0) or 0)
             cost = round(pos.get("price", 0) or 0)   # price = себест. в копейках
             total = round(qty * cost)
-            pos_records.append((doc_id, pos_id, product_name, qty, cost, total))
+            pos_records.append((doc_id, pos_id, product_id, product_name, qty, cost, total))
 
         if pos_records:
             with conn.cursor() as cur:
@@ -128,9 +130,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 cur.executemany(
                     """
                     INSERT INTO move_item
-                        (doc_id, position_id, product_name, qty, cost_kop, total_kop)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (doc_id, position_id, product_id, product_name, qty, cost_kop, total_kop)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (doc_id, position_id) DO UPDATE SET
+                        product_id=EXCLUDED.product_id,
                         product_name=EXCLUDED.product_name,
                         qty=EXCLUDED.qty, cost_kop=EXCLUDED.cost_kop,
                         total_kop=EXCLUDED.total_kop, synced_at=now()

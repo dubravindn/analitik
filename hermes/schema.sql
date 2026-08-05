@@ -252,3 +252,8 @@ CREATE INDEX IF NOT EXISTS ix_move_doc_day       ON move_doc (day);
 CREATE INDEX IF NOT EXISTS ix_move_doc_from       ON move_doc (store_from_id, day);
 CREATE INDEX IF NOT EXISTS ix_move_doc_to         ON move_doc (store_to_id, day);
 CREATE INDEX IF NOT EXISTS ix_move_item_product   ON move_item (product_name);
+
+-- Товар в позиции перемещения (id из МойСклад) — для пересчёта по закупочным
+-- ценам из приёмок (E2). id брать чистым (без ?expand=…), см. баг остатков.
+ALTER TABLE move_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_move_item_pid ON move_item (product_id);
