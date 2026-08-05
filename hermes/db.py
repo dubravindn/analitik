@@ -12,7 +12,15 @@ _SCHEMA = Path(__file__).resolve().parent / "schema.sql"
 
 
 def connect(database_url: str) -> psycopg.Connection:
-    return psycopg.connect(database_url, autocommit=False)
+    conn = psycopg.connect(database_url, autocommit=False)
+    # Отдавать timestamptz в московском времени. Храним в UTC (ETL помечают
+    # moment как config.MSK), но по умолчанию сессия Postgres в UTC и отчёты
+    # печатали время на 3 ч назад. Ставим зону сессии — чинит вывод во всех
+    # отчётах разом (report_loss/move/cashflow/audit, alerts).
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'Europe/Moscow'")
+    conn.commit()
+    return conn
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
