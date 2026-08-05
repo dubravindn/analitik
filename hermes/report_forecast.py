@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from .moysklad import MoyskladClient
+from . import config
 
 log = logging.getLogger("hermes.report_forecast")
 
@@ -74,7 +75,6 @@ def _fetch_order_positions(client: MoyskladClient, order_id: str) -> list[dict]:
 # ─── БД: фургоны, категории, праздники ───────────────────────────────────────
 
 def _van_dates(conn, limit: int = 10) -> list[date]:
-    from . import config
     suppliers = config.MOSCOW_SUPPLIERS
     if not suppliers:
         return []
