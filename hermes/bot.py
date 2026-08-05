@@ -20,17 +20,23 @@ log = logging.getLogger("hermes.bot")
 
 # Для каждой секции: список шагов ["period", "store"]
 _DIALOG_STEPS: dict[str, list[str]] = {
-    "sales":  ["period", "store"],
-    "stock":  ["period", "store"],
-    "stale":  ["period", "store"],
-    "loss":   ["period", "store"],
+    "sales":    ["period", "store"],
+    "stock":    ["period", "store"],
+    "stale":    ["period", "store"],
+    "loss":     ["period", "store"],
+    "reserves": ["period", "store"],
+    "expenses": ["period"],           # нет фильтра по складу у кассовых документов
+    "pdf":      ["period", "store"],
 }
 
 _SECTION_TITLE = {
-    "sales": "📊 Продажи",
-    "stock": "📦 Остатки",
-    "stale": "🚨 Залежалые",
-    "loss":  "🗑 Списания",
+    "sales":    "📊 Продажи",
+    "stock":    "📦 Остатки",
+    "stale":    "🚨 Залежалые",
+    "loss":     "🗑 Списания",
+    "reserves": "🎯 Резервы",
+    "expenses": "💸 Расходы",
+    "pdf":      "📄 Отчёт PDF",
 }
 
 _BUTTON_TO_SECTION = {
@@ -38,8 +44,10 @@ _BUTTON_TO_SECTION = {
     "📦 остатки":    "stock",
     "🚨 залежалые":  "stale",
     "🗑 списания":   "loss",
+    "🎯 резервы":    "reserves",
+    "💸 расходы":    "expenses",
+    "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
-    "🙈 скрыть меню":"hide",
     "/меню":         "show",
     "меню":          "show",
 }
@@ -63,21 +71,23 @@ _PERIOD_BUTTONS: dict[str, str] = {
 _HELP_TEXT = """\
 📋 Hermes — аналитика
 
-Нажмите кнопку меню или введите команду:
+Кнопки меню (все с выбором периода и склада):
+  📊 Продажи    — выручка, прибыль, топ позиций
+  📦 Остатки    — свободный остаток на дату
+  🚨 Залежалые  — позиции без движения
+  🗑 Списания   — все документы с позициями
+  🎯 Резервы    — товары отложены под клиента
+  💸 Расходы    — все платежи за период
+  📄 Отчёт PDF  — полный отчёт одним файлом
 
-📊 Продажи  → выберите период и склад
-📦 Остатки  → выберите дату и склад
-🚨 Залежалые → выберите дату и склад
-🗑 Списания  → выберите период и склад
-   (все документы с полным раскрытием позиций)
+Клавиатуру можно скрыть стрелкой ↓ внизу
+и вернуть касанием иконки клавиатуры.
 
-Дополнительные команды (без меню):
-  /деньги [д1] [д2]       — ДДС
-  /закупки [д1] [д2]      — закупки
+Команды без меню:
+  /деньги [д1] [д2]       — ДДС (сводка)
+  /закупки [д1] [д2]      — поставки
   /сотрудники [д1] [д2]   — по сотрудникам
-
-🙈 Скрыть меню — убирает кнопки
-/меню — восстановить кнопки\
+  /меню                   — показать клавиатуру\
 """
 
 # ─── состояние диалога (in-memory, один пользователь) ────────────────────────
@@ -138,14 +148,6 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         tg.send_message(bot_token, chat_id, "❌ Отменено.", tg.main_reply_keyboard())
         return
 
-    # ── Скрыть / показать меню ──
-    if norm == "🙈 скрыть меню":
-        _clear_state(chat_id)
-        tg.send_message(bot_token, chat_id,
-                        "🙈 Меню скрыто. Отправьте /меню чтобы вернуть.",
-                        tg.remove_keyboard())
-        return
-
     if norm in ("/меню", "меню", "/start"):
         _clear_state(chat_id)
         tg.send_message(bot_token, chat_id,
@@ -153,7 +155,7 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         return
 
     # ── Помощь ──
-    if norm in ("❓ помощь", "/помощь", "/help"):
+    if norm in ("❓ помощь", "/помощь", "/help", "помощь"):
         _clear_state(chat_id)
         tg.send_message(bot_token, chat_id, _HELP_TEXT, tg.main_reply_keyboard())
         return
@@ -187,8 +189,12 @@ def _start_dialog(section: str, chat_id: str, bot_token: str) -> None:
 def _ask_step(section: str, step: str, chat_id: str, bot_token: str) -> None:
     title = _SECTION_TITLE[section]
     if step == "period":
-        if section == "stale":
+        if section in ("stale", "stock", "reserves"):
             prompt = f"{title}\n\n📅 На какую дату показать снимок остатков?"
+        elif section == "expenses":
+            prompt = f"{title}\n\n📅 За какой период показать платежи?"
+        elif section == "pdf":
+            prompt = f"{title}\n\n📅 За какой период сформировать отчёт?"
         else:
             prompt = f"{title}\n\n📅 За какой период?"
         tg.send_message(bot_token, chat_id, prompt, tg.period_keyboard())
@@ -262,11 +268,26 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     d_to       = params.get("d_to")
     store_name = params.get("store_name")   # None = все склады
 
-    store_lbl = store_name or "Все склады"
-    tg.send_message(bot_token, chat_id,
-                    f"⏳ Готовлю отчёт…\n"
-                    f"Период: {_fmt_period(d_from, d_to)}\n"
-                    f"Склад: {store_lbl}")
+    # Для expenses — нет фильтра по складу
+    if section == "expenses":
+        tg.send_message(bot_token, chat_id,
+                        f"⏳ Загружаю платежи…\nПериод: {_fmt_period(d_from, d_to)}")
+    elif section == "pdf":
+        tg.send_message(bot_token, chat_id,
+                        f"⏳ Генерирую PDF-отчёт…\n"
+                        f"Период: {_fmt_period(d_from, d_to)}\n"
+                        f"Склад: {store_name or 'Все склады'}")
+    else:
+        tg.send_message(bot_token, chat_id,
+                        f"⏳ Готовлю отчёт…\n"
+                        f"Период: {_fmt_period(d_from, d_to)}\n"
+                        f"Склад: {store_name or 'Все склады'}")
+
+    # PDF — отдельный путь: handler сам отправляет файл и клавиатуру
+    if section == "pdf":
+        _run_pdf(conn_factory, client_factory, d_from, d_to, store_name,
+                 bot_token, chat_id)
+        return
 
     try:
         if section == "sales":
@@ -281,6 +302,12 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "loss":
             text = _run_loss(conn_factory, client_factory, d_from, d_to, store_name,
                              bot_token, chat_id)
+        elif section == "reserves":
+            text = _run_reserves(conn_factory, client_factory, d_from, store_name,
+                                 bot_token, chat_id)
+        elif section == "expenses":
+            text = _run_expenses(conn_factory, client_factory, d_from, d_to,
+                                 bot_token, chat_id)
         else:
             text = "Неизвестная секция."
     except Exception as e:
@@ -331,6 +358,95 @@ def _run_stale(conn_factory, client_factory, snap_date, store_name, bot_token, c
                             f"⏳ Снимаю остатки на {snap_date.strftime('%d.%m.%Y')}…")
             etl_stock(client, conn, snap_date)
     return build_stock_report(conn, snap_date, store_name)
+
+
+def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token, chat_id):
+    from .etl_stock import run as etl_stock
+    from .report_stock import build_reserve_report
+    conn   = conn_factory()
+    client = client_factory()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM stock_snapshot WHERE day=%s", (snap_date,))
+        if cur.fetchone()[0] == 0:
+            tg.send_message(bot_token, chat_id,
+                            f"⏳ Снимаю остатки на {snap_date.strftime('%d.%m.%Y')}…")
+            etl_stock(client, conn, snap_date)
+    return build_reserve_report(conn, snap_date, store_name)
+
+
+def _run_expenses(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
+    from .etl_cashflow import run as etl_cashflow
+    from .report_cashflow import build_expenses_report
+    conn   = conn_factory()
+    client = client_factory()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s",
+            (d_from, d_to),
+        )
+        if cur.fetchone()[0] == 0:
+            tg.send_message(bot_token, chat_id, "⏳ Подгружаю платежи из МойСклад…")
+            etl_cashflow(client, conn, d_from, d_to)
+    return build_expenses_report(conn, d_from, d_to)
+
+
+def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
+    from .etl_sales import run as etl_sales
+    from .etl_stock import run as etl_stock
+    from .etl_loss import run as etl_loss
+    from .etl_cashflow import run as etl_cashflow
+    from .report_pdf import build_pdf
+    try:
+        conn   = conn_factory()
+        client = client_factory()
+
+        # Догружаем данные по каждой секции если нет
+        missing = _missing_days(conn, d_from, d_to)
+        if missing:
+            tg.send_message(bot_token, chat_id,
+                            f"⏳ Загружаю продажи за {len(missing)} дн.…")
+            etl_sales(client, conn, min(missing), max(missing))
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM stock_snapshot WHERE day=%s", (d_to,))
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Снимаю остатки…")
+                etl_stock(client, conn, d_to)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to)
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю списания…")
+                etl_loss(client, conn, d_from, d_to)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s",
+                (d_from, d_to),
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю платежи…")
+                etl_cashflow(client, conn, d_from, d_to)
+
+        tg.send_message(bot_token, chat_id, "📝 Формирую PDF…")
+        pdf_bytes = build_pdf(conn, d_from, d_to, store_name)
+
+        period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
+        store_safe  = (store_name or "vse").split(",")[-1].strip().replace(" ", "_")[:20]
+        filename    = f"hermes_{period_safe}_{store_safe}.pdf"
+        caption     = (
+            f"📄 Отчёт {_fmt_period(d_from, d_to)}"
+            + (f" · {store_name}" if store_name else "")
+        )
+        tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption,
+                         tg.main_reply_keyboard())
+        tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
+    except Exception as e:
+        log.exception("Ошибка PDF: %s", e)
+        tg.send_message(bot_token, chat_id,
+                        f"⚠️ Ошибка при генерации PDF: {e}", tg.main_reply_keyboard())
 
 
 def _run_loss(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):

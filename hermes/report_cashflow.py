@@ -110,3 +110,87 @@ def build_cashflow_report(conn, d_from: date, d_to: date) -> str:
             lines.append(f"  {name}: {_rub(kop)} ₽")
 
     return "\n".join(lines)
+
+
+def build_expenses_report(conn, d_from: date, d_to: date) -> str:
+    """Подробный отчёт: каждый платёжный документ за период."""
+    period_str = (
+        d_from.strftime("%d.%m.%Y") if d_from == d_to
+        else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
+    )
+    lines: list[str] = []
+    lines.append(f"💸 Расходы и платежи {period_str}")
+    lines.append("(кассовые документы не привязаны к складу)")
+    lines.append("")
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT direction, SUM(amount_kop), COUNT(*)
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s
+            GROUP BY direction
+        """, (d_from, d_to))
+        totals = {row[0]: (float(row[1]), int(row[2])) for row in cur.fetchall()}
+
+    in_kop,  in_cnt  = totals.get("in",  (0.0, 0))
+    out_kop, out_cnt = totals.get("out", (0.0, 0))
+    bal = in_kop - out_kop
+    sign = "+" if bal >= 0 else "-"
+
+    if in_cnt + out_cnt == 0:
+        lines.append("Данных о платежах за этот период нет.")
+        return "\n".join(lines)
+
+    lines.append(f"📈 Приход:  {_rub(in_kop)} ₽  ({in_cnt} опер.)")
+    lines.append(f"📉 Расход:  {_rub(out_kop)} ₽  ({out_cnt} опер.)")
+    lines.append(f"{'✅' if bal >= 0 else '🔴'} Баланс: {sign}{_rub(abs(bal))} ₽")
+    lines.append("")
+
+    # Исходящие (cashout + paymentout)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT moment, doc_type, agent_name, description, amount_kop
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'out'
+            ORDER BY moment
+        """, (d_from, d_to))
+        out_docs = cur.fetchall()
+
+    if out_docs:
+        lines.append(f"── 📉 Исходящие платежи ({len(out_docs)}) ──")
+        for moment, doc_type, agent, desc, amount in out_docs:
+            dt = (moment.strftime("%d.%m %H:%M")
+                  if hasattr(moment, "strftime") else str(moment)[:16])
+            ch = "Касса" if doc_type == "cashout" else "Банк"
+            row = f"  {dt} [{ch}] {_rub(float(amount))} ₽"
+            if agent:
+                row += f"  → {agent}"
+            if desc:
+                row += f"\n     {desc}"
+            lines.append(row)
+        lines.append("")
+
+    # Приходные (cashin + paymentin)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT moment, doc_type, agent_name, description, amount_kop
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'in'
+            ORDER BY moment
+        """, (d_from, d_to))
+        in_docs = cur.fetchall()
+
+    if in_docs:
+        lines.append(f"── 📈 Приходные ордера ({len(in_docs)}) ──")
+        for moment, doc_type, agent, desc, amount in in_docs:
+            dt = (moment.strftime("%d.%m %H:%M")
+                  if hasattr(moment, "strftime") else str(moment)[:16])
+            ch = "Касса" if doc_type == "cashin" else "Банк"
+            row = f"  {dt} [{ch}] {_rub(float(amount))} ₽"
+            if agent:
+                row += f"  <- {agent}"
+            if desc:
+                row += f"\n     {desc}"
+            lines.append(row)
+
+    return "\n".join(lines)

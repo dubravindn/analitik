@@ -56,60 +56,123 @@ def build_stock_by_qty(conn, day: date, store_name: str | None = None) -> str:
     )
     lines.append("")
 
-    # Если конкретный склад — показываем топ по количеству (до 30 позиций)
+    # Если конкретный склад — топ-50 по свободному остатку (без резерва)
     if store_name:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT product_name, is_srezka, stock_qty, reserve_qty,
                        cost_price_kop,
-                       stock_qty * cost_price_kop AS total_cost
+                       (stock_qty - reserve_qty) * cost_price_kop AS free_cost
                 FROM stock_snapshot
-                WHERE day = %s AND stock_qty > 0 AND store_name = %s
-                ORDER BY stock_qty DESC
+                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s
+                ORDER BY (stock_qty - reserve_qty) DESC
                 LIMIT 50
             """, [day, store_name])
             rows = cur.fetchall()
 
-        lines.append(f"── Топ-{min(50, len(rows))} по количеству ──")
-        for name, is_srezka, qty, reserve, cost_unit, cost_total in rows:
-            tag = " [СР]" if is_srezka else ""
-            res = f" · резерв {_qty(float(reserve))}" if reserve else ""
+        lines.append(f"── Топ-{min(50, len(rows))} по свободному остатку ──")
+        for name, is_srezka, qty, reserve, cost_unit, free_cost in rows:
+            tag  = " [СР]" if is_srezka else ""
+            free = float(qty) - float(reserve)
+            res  = f" (рез. {_qty(float(reserve))})" if reserve else ""
             lines.append(
-                f"  • {name}{tag}: {_qty(float(qty))} ед.{res}\n"
-                f"    Цена ед.: {_rub(cost_unit)} ₽ · Итого: {_rub(float(cost_total))} ₽"
+                f"  • {name}{tag}: {_qty(free)} ед.{res}\n"
+                f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(free_cost))} ₽"
             )
         return "\n".join(lines)
 
-    # Все склады — разбивка по складам, топ по количеству в каждом
+    # Все склады — разбивка по складам, топ-15 по свободному остатку
     for sname in _STORE_ORDER:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT product_name, is_srezka, stock_qty, reserve_qty, cost_price_kop,
-                       stock_qty * cost_price_kop AS total_cost,
-                       COUNT(*) OVER()             AS total_cnt,
-                       SUM(stock_qty) OVER()       AS total_store_qty,
-                       SUM(stock_qty * cost_price_kop) OVER() AS total_store_cost
+                       (stock_qty - reserve_qty) * cost_price_kop AS free_cost,
+                       COUNT(*) FILTER (WHERE stock_qty - reserve_qty > 0) OVER() AS total_cnt,
+                       SUM(stock_qty - reserve_qty) OVER()                         AS total_free,
+                       SUM((stock_qty - reserve_qty) * cost_price_kop) OVER()      AS total_cost
                 FROM stock_snapshot
-                WHERE day = %s AND stock_qty > 0 AND store_name = %s
-                ORDER BY stock_qty DESC
+                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s
+                ORDER BY (stock_qty - reserve_qty) DESC
                 LIMIT 15
             """, [day, sname])
             rows = cur.fetchall()
 
         if not rows:
             continue
-        total_cnt     = rows[0][6]
-        store_qty     = float(rows[0][7] or 0)
-        store_cost    = float(rows[0][8] or 0)
+        total_cnt  = rows[0][6]
+        store_free = float(rows[0][7] or 0)
+        store_cost = float(rows[0][8] or 0)
         lines.append(f"── 📍 {sname} ──")
         lines.append(
-            f"   Позиций: {total_cnt} · {_qty(store_qty)} ед. · {_rub(store_cost)} ₽"
+            f"   Позиций: {total_cnt} · Своб.: {_qty(store_free)} ед. · {_rub(store_cost)} ₽"
         )
-        for name, is_srezka, qty, reserve, cost_unit, cost_total, *_ in rows:
-            tag = " [СР]" if is_srezka else ""
-            res = f" / рез. {_qty(float(reserve))}" if reserve else ""
+        for name, is_srezka, qty, reserve, cost_unit, free_cost, *_ in rows:
+            tag  = " [СР]" if is_srezka else ""
+            free = float(qty) - float(reserve)
+            res  = f" / рез.{_qty(float(reserve))}" if reserve else ""
             lines.append(
-                f"  • {name}{tag}: {_qty(float(qty))}{res} ед. · {_rub(float(cost_total))} ₽"
+                f"  • {name}{tag}: {_qty(free)}{res} ед. · {_rub(float(free_cost))} ₽"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─── Отчёт «Резервы» ──────────────────────────────────────────────────────────
+
+def build_reserve_report(conn, day: date, store_name: str | None = None) -> str:
+    """Товары в резерве (отложены под клиента)."""
+    store_label = f" · {store_name}" if store_name else " · Все склады"
+    lines: list[str] = []
+    lines.append(f"🎯 Резервы на {day.strftime('%d.%m.%Y')}{store_label}")
+    lines.append("")
+
+    sf = "AND store_name = %s" if store_name else ""
+    p  = [day] + ([store_name] if store_name else [])
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COUNT(*), COALESCE(SUM(reserve_qty), 0),
+                   COALESCE(SUM(reserve_qty * cost_price_kop), 0)
+            FROM stock_snapshot
+            WHERE day = %s AND reserve_qty > 0 {sf}
+        """, p)
+        cnt, total_qty, total_cost = cur.fetchone()
+        total_qty  = float(total_qty or 0)
+        total_cost = float(total_cost or 0)
+
+    if not cnt:
+        lines.append("Резервов на эту дату нет.")
+        return "\n".join(lines)
+
+    lines.append(
+        f"📋 Позиций: {cnt} · Всего: {_qty(total_qty)} ед. · Сумма: {_rub(total_cost)} ₽"
+    )
+    lines.append("")
+
+    order = _STORE_ORDER if not store_name else [store_name]
+    for sname in order:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT product_name, is_srezka, reserve_qty, stock_qty,
+                       cost_price_kop,
+                       reserve_qty * cost_price_kop AS res_cost
+                FROM stock_snapshot
+                WHERE day = %s AND reserve_qty > 0 AND store_name = %s
+                ORDER BY reserve_qty DESC
+            """, [day, sname])
+            rows = cur.fetchall()
+
+        if not rows:
+            continue
+        sc = sum(float(r[5]) for r in rows)
+        lines.append(f"── 📍 {sname} — {len(rows)} поз. · {_rub(sc)} ₽ ──")
+        for name, is_srezka, rqty, sqty, cost_unit, res_cost in rows:
+            tag  = " [СР]" if is_srezka else ""
+            free = float(sqty) - float(rqty)
+            lines.append(
+                f"  • {name}{tag}: резерв {_qty(float(rqty))} ед."
+                f" / своб. {_qty(free)} ед. · {_rub(float(res_cost))} ₽"
             )
         lines.append("")
 

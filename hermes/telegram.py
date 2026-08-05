@@ -42,12 +42,15 @@ def answer_callback_query(
 # ─── клавиатуры ───────────────────────────────────────────────────────────────
 
 def main_reply_keyboard() -> dict:
-    """Главное меню — постоянная клавиатура снизу."""
+    """Главное меню — постоянная клавиатура снизу.
+    Telegram нативно скрывает стрелкой ↓ без команды.
+    """
     return {
         "keyboard": [
             [{"text": "📊 Продажи"},   {"text": "📦 Остатки"}],
             [{"text": "🚨 Залежалые"}, {"text": "🗑 Списания"}],
-            [{"text": "❓ Помощь"},    {"text": "🙈 Скрыть меню"}],
+            [{"text": "🎯 Резервы"},   {"text": "💸 Расходы"}],
+            [{"text": "📄 Отчёт PDF"}, {"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -107,6 +110,57 @@ def input_dates_keyboard() -> dict:
         "keyboard": [[{"text": "🚫 Отмена"}]],
         "resize_keyboard": True,
     }
+
+
+def send_document(
+    bot_token: str,
+    chat_id: str,
+    data: bytes,
+    filename: str,
+    caption: str = "",
+    reply_markup: dict | None = None,
+) -> dict:
+    """Отправить файл как документ (multipart/form-data)."""
+    import uuid
+    boundary = uuid.uuid4().hex
+    body_parts: list[bytes] = []
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode("utf-8")
+
+    body_parts.append(_field("chat_id", str(chat_id)))
+    if caption:
+        body_parts.append(_field("caption", caption[:1024]))
+    if reply_markup:
+        body_parts.append(_field("reply_markup", json.dumps(reply_markup)))
+
+    body_parts.append((
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8"))
+    body_parts.append(data)
+    body_parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    body = b"".join(body_parts)
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body_err = e.read().decode(errors="replace")
+        raise RuntimeError(f"Telegram sendDocument HTTP {e.code}: {body_err}") from e
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram sendDocument ошибка: {result}")
+    return result
 
 
 # ─── низкоуровневые утилиты ───────────────────────────────────────────────────
