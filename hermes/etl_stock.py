@@ -134,6 +134,23 @@ def run(client: MoyskladClient, conn, day: date | None = None) -> int:
                     """,
                     records,
                 )
+                # Попутно обновляем справочник товаров (product_id → folder_path)
+                dim_records = [
+                    (r[3], r[4], r[6], r[7])   # product_id, product_name, folder_path, is_srezka
+                    for r in records
+                ]
+                cur.executemany(
+                    """
+                    INSERT INTO product_dim (product_id, product_name, folder_path, is_srezka)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (product_id) DO UPDATE SET
+                        product_name = EXCLUDED.product_name,
+                        folder_path  = EXCLUDED.folder_path,
+                        is_srezka    = EXCLUDED.is_srezka,
+                        updated_at   = now()
+                    """,
+                    dim_records,
+                )
             conn.commit()
         log.info("Остатки на %s | %s | %d позиций", day, store_id[:8], len(records))
         total += len(records)

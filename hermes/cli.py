@@ -95,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     p_rep_emp.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_rep_emp.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
+    sub.add_parser("report-forecast", help="Прогноз закупки (заказы + история фургонов)")
+
     sub.add_parser(
         "daily",
         help="Sync вчера (продажи) + сегодня (остатки) → отправить оба отчёта в Telegram",
@@ -204,6 +206,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report-employees":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         print(build_employee_report(client, args.d_from, args.d_to))
+        return 0
+
+    if args.cmd == "report-forecast":
+        from .report_forecast import build_forecast_report
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn   = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        print(build_forecast_report(client, conn))
         return 0
 
     if args.cmd == "bot":

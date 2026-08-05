@@ -28,6 +28,7 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "expenses": ["period"],           # нет фильтра по складу у кассовых документов
     "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
+    "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
     "pdf":      ["period", "store"],
 }
 
@@ -40,6 +41,7 @@ _SECTION_TITLE = {
     "expenses": "💸 Расходы",
     "audit":    "🔍 Изменения",
     "clients":  "👥 Клиенты",
+    "forecast": "🛒 Прогноз",
     "pdf":      "📄 Отчёт PDF",
 }
 
@@ -52,6 +54,7 @@ _BUTTON_TO_SECTION = {
     "💸 расходы":    "expenses",
     "🔍 изменения":  "audit",
     "👥 клиенты":    "clients",
+    "🛒 прогноз":    "forecast",
     "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
     "/меню":         "show",
@@ -166,11 +169,15 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         tg.send_message(bot_token, chat_id, _HELP_TEXT, tg.main_reply_keyboard())
         return
 
-    # ── Кнопка главного меню → начать диалог ──
+    # ── Кнопка главного меню → начать диалог (или выполнить сразу) ──
     section = _BUTTON_TO_SECTION.get(norm)
     if section in _DIALOG_STEPS:
         _clear_state(chat_id)
-        _start_dialog(section, chat_id, bot_token)
+        if not _DIALOG_STEPS[section]:
+            # Секция без шагов — выполняем немедленно
+            _execute(section, {}, chat_id, conn_factory, client_factory, bot_token)
+        else:
+            _start_dialog(section, chat_id, bot_token)
         return
 
     # ── Продолжение диалога ──
@@ -356,6 +363,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "clients":
             text = _run_clients(conn_factory, client_factory, d_from, d_to, store_name,
                                 bot_token, chat_id)
+        elif section == "forecast":
+            text = _run_forecast(conn_factory, client_factory, bot_token, chat_id)
         elif section == "audit":
             text = _run_audit(client_factory, d_from, d_to, bot_token, chat_id)
         else:
@@ -424,6 +433,14 @@ def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token
                             f"⏳ Снимаю остатки на {snap_date.strftime('%d.%m.%Y')}…")
             etl_stock(client, conn, snap_date)
     return build_reserve_report(conn, snap_date, store_name)
+
+
+def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
+    from .report_forecast import build_forecast_report
+    conn   = conn_factory()
+    client = client_factory()
+    tg.send_message(bot_token, chat_id, "⏳ Запрашиваю заказы и остатки…")
+    return build_forecast_report(client, conn)
 
 
 def _run_clients(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):

@@ -164,3 +164,13 @@ ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS positions  integer NOT NULL DEFAU
 
 CREATE INDEX IF NOT EXISTS ix_sales_doc_day   ON sales_doc (day);
 CREATE INDEX IF NOT EXISTS ix_sales_doc_agent ON sales_doc (agent_id, day);
+
+-- Справочник товаров: id → folder_path/is_srezka. Обновляется при каждом etl_stock.
+-- Нужен для связи sales_by_product_day (assortment_id) с категорией товара.
+CREATE TABLE IF NOT EXISTS product_dim (
+    product_id   text        PRIMARY KEY,
+    product_name text        NOT NULL,
+    folder_path  text,
+    is_srezka    boolean     NOT NULL DEFAULT false,
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
