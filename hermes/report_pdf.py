@@ -124,9 +124,14 @@ def build_pdf(
 
         for raw_line in content.split("\n"):
             cline = _clean(raw_line)
+            # Дополнительно удаляем непечатаемые управляющие символы
+            cline = "".join(ch for ch in cline if ch >= " " or ch == "\n")
             if not cline.strip():
                 pdf.ln(2)
                 continue
+            # Обрезаем очень длинные строки без пробелов (название без пробела > 60 chars)
+            words = cline.split()
+            cline = " ".join(w if len(w) <= 60 else w[:60] + "…" for w in words)
             # Всегда сбрасываем x в левый отступ перед multi_cell
             pdf.set_x(_MARGIN)
             stripped = cline.lstrip()
@@ -145,13 +150,17 @@ def build_pdf(
                         new_x="LMARGIN", new_y="NEXT",
                     )
             except Exception:
-                # Защита от любых ошибок отдельной строки
+                # Сбрасываем шрифт и отступ; пробуем усечённую строку
+                pdf.set_font("DejaVu", size=8)
                 pdf.set_x(_MARGIN)
-                pdf.multi_cell(
-                    eff_w, _LINE_H,
-                    cline[:120] if len(cline) > 120 else cline,
-                    new_x="LMARGIN", new_y="NEXT",
-                )
+                short = cline[:80] if len(cline) > 80 else cline
+                try:
+                    pdf.multi_cell(
+                        eff_w, _LINE_H, short,
+                        new_x="LMARGIN", new_y="NEXT",
+                    )
+                except Exception:
+                    pass  # пропускаем строку которую совсем нельзя нарисовать
 
     # ── Секция 1: Продажи ──────────────────────────────────────────────────────
     from .report_sales import build_sales_analytics
