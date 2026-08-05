@@ -26,6 +26,19 @@ def _qty(q: float) -> str:
     return f"{q:,.1f}".replace(",", " ")
 
 
+# Стоимость запаса — по закупочным ценам из приёмок на дату снимка (методика E),
+# фолбэк на cost_price_kop МойСклад. Единица = закупочная или фолбэк.
+_ST_JOIN = """
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM purchase_price_asof p
+        WHERE p.product_id = stock_snapshot.product_id AND p.priced_from <= stock_snapshot.day
+        ORDER BY p.priced_from DESC LIMIT 1
+    ) pp ON true
+"""
+_ST_UNIT  = "COALESCE(NULLIF(pp.price_kop, 0), stock_snapshot.cost_price_kop)"
+_ST_VALUE = f"stock_qty * {_ST_UNIT}"
+
+
 # ─── Отчёт «Остатки»: позиции с наибольшим количеством ───────────────────────
 
 def _group_filter(folder_group: str | None) -> tuple[str, list]:
@@ -74,20 +87,25 @@ def build_stock_by_qty(
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COUNT(*), COALESCE(SUM(stock_qty), 0), COALESCE(SUM(stock_qty * cost_price_kop), 0)
-            FROM stock_snapshot
+            SELECT COUNT(*), COALESCE(SUM(stock_qty), 0), COALESCE(SUM({_ST_VALUE}), 0),
+                   COUNT(*) FILTER (WHERE pp.price_kop IS NOT NULL AND pp.price_kop > 0)
+            FROM stock_snapshot {_ST_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
         """, p)
         row = cur.fetchone()
         total_pos, total_qty, total_cost = row[0], float(row[1] or 0), float(row[2] or 0)
+        cov_pos = int(row[3] or 0)
 
     if not total_pos:
         lines.append("Снимок остатков за этот день не найден.")
         return "\n".join(lines)
 
+    cov_pct = cov_pos / total_pos * 100 if total_pos else 0
     lines.append(
-        f"📋 Позиций: {total_pos} · Всего: {_qty(total_qty)} ед. · Себест.: {_rub(total_cost)} ₽"
+        f"📋 Позиций: {total_pos} · Всего: {_qty(total_qty)} ед. · "
+        f"Закуп. стоимость: {_rub(total_cost)} ₽"
     )
+    lines.append(f"(по закупочным ценам из приёмок: {cov_pct:.0f}% позиций, остальные — себест. МойСклад)")
     lines.append("")
 
     # Конкретный склад — топ-50 по остатку
@@ -95,8 +113,8 @@ def build_stock_by_qty(
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT product_name, is_srezka, stock_qty,
-                       cost_price_kop, stock_qty * cost_price_kop AS cost_total
-                FROM stock_snapshot
+                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
+                FROM stock_snapshot {_ST_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 50
@@ -122,12 +140,12 @@ def build_stock_by_qty(
     for sname in _STORE_ORDER:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT product_name, is_srezka, stock_qty, cost_price_kop,
-                       stock_qty * cost_price_kop AS cost_total,
+                SELECT product_name, is_srezka, stock_qty, {_ST_UNIT} AS cost_unit,
+                       {_ST_VALUE} AS cost_total,
                        COUNT(*) OVER() AS total_cnt,
                        SUM(stock_qty) OVER() AS total_qty,
-                       SUM(stock_qty * cost_price_kop) OVER() AS total_cost
-                FROM stock_snapshot
+                       SUM({_ST_VALUE}) OVER() AS total_cost
+                FROM stock_snapshot {_ST_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 15
@@ -252,8 +270,8 @@ def build_stock_report(
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT store_name, product_name, is_srezka, stock_qty,
-                   cost_price_kop, stock_qty * cost_price_kop AS cost_total
-            FROM stock_snapshot
+                   {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
+            FROM stock_snapshot {_ST_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
             ORDER BY store_name, stock_qty DESC
         """, p)
@@ -326,13 +344,13 @@ def build_stock_report(
     # в МойСклад имеют остатки-заглушки (999 999 / 10 000 ед.) и искажали итог
     # на 3–4 порядка (2 млн ед. / 200 млн ₽ по рознице). Считаем только реальный
     # товар из «Ассортимент/%».
-    lines.append("── ОСТАТКИ ПО СКЛАДАМ (только товар «Ассортимент») ──")
+    lines.append("── ОСТАТКИ ПО СКЛАДАМ (только товар «Ассортимент», закуп. цены) ──")
     order = _STORE_ORDER if not store_name else [store_name]
     with conn.cursor() as cur:
         for sn in order:
-            cur.execute("""
-                SELECT COUNT(*), SUM(stock_qty), SUM(stock_qty * cost_price_kop)
-                FROM stock_snapshot
+            cur.execute(f"""
+                SELECT COUNT(*), SUM(stock_qty), SUM({_ST_VALUE})
+                FROM stock_snapshot {_ST_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND store_name = %s
                   AND folder_path LIKE %s
             """, [day, sn, "Ассортимент/%"])
