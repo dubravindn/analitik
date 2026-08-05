@@ -80,8 +80,10 @@ def _fetch_stale(conn, day: date) -> tuple[list[dict], list[dict]]:
         else:
             stale_other.append(r)
 
-    stale_srezka.sort(key=lambda x: x["days_idle"], reverse=True)
-    stale_other.sort(key=lambda x: x["days_idle"], reverse=True)
+    # Сортируем по сумме застрявшего (себест. × кол-во): самые дорогие — первые
+    _cost = lambda p: float(p["stock_qty"]) * p["cost_price_kop"]  # noqa: E731
+    stale_srezka.sort(key=_cost, reverse=True)
+    stale_other.sort(key=_cost, reverse=True)
     return stale_srezka, stale_other
 
 
@@ -140,29 +142,25 @@ def build_stock_report(conn, day: date) -> str:
     # --- Залежалые СРЕЗКА ---
     if stale_srezka:
         lines.append(f"🚨 ЗАЛЕЖАЛЫЕ СРЕЗКА (≥{STALE_SREZKA_DAYS} дн. без продаж): {len(stale_srezka)} поз.")
-        for p in stale_srezka[:15]:
+        for p in stale_srezka:
             idle_str = f"{p['days_idle']} дн." if p["days_idle"] < 9000 else "нет данных о продаже"
-            cost_total = p["stock_qty"] * p["cost_price_kop"]
+            cost_total = float(p["stock_qty"]) * p["cost_price_kop"]
             lines.append(
                 f"  • {p['product_name']}: {_qty(p['stock_qty'])} шт · {idle_str}"
                 + (f" · себест. {_rub(cost_total)} ₽" if cost_total else "")
             )
-        if len(stale_srezka) > 15:
-            lines.append(f"  ... и ещё {len(stale_srezka) - 15} позиций")
         lines.append("")
 
     # --- Залежалые прочие ---
     if stale_other:
         lines.append(f"⚠️ ЗАЛЕЖАЛЫЕ прочие (≥{STALE_OTHER_DAYS} дн. без продаж): {len(stale_other)} поз.")
-        for p in stale_other[:10]:
+        for p in stale_other:
             idle_str = f"{p['days_idle']} дн." if p["days_idle"] < 9000 else "нет данных"
-            cost_total = p["stock_qty"] * p["cost_price_kop"]
+            cost_total = float(p["stock_qty"]) * p["cost_price_kop"]
             lines.append(
                 f"  • {p['product_name']}: {_qty(p['stock_qty'])} шт · {idle_str}"
                 + (f" · себест. {_rub(cost_total)} ₽" if cost_total else "")
             )
-        if len(stale_other) > 10:
-            lines.append(f"  ... и ещё {len(stale_other) - 10} позиций")
         lines.append("")
 
     if not stale_srezka and not stale_other:
