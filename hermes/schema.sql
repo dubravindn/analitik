@@ -146,3 +146,20 @@ ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS expense_item_name text;
 ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS project_name text;
 -- Проект у документа списания (указывает подразделение/склад/цель)
 ALTER TABLE loss_doc ADD COLUMN IF NOT EXISTS project_name text;
+
+-- Документы отгрузки (demand) для клиентской аналитики
+CREATE TABLE IF NOT EXISTS sales_doc (
+    doc_id       text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    store_id     text        NOT NULL,
+    store_name   text        NOT NULL,
+    agent_id     text,
+    agent_name   text,
+    positions    integer     NOT NULL DEFAULT 0,
+    amount_kop   bigint      NOT NULL DEFAULT 0,
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_sales_doc_day   ON sales_doc (day);
+CREATE INDEX IF NOT EXISTS ix_sales_doc_agent ON sales_doc (agent_id, day);

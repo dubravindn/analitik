@@ -120,10 +120,14 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
                    SUM(profit_kop)  AS profit
             FROM sales_by_product_day
             WHERE day BETWEEN %s AND %s {sf2}
+              AND assortment_id IN (
+                  SELECT DISTINCT product_id FROM stock_snapshot
+                  WHERE folder_path LIKE %s
+              )
             GROUP BY product_name
             ORDER BY SUM(revenue_kop) DESC
             LIMIT 20
-        """, p2)
+        """, p2 + ["Ассортимент/%"])
         top_rev = cur.fetchall()
 
     if top_rev:
@@ -145,10 +149,14 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
                    SUM(profit_kop)  AS profit
             FROM sales_by_product_day
             WHERE day BETWEEN %s AND %s {sf2}
+              AND assortment_id IN (
+                  SELECT DISTINCT product_id FROM stock_snapshot
+                  WHERE folder_path LIKE %s
+              )
             GROUP BY product_name
             ORDER BY SUM(profit_kop) DESC
             LIMIT 10
-        """, p2)
+        """, p2 + ["Ассортимент/%"])
         top_profit = cur.fetchall()
 
     if top_profit:
@@ -166,7 +174,22 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
 # ─── Дневной / периодный отчёт (для daily push) ───────────────────────────────
 
 def build_day_report(conn, day: date) -> str:
-    return build_sales_analytics(conn, day, day)
+    text = build_sales_analytics(conn, day, day)
+    baseline = calc.weekday_baseline(conn, day)
+    if baseline:
+        avg_kop, n = baseline
+        with conn.cursor() as cur:
+            cur.execute("SELECT SUM(revenue_kop) FROM sales_by_store_day WHERE day=%s", (day,))
+            row = cur.fetchone()
+        today_kop = int(row[0] or 0) if row else 0
+        diff = calc.delta_pct(today_kop, avg_kop)
+        avg_rub = f"{avg_kop / 100:,.0f}".replace(",", " ")
+        if diff is not None:
+            sign = "+" if diff >= 0 else ""
+            text += f"\n\n📊 Обычно ~{avg_rub} ₽ в этот д.н. ({sign}{diff:.0f}% к норме)"
+        else:
+            text += f"\n\n📊 Обычно ~{avg_rub} ₽ в этот д.н."
+    return text
 
 
 def build_period_report(conn, d_from: date, d_to: date) -> str:

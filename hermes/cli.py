@@ -21,6 +21,7 @@ from .etl_stock import run as run_sync_stock
 from .etl_loss import run as run_sync_loss
 from .etl_supply import run as run_sync_supply
 from .etl_cashflow import run as run_sync_cashflow
+from .etl_clients import run as run_sync_clients
 from .logging_setup import setup
 from .moysklad import MoyskladClient
 from .report_sales import build_day_report
@@ -73,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_cf = sub.add_parser("sync-cashflow", help="Выгрузить ДДС за период")
     p_sync_cf.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_sync_cf.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_sync_clients = sub.add_parser("sync-clients", help="Выгрузить отгрузки (demand) за период")
+    p_sync_clients.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_clients.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
     p_rep_loss = sub.add_parser("report-loss", help="Отчёт по списаниям (в stdout)")
     p_rep_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
@@ -173,6 +178,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Выгружено платежей: {n} событий за {args.d_from}..{args.d_to}")
         return 0
 
+    if args.cmd == "sync-clients":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_clients(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено отгрузок: {n} документов за {args.d_from}..{args.d_to}")
+        return 0
+
     if args.cmd == "report-loss":
         conn = db.connect(config.DATABASE_URL())
         print(build_loss_report(conn, args.d_from, args.d_to))
@@ -221,6 +234,13 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Снимок остатков на %s", today)
         run_sync_stock(client, conn, today)
         _send_telegram(build_stock_report(conn, today), log)
+
+        # 3. Алерты по выручке за вчера
+        from .alerts import build_alerts
+        alert_text = build_alerts(conn, yesterday)
+        if alert_text:
+            log.info("Отправляем алерт выручки")
+            _send_telegram(alert_text, log)
 
         return 0
 

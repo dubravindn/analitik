@@ -59,3 +59,26 @@ def expected_transfer_price(cash_price: float) -> float:
 
 def expected_retail_price(cash_price: float) -> float:
     return round(cash_price * COEFF_RETAIL, 2)
+
+
+def weekday_baseline(conn, day: "date", weeks: int = 8) -> "tuple[int, int] | None":
+    """Средняя выручка по тому же дню недели за прошлые N недель.
+
+    Returns (avg_revenue_kop, n_data_points) or None if no data.
+    """
+    from datetime import timedelta
+    past_days = [day - timedelta(weeks=w) for w in range(1, weeks + 1)]
+    placeholders = ", ".join(["%s"] * len(past_days))
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT SUM(revenue_kop), COUNT(DISTINCT day)
+            FROM sales_by_store_day
+            WHERE day IN ({placeholders})
+        """, past_days)
+        row = cur.fetchone()
+    if not row or not row[1]:
+        return None
+    total_kop, n_days = int(row[0] or 0), int(row[1])
+    if n_days == 0:
+        return None
+    return total_kop // n_days, n_days

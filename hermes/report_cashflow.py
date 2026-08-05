@@ -158,6 +158,24 @@ def build_expenses_report(conn, d_from: date, d_to: date) -> str:
             lines.append(f"  {item_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
         lines.append("")
 
+    # Разбивка по проектам (склад/подразделение)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(NULLIF(project_name, ''), 'Без проекта'),
+                   SUM(amount_kop), COUNT(*)
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'out'
+            GROUP BY 1
+            ORDER BY 2 DESC
+        """, (d_from, d_to))
+        by_project = cur.fetchall()
+
+    if len(by_project) > 1:
+        lines.append("── По проектам (складам) ──")
+        for proj_name, kop, cnt in by_project:
+            lines.append(f"  📍 {proj_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
+        lines.append("")
+
     # Каждый документ
     with conn.cursor() as cur:
         cur.execute("""
