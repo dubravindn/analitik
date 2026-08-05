@@ -18,10 +18,17 @@ from datetime import date, datetime, timedelta
 from . import config, db
 from .etl_sales import run as run_sync
 from .etl_stock import run as run_sync_stock
+from .etl_loss import run as run_sync_loss
+from .etl_supply import run as run_sync_supply
+from .etl_cashflow import run as run_sync_cashflow
 from .logging_setup import setup
 from .moysklad import MoyskladClient
 from .report_sales import build_day_report
 from .report_stock import build_stock_report
+from .report_loss import build_loss_report
+from .report_supply import build_supply_report
+from .report_cashflow import build_cashflow_report
+from .report_employees import build_employee_report
 
 
 def _parse_date(s: str) -> date:
@@ -54,6 +61,34 @@ def main(argv: list[str] | None = None) -> int:
 
     p_send_stock = sub.add_parser("send-stock", help="Отчёт по остаткам за день → Telegram")
     p_send_stock.add_argument("--date", dest="d", required=True, type=_parse_date)
+
+    p_sync_loss = sub.add_parser("sync-loss", help="Выгрузить списания за период")
+    p_sync_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_loss.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_sync_supply = sub.add_parser("sync-supply", help="Выгрузить поставки за период")
+    p_sync_supply.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_supply.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_sync_cf = sub.add_parser("sync-cashflow", help="Выгрузить ДДС за период")
+    p_sync_cf.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_cf.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_rep_loss = sub.add_parser("report-loss", help="Отчёт по списаниям (в stdout)")
+    p_rep_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_rep_loss.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_rep_supply = sub.add_parser("report-supply", help="Отчёт по закупкам (в stdout)")
+    p_rep_supply.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_rep_supply.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_rep_cf = sub.add_parser("report-cashflow", help="Отчёт ДДС (в stdout)")
+    p_rep_cf.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_rep_cf.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_rep_emp = sub.add_parser("report-employees", help="Аналитика сотрудников (в stdout)")
+    p_rep_emp.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_rep_emp.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
     sub.add_parser(
         "daily",
@@ -112,6 +147,50 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "send-stock":
         conn = db.connect(config.DATABASE_URL())
         _send_telegram(build_stock_report(conn, args.d), log)
+        return 0
+
+    if args.cmd == "sync-loss":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_loss(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено списаний: {n} документов за {args.d_from}..{args.d_to}")
+        return 0
+
+    if args.cmd == "sync-supply":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_supply(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено поставок: {n} документов за {args.d_from}..{args.d_to}")
+        return 0
+
+    if args.cmd == "sync-cashflow":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_cashflow(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено платежей: {n} событий за {args.d_from}..{args.d_to}")
+        return 0
+
+    if args.cmd == "report-loss":
+        conn = db.connect(config.DATABASE_URL())
+        print(build_loss_report(conn, args.d_from, args.d_to))
+        return 0
+
+    if args.cmd == "report-supply":
+        conn = db.connect(config.DATABASE_URL())
+        print(build_supply_report(conn, args.d_from, args.d_to))
+        return 0
+
+    if args.cmd == "report-cashflow":
+        conn = db.connect(config.DATABASE_URL())
+        print(build_cashflow_report(conn, args.d_from, args.d_to))
+        return 0
+
+    if args.cmd == "report-employees":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        print(build_employee_report(client, args.d_from, args.d_to))
         return 0
 
     if args.cmd == "bot":
