@@ -28,21 +28,46 @@ def _qty(q: float) -> str:
 
 # ─── Отчёт «Остатки»: позиции с наибольшим количеством ───────────────────────
 
-def build_stock_by_qty(conn, day: date, store_name: str | None = None) -> str:
-    """Все позиции, отсортированные по количеству, с разбивкой по складам."""
+def _group_filter(folder_group: str | None) -> tuple[str, list]:
+    """Возвращает (SQL-фрагмент WHERE, параметры) для фильтра группы."""
+    if not folder_group:
+        return "", []
+    return "AND SPLIT_PART(folder_path, '/', 1) = %s", [folder_group]
+
+
+def fetch_groups(conn, day: date) -> list[str]:
+    """Уникальные папки верхнего уровня за день (для клавиатуры)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT SPLIT_PART(folder_path, '/', 1)
+            FROM stock_snapshot
+            WHERE day = %s AND folder_path IS NOT NULL AND folder_path != ''
+            ORDER BY 1
+        """, [day])
+        return [r[0] for r in cur.fetchall() if r[0]]
+
+
+def build_stock_by_qty(
+    conn, day: date,
+    store_name: str | None = None,
+    folder_group: str | None = None,
+) -> str:
+    """Свободный остаток (stock − reserve), разбивка по складам."""
     store_label = f" · {store_name}" if store_name else " · Все склады"
+    group_label = f" · Группа: {folder_group}" if folder_group else ""
     lines: list[str] = []
-    lines.append(f"📦 Остатки на {day.strftime('%d.%m.%Y')}{store_label}")
+    lines.append(f"📦 Остатки на {day.strftime('%d.%m.%Y')}{store_label}{group_label}")
     lines.append("")
 
+    gf, gp = _group_filter(folder_group)
     sf = "AND store_name = %s" if store_name else ""
-    p  = [day] + ([store_name] if store_name else [])
+    p  = [day] + ([store_name] if store_name else []) + gp
 
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COUNT(*), COALESCE(SUM(stock_qty), 0), COALESCE(SUM(stock_qty * cost_price_kop), 0)
             FROM stock_snapshot
-            WHERE day = %s AND stock_qty > 0 {sf}
+            WHERE day = %s AND stock_qty > 0 {sf} {gf}
         """, p)
         row = cur.fetchone()
         total_pos, total_qty, total_cost = row[0], float(row[1] or 0), float(row[2] or 0)
@@ -56,18 +81,18 @@ def build_stock_by_qty(conn, day: date, store_name: str | None = None) -> str:
     )
     lines.append("")
 
-    # Если конкретный склад — топ-50 по свободному остатку (без резерва)
+    # Конкретный склад — топ-50 по свободному остатку
     if store_name:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT product_name, is_srezka, stock_qty, reserve_qty,
                        cost_price_kop,
                        (stock_qty - reserve_qty) * cost_price_kop AS free_cost
                 FROM stock_snapshot
-                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s
+                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s {gf}
                 ORDER BY (stock_qty - reserve_qty) DESC
                 LIMIT 50
-            """, [day, store_name])
+            """, [day, store_name] + gp)
             rows = cur.fetchall()
 
         lines.append(f"── Топ-{min(50, len(rows))} по свободному остатку ──")
@@ -81,20 +106,20 @@ def build_stock_by_qty(conn, day: date, store_name: str | None = None) -> str:
             )
         return "\n".join(lines)
 
-    # Все склады — разбивка по складам, топ-15 по свободному остатку
+    # Все склады — разбивка по складам, топ-15
     for sname in _STORE_ORDER:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT product_name, is_srezka, stock_qty, reserve_qty, cost_price_kop,
                        (stock_qty - reserve_qty) * cost_price_kop AS free_cost,
                        COUNT(*) FILTER (WHERE stock_qty - reserve_qty > 0) OVER() AS total_cnt,
                        SUM(stock_qty - reserve_qty) OVER()                         AS total_free,
                        SUM((stock_qty - reserve_qty) * cost_price_kop) OVER()      AS total_cost
                 FROM stock_snapshot
-                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s
+                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s {gf}
                 ORDER BY (stock_qty - reserve_qty) DESC
                 LIMIT 15
-            """, [day, sname])
+            """, [day, sname] + gp)
             rows = cur.fetchall()
 
         if not rows:
@@ -181,20 +206,26 @@ def build_reserve_report(conn, day: date, store_name: str | None = None) -> str:
 
 # ─── Отчёт «Залежалые» ────────────────────────────────────────────────────────
 
-def build_stock_report(conn, day: date, store_name: str | None = None) -> str:
+def build_stock_report(
+    conn, day: date,
+    store_name: str | None = None,
+    folder_group: str | None = None,
+) -> str:
     """Залежалые позиции: СРЕЗКА ≥N дн., прочие ≥M дн., разбивка по складам."""
     store_label = f" · {store_name}" if store_name else " · Все склады"
+    group_label = f" · Группа: {folder_group}" if folder_group else ""
     lines: list[str] = []
-    lines.append(f"🚨 Залежалые на {day.strftime('%d.%m.%Y')}{store_label}")
+    lines.append(f"🚨 Залежалые на {day.strftime('%d.%m.%Y')}{store_label}{group_label}")
     lines.append(f"   СРЕЗКА ≥{STALE_SREZKA_DAYS} дн. · Прочие ≥{STALE_OTHER_DAYS} дн.")
     lines.append("")
 
+    gf, gp = _group_filter(folder_group)
     sf = "AND store_name = %s" if store_name else ""
-    p  = [day] + ([store_name] if store_name else [])
+    p  = [day] + ([store_name] if store_name else []) + gp
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COUNT(*) FROM stock_snapshot WHERE day = %s AND stock_qty > 0 {sf}
+            SELECT COUNT(*) FROM stock_snapshot WHERE day = %s AND stock_qty > 0 {sf} {gf}
         """, p)
         total_rows = cur.fetchone()[0]
 
@@ -211,7 +242,7 @@ def build_stock_report(conn, day: date, store_name: str | None = None) -> str:
             SELECT store_name, product_name, is_srezka, stock_qty,
                    cost_price_kop, stock_qty * cost_price_kop AS cost_total
             FROM stock_snapshot
-            WHERE day = %s AND stock_qty > 0 {sf}
+            WHERE day = %s AND stock_qty > 0 {sf} {gf}
             ORDER BY store_name, stock_qty DESC
         """, p)
         rows = cur.fetchall()

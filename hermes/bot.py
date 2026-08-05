@@ -21,8 +21,8 @@ log = logging.getLogger("hermes.bot")
 # Для каждой секции: список шагов ["period", "store"]
 _DIALOG_STEPS: dict[str, list[str]] = {
     "sales":    ["period", "store"],
-    "stock":    ["period", "store"],
-    "stale":    ["period", "store"],
+    "stock":    ["period", "store", "group"],   # доп. шаг: фильтр по группе товаров
+    "stale":    ["period", "store", "group"],
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
     "expenses": ["period"],           # нет фильтра по складу у кассовых документов
@@ -183,10 +183,13 @@ def _start_dialog(section: str, chat_id: str, bot_token: str) -> None:
     steps = _DIALOG_STEPS[section]
     first_step = steps[0]
     _set_state(chat_id, section, first_step, {})
-    _ask_step(section, first_step, chat_id, bot_token)
+    _ask_step(section, first_step, chat_id, bot_token, {})
 
 
-def _ask_step(section: str, step: str, chat_id: str, bot_token: str) -> None:
+def _ask_step(
+    section: str, step: str, chat_id: str, bot_token: str,
+    params: dict | None = None,
+) -> None:
     title = _SECTION_TITLE[section]
     if step == "period":
         if section in ("stale", "stock", "reserves"):
@@ -203,6 +206,14 @@ def _ask_step(section: str, step: str, chat_id: str, bot_token: str) -> None:
         prompt = f"{title}\n\n📍 По какому складу?"
         tg.send_message(bot_token, chat_id, prompt, tg.store_keyboard(config.STORES))
 
+    elif step == "group":
+        groups = (params or {}).get("_groups", [])
+        prompt = (
+            f"{title}\n\n📁 По какой группе товаров?\n"
+            f"(«Все группы» — без фильтра)"
+        )
+        tg.send_message(bot_token, chat_id, prompt, tg.group_keyboard(groups))
+
 
 # ─── диалог: продолжение ─────────────────────────────────────────────────────
 
@@ -211,6 +222,25 @@ def _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, b
     step    = state["step"]
     params  = state["params"]
     steps   = _DIALOG_STEPS[section]
+
+    def _next_step_or_execute(current_step: str) -> None:
+        idx = steps.index(current_step) + 1
+        if idx < len(steps):
+            next_step = steps[idx]
+            # Перед шагом "group" — подгружаем список групп из базы
+            if next_step == "group":
+                try:
+                    conn = conn_factory()
+                    snap_date = params.get("d_to") or params.get("d_from")
+                    from .report_stock import fetch_groups
+                    params["_groups"] = fetch_groups(conn, snap_date) if snap_date else []
+                except Exception:
+                    params["_groups"] = []
+            _set_state(chat_id, section, next_step, params)
+            _ask_step(section, next_step, chat_id, bot_token, params)
+        else:
+            _clear_state(chat_id)
+            _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
 
     # ── Шаг: период ──
     if step == "period":
@@ -239,34 +269,43 @@ def _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, b
                             "Выберите период из кнопок или введите даты.",
                             tg.period_keyboard())
             return
-
-        # Переходим к следующему шагу
-        next_step_idx = steps.index("period") + 1
-        if next_step_idx < len(steps):
-            next_step = steps[next_step_idx]
-            _set_state(chat_id, section, next_step, params)
-            _ask_step(section, next_step, chat_id, bot_token)
-        else:
-            _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
+        _next_step_or_execute("period")
 
     # ── Шаг: склад ──
     elif step == "store":
         if norm in _STORE_BUTTONS:
             params["store_name"] = _STORE_BUTTONS[norm]
-            _clear_state(chat_id)
-            _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
+            _next_step_or_execute("store")
         else:
             tg.send_message(bot_token, chat_id,
                             "Выберите склад из кнопок.",
                             tg.store_keyboard(config.STORES))
 
+    # ── Шаг: группа товаров ──
+    elif step == "group":
+        groups = params.get("_groups") or []
+        norm_map = {f"📁 {g}".lower(): g for g in groups}
+        if norm == "📦 все группы":
+            params["folder_group"] = None
+            _clear_state(chat_id)
+            _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
+        elif norm in norm_map:
+            params["folder_group"] = norm_map[norm]
+            _clear_state(chat_id)
+            _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
+        else:
+            tg.send_message(bot_token, chat_id,
+                            "Выберите группу из кнопок.",
+                            tg.group_keyboard(groups))
+
 
 # ─── выполнение отчёта ────────────────────────────────────────────────────────
 
 def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
-    d_from     = params.get("d_from")
-    d_to       = params.get("d_to")
-    store_name = params.get("store_name")   # None = все склады
+    d_from       = params.get("d_from")
+    d_to         = params.get("d_to")
+    store_name   = params.get("store_name")    # None = все склады
+    folder_group = params.get("folder_group")  # None = все группы
 
     # Для expenses — нет фильтра по складу
     if section == "expenses":
@@ -295,10 +334,10 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                               bot_token, chat_id)
         elif section == "stock":
             text = _run_stock(conn_factory, client_factory, d_from, store_name,
-                              bot_token, chat_id)
+                              folder_group, bot_token, chat_id)
         elif section == "stale":
             text = _run_stale(conn_factory, client_factory, d_from, store_name,
-                              bot_token, chat_id)
+                              folder_group, bot_token, chat_id)
         elif section == "loss":
             text = _run_loss(conn_factory, client_factory, d_from, d_to, store_name,
                              bot_token, chat_id)
@@ -332,7 +371,8 @@ def _run_sales(conn_factory, client_factory, d_from, d_to, store_name, bot_token
     return build_sales_analytics(conn, d_from, d_to, store_name)
 
 
-def _run_stock(conn_factory, client_factory, snap_date, store_name, bot_token, chat_id):
+def _run_stock(conn_factory, client_factory, snap_date, store_name, folder_group,
+               bot_token, chat_id):
     from .etl_stock import run as etl_stock
     from .report_stock import build_stock_by_qty
     conn   = conn_factory()
@@ -343,10 +383,11 @@ def _run_stock(conn_factory, client_factory, snap_date, store_name, bot_token, c
             tg.send_message(bot_token, chat_id,
                             f"⏳ Снимаю остатки на {snap_date.strftime('%d.%m.%Y')}…")
             etl_stock(client, conn, snap_date)
-    return build_stock_by_qty(conn, snap_date, store_name)
+    return build_stock_by_qty(conn, snap_date, store_name, folder_group)
 
 
-def _run_stale(conn_factory, client_factory, snap_date, store_name, bot_token, chat_id):
+def _run_stale(conn_factory, client_factory, snap_date, store_name, folder_group,
+               bot_token, chat_id):
     from .etl_stock import run as etl_stock
     from .report_stock import build_stock_report
     conn   = conn_factory()
@@ -357,7 +398,7 @@ def _run_stale(conn_factory, client_factory, snap_date, store_name, bot_token, c
             tg.send_message(bot_token, chat_id,
                             f"⏳ Снимаю остатки на {snap_date.strftime('%d.%m.%Y')}…")
             etl_stock(client, conn, snap_date)
-    return build_stock_report(conn, snap_date, store_name)
+    return build_stock_report(conn, snap_date, store_name, folder_group)
 
 
 def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token, chat_id):

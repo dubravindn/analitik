@@ -6,15 +6,15 @@ from datetime import date
 
 _FONT      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-_MARGIN  = 12
-_LINE_H  = 4.8
+_MARGIN  = 12   # мм (отступ слева, справа, сверху)
+_LINE_H  = 4.8  # мм высота строки
 
+# Убираем emoji и символы, которых нет в DejaVu Sans
 _RE_STRIP = re.compile(
-    "["
-    "\U0001F000-\U0001FFFF"   # emoji + supplemental symbols
-    "☀-⛿"           # misc symbols
-    "✀-➿"           # dingbats
-    "︀-﻿"           # variation selectors
+    "[\U0001F000-\U0001FFFF"  # emoji supplemental planes
+    "\U00002600-\U000026FF"   # misc symbols ☀ ⚡ etc.
+    "\U00002700-\U000027BF"   # dingbats ✀ ✅ etc.
+    "\U0000FE00-\U0000FEFF"   # variation selectors
     "]",
     flags=re.UNICODE,
 )
@@ -22,7 +22,7 @@ _RE_STRIP = re.compile(
 
 def _clean(text: str) -> str:
     """Убрать emoji, которых нет в DejaVu Sans."""
-    return _RE_STRIP.sub("", text).strip()
+    return _RE_STRIP.sub("", text)
 
 
 def build_pdf(
@@ -42,21 +42,31 @@ def build_pdf(
 
     class _PDF(FPDF):
         def header(self):
+            self.set_x(self.l_margin)
             self.set_font("DejaVu_B", size=8)
             self.set_text_color(140, 140, 140)
             self.cell(
-                0, 5,
+                self.w - self.l_margin - self.r_margin,
+                5,
                 f"Hermes | {period_str} | {store_label}",
-                align="R", new_x="LMARGIN", new_y="NEXT",
+                align="R",
+                new_x="LMARGIN",
+                new_y="NEXT",
             )
             self.set_text_color(0, 0, 0)
             self.ln(1)
 
         def footer(self):
             self.set_y(-12)
+            self.set_x(self.l_margin)
             self.set_font("DejaVu", size=8)
             self.set_text_color(140, 140, 140)
-            self.cell(0, 6, f"Стр. {self.page_no()}", align="C")
+            self.cell(
+                self.w - self.l_margin - self.r_margin,
+                6,
+                f"Стр. {self.page_no()}",
+                align="C",
+            )
             self.set_text_color(0, 0, 0)
 
     pdf = _PDF(orientation="P", unit="mm", format="A4")
@@ -65,58 +75,90 @@ def build_pdf(
     pdf.add_font("DejaVu_B", style="", fname=_FONT_BOLD)
     pdf.set_margins(_MARGIN, _MARGIN, _MARGIN)
 
+    # Эффективная ширина текстовой области
+    eff_w = 210 - _MARGIN - _MARGIN  # 186 мм
+
     # ── Титульная страница ──────────────────────────────────────────────────────
     pdf.add_page()
     pdf.ln(18)
+    pdf.set_x(_MARGIN)
     pdf.set_font("DejaVu_B", size=15)
-    pdf.cell(0, 12, "ОТЧЁТ", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 12, "Цветочная База Дубравиных", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(eff_w, 12, "ОТЧЁТ", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(_MARGIN)
+    pdf.cell(eff_w, 12, "Цветочная База Дубравиных", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
     pdf.set_font("DejaVu", size=11)
-    pdf.cell(0, 9, f"Период: {period_str}", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 9, f"Склад: {store_label}",  align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(_MARGIN)
+    pdf.cell(eff_w, 9, f"Период: {period_str}", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(_MARGIN)
+    pdf.cell(eff_w, 9, f"Склад: {store_label}", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(8)
     pdf.set_font("DejaVu", size=9)
     pdf.set_text_color(100, 100, 100)
-    for idx, s in enumerate([
+    for s in [
         "1. Продажи  — выручка, прибыль, топ позиций",
         "2. Остатки  — свободный остаток на дату",
         "3. Залежалые — позиции без движения",
         "4. Списания — документы с позициями",
         "5. Расходы  — движение денег",
-    ], 1):
-        pdf.cell(0, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
+    ]:
+        pdf.set_x(_MARGIN)
+        pdf.cell(eff_w, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
 
     # ── Вспомогательная функция секции ─────────────────────────────────────────
     def _section(title: str, content: str) -> None:
         pdf.add_page()
+        pdf.set_x(_MARGIN)
         pdf.set_font("DejaVu_B", size=12)
-        pdf.cell(0, 9, title, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(eff_w, 9, title, new_x="LMARGIN", new_y="NEXT")
+        # Горизонтальная черта под заголовком через set_draw_color + rect
+        y_line = pdf.get_y()
         pdf.set_draw_color(180, 180, 180)
-        pdf.line(_MARGIN, pdf.get_y(), 210 - _MARGIN, pdf.get_y())
-        pdf.ln(2)
+        pdf.set_line_width(0.3)
+        pdf.line(_MARGIN, y_line, 210 - _MARGIN, y_line)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.set_line_width(0.2)
+        pdf.ln(3)
         pdf.set_font("DejaVu", size=8)
 
         for raw_line in content.split("\n"):
             cline = _clean(raw_line)
-            if not cline:
+            if not cline.strip():
                 pdf.ln(2)
                 continue
-            is_header = cline.startswith("--") or cline.startswith("==")
-            if is_header:
-                pdf.set_font("DejaVu_B", size=8)
-                pdf.multi_cell(0, _LINE_H, cline)
-                pdf.set_font("DejaVu", size=8)
-            else:
-                pdf.multi_cell(0, _LINE_H, cline)
+            # Всегда сбрасываем x в левый отступ перед multi_cell
+            pdf.set_x(_MARGIN)
+            stripped = cline.lstrip()
+            is_hdr = stripped.startswith("--") or stripped.startswith("==")
+            try:
+                if is_hdr:
+                    pdf.set_font("DejaVu_B", size=8)
+                    pdf.multi_cell(
+                        eff_w, _LINE_H, cline,
+                        new_x="LMARGIN", new_y="NEXT",
+                    )
+                    pdf.set_font("DejaVu", size=8)
+                else:
+                    pdf.multi_cell(
+                        eff_w, _LINE_H, cline,
+                        new_x="LMARGIN", new_y="NEXT",
+                    )
+            except Exception:
+                # Защита от любых ошибок отдельной строки
+                pdf.set_x(_MARGIN)
+                pdf.multi_cell(
+                    eff_w, _LINE_H,
+                    cline[:120] if len(cline) > 120 else cline,
+                    new_x="LMARGIN", new_y="NEXT",
+                )
 
     # ── Секция 1: Продажи ──────────────────────────────────────────────────────
     from .report_sales import build_sales_analytics
     _section("1. ПРОДАЖИ", build_sales_analytics(conn, d_from, d_to, store_name))
 
     # ── Секция 2: Остатки (на последний день периода) ──────────────────────────
-    from .report_stock import build_stock_by_qty, build_reserve_report
+    from .report_stock import build_stock_by_qty
     _section("2. ОСТАТКИ", build_stock_by_qty(conn, d_to, store_name))
 
     # ── Секция 3: Залежалые ────────────────────────────────────────────────────

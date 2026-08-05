@@ -104,6 +104,19 @@ def detail_keyboard() -> dict:
     }
 
 
+def group_keyboard(groups: list[str]) -> dict:
+    """Клавиатура выбора группы товаров."""
+    rows = []
+    for i in range(0, len(groups), 2):
+        pair = [{"text": f"📁 {groups[i]}"}]
+        if i + 1 < len(groups):
+            pair.append({"text": f"📁 {groups[i + 1]}"})
+        rows.append(pair)
+    rows.append([{"text": "📦 Все группы"}])
+    rows.append([{"text": "🚫 Отмена"}])
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
 def input_dates_keyboard() -> dict:
     """Подсказка при вводе дат вручную — только отмена."""
     return {
