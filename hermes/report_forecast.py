@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
+import statistics
 from datetime import date, timedelta
 from typing import Optional
 
 from .moysklad import MoyskladClient
-from . import config
+from . import config, calc
 
 log = logging.getLogger("hermes.report_forecast")
 
@@ -240,6 +243,135 @@ def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
 
 
+# ─── Позиционный прогноз (SKU) ────────────────────────────────────────────────
+
+_PKG_RE = re.compile(r"(\d+)\s*шт\.?", re.IGNORECASE)
+
+
+_PKG_MAX = 100   # реальная кратность пучка/упаковки цветов ≤ 100
+
+
+def _pkg_size(name: str) -> "int | None":
+    """Кратность упаковки из названия: «Роза … 25 шт.» → 25. None — не распознано.
+
+    Большие «N шт.» (напр. «Кризал 1000 шт.», «Оазис … 500 шт.») — это содержимое
+    коробки, а не кратность заказа: их не округляем (иначе 0.7 → 1000 ед.).
+    """
+    m = _PKG_RE.search(name or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= _PKG_MAX else None
+
+
+def _orders_by_product(client: MoyskladClient, project_href: str,
+                       state_href: Optional[str]) -> dict:
+    """Оформленные заказы клиентов из проекта → {product_id: {name, qty}}."""
+    by_pid: dict[str, dict] = {}
+    for order in _fetch_orders(client, project_href, state_href):
+        try:
+            positions = _fetch_order_positions(client, order["id"])
+        except Exception as e:
+            log.warning("Позиции заказа %s недоступны: %s", order.get("id"), e)
+            continue
+        for pos in positions:
+            assort = pos.get("assortment", {}) or {}
+            pid = assort.get("id", "")
+            if not pid:
+                continue
+            qty = float(pos.get("quantity", 0) or 0)
+            e = by_pid.setdefault(pid, {"name": assort.get("name", ""), "qty": 0.0})
+            e["qty"] += qty
+    return by_pid
+
+
+def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
+                       n_cycles: int = 3, round_pkg: bool = False) -> list[dict]:
+    """Позиционный прогноз закупки. Возвращает список SKU с «к заказу».
+
+    К заказу = расход_за_цикл + заказы клиентов − свободный остаток.
+    Расход_за_цикл = (продано + списано за последние n_cycles циклов) / n_cycles.
+    Свободный остаток = available_qty (резерв уже обещан). Служебные позиции
+    (sentinel-остаток, не «Ассортимент») исключены. Если история позиции меньше
+    n_cycles циклов — enough_history=False (в отчёте «мало истории»).
+    round_pkg — округлять вверх до кратности упаковки (2-й проход).
+    """
+    win_from = today - timedelta(days=n_cycles * avg_cycle)
+    win_to   = today - timedelta(days=1)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT product_id, product_name, folder_path FROM product_dim WHERE folder_path LIKE %s",
+            ("Ассортимент/%",),
+        )
+        dim = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT assortment_id, SUM(sell_qty)
+            FROM sales_by_product_day WHERE day BETWEEN %s AND %s
+            GROUP BY assortment_id
+        """, (win_from, win_to))
+        sales = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT pd.product_id, SUM(li.qty)
+            FROM loss_item li
+            JOIN loss_doc ld ON ld.doc_id = li.doc_id
+            JOIN product_dim pd ON pd.product_name = li.product_name
+            WHERE ld.day BETWEEN %s AND %s
+            GROUP BY pd.product_id
+        """, (win_from, win_to))
+        loss = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT ss.product_id, SUM(ss.available_qty)
+            FROM stock_snapshot ss
+            WHERE ss.day = (SELECT MAX(day) FROM stock_snapshot)
+              AND ss.reserve_qty = 0 AND ss.available_qty < %s
+            GROUP BY ss.product_id
+        """, (_SENTINEL_QTY,))
+        stock = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("SELECT assortment_id, MIN(day) FROM sales_by_product_day GROUP BY assortment_id")
+        first_sale = {r[0]: r[1] for r in cur.fetchall()}
+
+    prices = calc.purchase_prices_asof(conn, today)   # {pid: price_kop}
+
+    pids = set(sales) | set(loss) | set(orders_by_pid) | set(stock)
+    items: list[dict] = []
+    for pid in pids:
+        if pid not in dim:
+            continue   # не реальный товар «Ассортимент» (услуга/шар/расходник)
+        name, folder = dim[pid]
+        consumption = (sales.get(pid, 0.0) + loss.get(pid, 0.0)) / n_cycles
+        free = stock.get(pid, 0.0)
+        ordered = orders_by_pid.get(pid, {}).get("qty", 0.0)
+        to_order = consumption + ordered - free
+        if to_order <= 0:
+            continue
+
+        fs = first_sale.get(pid)
+        enough = bool(fs and (today - fs).days >= n_cycles * avg_cycle)
+
+        pkg = _pkg_size(name)
+        final = to_order
+        packs = None
+        if round_pkg and pkg:
+            final = math.ceil(to_order / pkg) * pkg
+            packs = final / pkg
+        price = prices.get(pid, 0)
+        parts = folder.split("/")
+        cat = parts[1] if len(parts) >= 2 else folder
+
+        items.append({
+            "pid": pid, "name": name, "cat": cat,
+            "consumption": consumption, "free": free, "orders": ordered,
+            "raw_to_order": to_order, "to_order": final, "packs": packs, "pkg": pkg,
+            "enough": enough, "price_kop": price, "buy_kop": round(final * price),
+        })
+    return items
+
+
 # ─── Главная функция ──────────────────────────────────────────────────────────
 
 def build_forecast_report(client: MoyskladClient, conn) -> str:
@@ -348,96 +480,81 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
         lines.append(f"⚠️ Проект «{_PROJECT_KEYWORD}» не найден в МойСклад.")
         lines.append("")
 
-    # ── 2. Категорийный прогноз по циклам с поправкой на праздники ───────────
+    # ── 2. Позиционный прогноз закупки на фургон ─────────────────────────────
     van_list = _van_dates(conn)
     if len(van_list) >= 3:
-        last_van = van_list[-1]
         gaps = [(van_list[i + 1] - van_list[i]).days for i in range(len(van_list) - 1)]
-        avg_cycle = round(sum(gaps) / len(gaps))
+        avg_cycle = round(statistics.median(gaps)) or 7   # медиана устойчивее к провалам
+        last_van = van_list[-1]
         next_van  = last_van + timedelta(days=avg_cycle)
-        days_left = (next_van - today).days
+        days_left = max((next_van - today).days, 0)
 
-        lines.append("═══ ПРОГНОЗ ПО СРЕДНЕМУ РАСХОДУ ═══")
-        lines.append("(сколько брать под цикл фургона, по среднему расходу категории)")
-        lines.append(
-            f"  Последняя приемка: {last_van.strftime('%d.%m.%Y')}"
-            f" | Цикл фургона: ~{avg_cycle} дн. (еженедельно)"
-            f" | Следующая: ~{next_van.strftime('%d.%m.%Y')}"
-            f" (через {max(days_left, 0)} дн.)"
-        )
+        _log_sentinel_positions(conn)
+        orders_by_pid = _orders_by_product(client, project_href, state_href) if project_href else {}
+        items = build_sku_forecast(conn, orders_by_pid, today, avg_cycle, n_cycles=3, round_pkg=True)
+        holidays = _holidays_in_window(conn, today, next_van)
+
+        # ── Блок 1: хватит ли до фургона ──
+        lines.append(f"═══ ХВАТИТ ЛИ ДО ФУРГОНА (осталось {days_left} дн.) ═══")
+        lines.append(f"Позиции, которые кончатся раньше {next_van.strftime('%d.%m')} — "
+                     f"докупить локально или перекинуть с другой точки.")
+        runout = []
+        for it in items:
+            if not it["enough"]:
+                continue
+            need = it["consumption"] / avg_cycle * days_left
+            short = need - it["free"]
+            if short > 0.5:
+                runout.append((short, need, it))
+        runout.sort(key=lambda x: -x[0])
+        if runout:
+            for short, need, it in runout[:15]:
+                lines.append(f"  • {it['name']}: до фургона нужно ~{_qty(need)}, "
+                             f"ост. {_qty(it['free'])} → не хватит ~{_qty(short)}")
+        else:
+            lines.append("  ✅ Свободных остатков хватает до прихода фургона.")
         lines.append("")
 
-        # Праздники в окне прогноза
-        holidays = _holidays_in_window(conn, today, next_van)
+        # ── Блок 2: заказ на фургон (позиционный) ──
+        lines.append(f"═══ ЗАКАЗ НА ФУРГОН {next_van.strftime('%d.%m')} (цикл {avg_cycle} дн.) ═══")
+        lines.append("Расход за цикл + заказы клиентов − свободный остаток.")
         if holidays:
-            hnames = ", ".join(h["name"] for h in holidays)
-            lines.append(f"  ⚠️ Праздники в окне: {hnames}")
+            lines.append(f"⚠️ Праздники в окне: {', '.join(h['name'] for h in holidays)} — "
+                         f"расход может быть выше среднего.")
+        lines.append("")
+
+        ok_items  = sorted([it for it in items if it["enough"]], key=lambda x: -x["buy_kop"])
+        malo_items = [it for it in items if not it["enough"]]
+        _TOP = 40
+        shown, rest = ok_items[:_TOP], ok_items[_TOP:]
+
+        by_cat: dict[str, list] = {}
+        for it in shown:
+            by_cat.setdefault(it["cat"], []).append(it)
+        star = False
+        for cat, its in by_cat.items():
+            lines.append(f"── {cat} ──")
+            for it in its:
+                if it["packs"]:
+                    pkg_str = f" ({_qty(it['packs'])} упак.)"
+                else:
+                    pkg_str = " *"; star = True
+                lines.append(f"  • {it['name']}: расход/цикл {_qty(it['consumption'])} · "
+                             f"ост. {_qty(it['free'])} · заказы {_qty(it['orders'])}")
+                lines.append(f"      → К ЗАКАЗУ {_qty(it['to_order'])} ед.{pkg_str}"
+                             + (f"  ≈{_rub(it['buy_kop'])} ₽" if it['buy_kop'] else ""))
+            lines.append(f"  Итого по {cat}: {len(its)} поз. · ≈{_rub(sum(i['buy_kop'] for i in its))} ₽")
             lines.append("")
-
-        # По каждой категории
-        _log_sentinel_positions(conn)   # отсечённые служебные позиции — в лог
-        categories = _categories(conn)
-        if not categories:
-            lines.append("  Нет данных в product_dim — запусти sync-stock для заполнения.")
-        else:
-            # Базовый период: последние 2–3 цикла (без текущего)
-            if len(van_list) >= 4:
-                base_from = van_list[-4]
-            else:
-                base_from = van_list[0]
-            base_to = last_van - timedelta(days=1)
-
-            for cat in categories:
-                base_daily = _category_daily_avg(conn, cat, base_from, base_to)
-                if base_daily == 0:
-                    continue
-
-                # Рассчитываем прогноз с учётом праздников
-                # Для каждого дня в окне [today, next_van) определяем множитель
-                total_forecast = 0.0
-                holiday_notes: list[str] = []
-
-                # Помечаем дни как «ажиотажные» (по max-множителю)
-                day_mult: dict[date, tuple[float, str]] = {}
-                for h in holidays:
-                    mult, src = _holiday_multiplier(conn, h, cat)
-                    h_start = h["date"] - timedelta(days=h["lead_days"])
-                    d = max(h_start, today)
-                    while d <= min(h["date"], next_van):
-                        if d not in day_mult or mult > day_mult[d][0]:
-                            day_mult[d] = (mult, f"{h['name']} ×{mult:.1f} ({src})")
-                        d += timedelta(days=1)
-
-                d = today
-                while d < next_van:
-                    if d in day_mult:
-                        mult, _ = day_mult[d]
-                        total_forecast += base_daily * mult
-                    else:
-                        total_forecast += base_daily
-                    d += timedelta(days=1)
-
-                # Уникальные заметки о праздниках
-                seen_notes: set[str] = set()
-                for mult, note in day_mult.values():
-                    if note not in seen_notes:
-                        holiday_notes.append(note)
-                        seen_notes.add(note)
-
-                stock = _category_stock(conn, cat)
-                to_buy = max(0.0, total_forecast - stock)
-                norm = base_daily * avg_cycle
-
-                line = (
-                    f"  📦 {cat}: обычно ~{_qty(norm)} ед./цикл"
-                    f" → прогноз {_qty(total_forecast)} ед."
-                    f" | ост. {_qty(stock)} | докупить {_qty(to_buy)} ед."
-                )
-                lines.append(line)
-                for note in holiday_notes:
-                    lines.append(f"     ⚠️ {note}")
-
+        if rest:
+            lines.append(f"… и ещё {len(rest)} позиций на ≈{_rub(sum(i['buy_kop'] for i in rest))} ₽ "
+                         f"(полный список — по кнопке «🛒 Прогноз»)")
             lines.append("")
+        if star:
+            lines.append("* кратность упаковки не распознана из названия — заказать вручную")
+        if malo_items:
+            names = ", ".join(i["name"] for i in malo_items[:8])
+            more = "…" if len(malo_items) > 8 else ""
+            lines.append(f"ℹ️ Мало истории (<3 циклов), не прогнозируем: {len(malo_items)} поз. — {names}{more}")
 
     elif van_list:
         last_van = van_list[-1]
