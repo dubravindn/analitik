@@ -1,0 +1,17 @@
+# Секреты — НИКОГДА не коммитить
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Логи и локальные данные
+logs/
+*.log
+.DS_Store
