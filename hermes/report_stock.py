@@ -303,8 +303,12 @@ def build_stock_report(
         lines.append("✅ Залежалых позиций нет.")
         lines.append("")
 
-    # Итоги по складам
-    lines.append("── ОСТАТКИ ПО СКЛАДАМ ──")
+    # Итоги по складам — только товар (папка «Ассортимент»).
+    # Служебные позиции (папка «РАБОЧЕЕ»: сборка букета, лента, упаковка, шары)
+    # в МойСклад имеют остатки-заглушки (999 999 / 10 000 ед.) и искажали итог
+    # на 3–4 порядка (2 млн ед. / 200 млн ₽ по рознице). Считаем только реальный
+    # товар из «Ассортимент/%».
+    lines.append("── ОСТАТКИ ПО СКЛАДАМ (только товар «Ассортимент») ──")
     order = _STORE_ORDER if not store_name else [store_name]
     with conn.cursor() as cur:
         for sn in order:
@@ -312,7 +316,8 @@ def build_stock_report(
                 SELECT COUNT(*), SUM(stock_qty), SUM(stock_qty * cost_price_kop)
                 FROM stock_snapshot
                 WHERE day = %s AND stock_qty > 0 AND store_name = %s
-            """, [day, sn])
+                  AND folder_path LIKE %s
+            """, [day, sn, "Ассортимент/%"])
             r = cur.fetchone()
             if not r or not r[0]:
                 continue
