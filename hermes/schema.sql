@@ -139,3 +139,10 @@ CREATE TABLE IF NOT EXISTS cashflow_event (
 
 CREATE INDEX IF NOT EXISTS ix_cashflow_day       ON cashflow_event (day);
 CREATE INDEX IF NOT EXISTS ix_cashflow_direction ON cashflow_event (direction, day);
+
+-- Статья расходов (expenseItem из МойСклад, для cashout/paymentout)
+ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS expense_item_name text;
+-- Проект/подразделение (project из МойСклад, для привязки к складу)
+ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS project_name text;
+-- Проект у документа списания (указывает подразделение/склад/цель)
+ALTER TABLE loss_doc ADD COLUMN IF NOT EXISTS project_name text;

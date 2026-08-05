@@ -26,6 +26,7 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
     "expenses": ["period"],           # нет фильтра по складу у кассовых документов
+    "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "pdf":      ["period", "store"],
 }
 
@@ -36,6 +37,7 @@ _SECTION_TITLE = {
     "loss":     "🗑 Списания",
     "reserves": "🎯 Резервы",
     "expenses": "💸 Расходы",
+    "audit":    "🔍 Изменения",
     "pdf":      "📄 Отчёт PDF",
 }
 
@@ -46,6 +48,7 @@ _BUTTON_TO_SECTION = {
     "🗑 списания":   "loss",
     "🎯 резервы":    "reserves",
     "💸 расходы":    "expenses",
+    "🔍 изменения":  "audit",
     "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
     "/меню":         "show",
@@ -194,8 +197,8 @@ def _ask_step(
     if step == "period":
         if section in ("stale", "stock", "reserves"):
             prompt = f"{title}\n\n📅 На какую дату показать снимок остатков?"
-        elif section == "expenses":
-            prompt = f"{title}\n\n📅 За какой период показать платежи?"
+        elif section in ("expenses", "audit"):
+            prompt = f"{title}\n\n📅 За какой период?"
         elif section == "pdf":
             prompt = f"{title}\n\n📅 За какой период сформировать отчёт?"
         else:
@@ -307,10 +310,10 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     store_name   = params.get("store_name")    # None = все склады
     folder_group = params.get("folder_group")  # None = все группы
 
-    # Для expenses — нет фильтра по складу
-    if section == "expenses":
+    # Для expenses/audit — нет фильтра по складу
+    if section in ("expenses", "audit"):
         tg.send_message(bot_token, chat_id,
-                        f"⏳ Загружаю платежи…\nПериод: {_fmt_period(d_from, d_to)}")
+                        f"⏳ Запрашиваю данные…\nПериод: {_fmt_period(d_from, d_to)}")
     elif section == "pdf":
         tg.send_message(bot_token, chat_id,
                         f"⏳ Генерирую PDF-отчёт…\n"
@@ -347,6 +350,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "expenses":
             text = _run_expenses(conn_factory, client_factory, d_from, d_to,
                                  bot_token, chat_id)
+        elif section == "audit":
+            text = _run_audit(client_factory, d_from, d_to, bot_token, chat_id)
         else:
             text = "Неизвестная секция."
     except Exception as e:
@@ -415,6 +420,12 @@ def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token
     return build_reserve_report(conn, snap_date, store_name)
 
 
+def _run_audit(client_factory, d_from, d_to, bot_token, chat_id):
+    from .report_audit import build_audit_report
+    client = client_factory()
+    return build_audit_report(client, d_from, d_to)
+
+
 def _run_expenses(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
     from .etl_cashflow import run as etl_cashflow
     from .report_cashflow import build_expenses_report
@@ -475,14 +486,12 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
         pdf_bytes = build_pdf(conn, d_from, d_to, store_name)
 
         period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
-        store_safe  = (store_name or "vse").split(",")[-1].strip().replace(" ", "_")[:20]
-        filename    = f"hermes_{period_safe}_{store_safe}.pdf"
+        filename    = f"hermes_{period_safe}.pdf"   # только ASCII, без кириллицы
         caption     = (
-            f"📄 Отчёт {_fmt_period(d_from, d_to)}"
-            + (f" · {store_name}" if store_name else "")
+            f"Otchet {_fmt_period(d_from, d_to)}"
+            + (f" | {store_name}" if store_name else "")
         )
-        tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption,
-                         tg.main_reply_keyboard())
+        tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption)
         tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
     except Exception as e:
         log.exception("Ошибка PDF: %s", e)

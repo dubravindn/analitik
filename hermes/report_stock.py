@@ -29,21 +29,29 @@ def _qty(q: float) -> str:
 # ─── Отчёт «Остатки»: позиции с наибольшим количеством ───────────────────────
 
 def _group_filter(folder_group: str | None) -> tuple[str, list]:
-    """Возвращает (SQL-фрагмент WHERE, параметры) для фильтра группы."""
+    """Возвращает (SQL-фрагмент WHERE, параметры) для фильтра группы.
+    % в LIKE передаётся параметром — psycopg3 не нужно двоить.
+    """
     if not folder_group:
         return "", []
-    return "AND SPLIT_PART(folder_path, '/', 1) = %s", [folder_group]
+    return (
+        "AND folder_path LIKE %s AND SPLIT_PART(folder_path, '/', 2) = %s",
+        ["Ассортимент/%", folder_group],
+    )
 
 
 def fetch_groups(conn, day: date) -> list[str]:
-    """Уникальные папки верхнего уровня за день (для клавиатуры)."""
+    """Подгруппы второго уровня внутри 'Ассортимент' за день (для клавиатуры)."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT SPLIT_PART(folder_path, '/', 1)
+            SELECT DISTINCT SPLIT_PART(folder_path, '/', 2)
             FROM stock_snapshot
-            WHERE day = %s AND folder_path IS NOT NULL AND folder_path != ''
+            WHERE day = %s
+              AND folder_path LIKE %s
+              AND folder_path IS NOT NULL
+              AND folder_path != ''
             ORDER BY 1
-        """, [day])
+        """, [day, "Ассортимент/%"])
         return [r[0] for r in cur.fetchall() if r[0]]
 
 
@@ -52,11 +60,12 @@ def build_stock_by_qty(
     store_name: str | None = None,
     folder_group: str | None = None,
 ) -> str:
-    """Свободный остаток (stock − reserve), разбивка по складам."""
+    """Свободный остаток: только товары БЕЗ резерва (reserve_qty = 0)."""
     store_label = f" · {store_name}" if store_name else " · Все склады"
     group_label = f" · Группа: {folder_group}" if folder_group else ""
     lines: list[str] = []
     lines.append(f"📦 Остатки на {day.strftime('%d.%m.%Y')}{store_label}{group_label}")
+    lines.append("(только товары без резерва)")
     lines.append("")
 
     gf, gp = _group_filter(folder_group)
@@ -67,7 +76,7 @@ def build_stock_by_qty(
         cur.execute(f"""
             SELECT COUNT(*), COALESCE(SUM(stock_qty), 0), COALESCE(SUM(stock_qty * cost_price_kop), 0)
             FROM stock_snapshot
-            WHERE day = %s AND stock_qty > 0 {sf} {gf}
+            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
         """, p)
         row = cur.fetchone()
         total_pos, total_qty, total_cost = row[0], float(row[1] or 0), float(row[2] or 0)
@@ -81,28 +90,25 @@ def build_stock_by_qty(
     )
     lines.append("")
 
-    # Конкретный склад — топ-50 по свободному остатку
+    # Конкретный склад — топ-50 по остатку
     if store_name:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT product_name, is_srezka, stock_qty, reserve_qty,
-                       cost_price_kop,
-                       (stock_qty - reserve_qty) * cost_price_kop AS free_cost
+                SELECT product_name, is_srezka, stock_qty,
+                       cost_price_kop, stock_qty * cost_price_kop AS cost_total
                 FROM stock_snapshot
-                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s {gf}
-                ORDER BY (stock_qty - reserve_qty) DESC
+                WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
+                ORDER BY stock_qty DESC
                 LIMIT 50
             """, [day, store_name] + gp)
             rows = cur.fetchall()
 
-        lines.append(f"── Топ-{min(50, len(rows))} по свободному остатку ──")
-        for name, is_srezka, qty, reserve, cost_unit, free_cost in rows:
-            tag  = " [СР]" if is_srezka else ""
-            free = float(qty) - float(reserve)
-            res  = f" (рез. {_qty(float(reserve))})" if reserve else ""
+        lines.append(f"── Топ-{min(50, len(rows))} ──")
+        for name, is_srezka, qty, cost_unit, cost_total in rows:
+            tag = " [СР]" if is_srezka else ""
             lines.append(
-                f"  • {name}{tag}: {_qty(free)} ед.{res}\n"
-                f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(free_cost))} ₽"
+                f"  • {name}{tag}: {_qty(float(qty))} ед.\n"
+                f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(cost_total))} ₽"
             )
         return "\n".join(lines)
 
@@ -110,33 +116,31 @@ def build_stock_by_qty(
     for sname in _STORE_ORDER:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT product_name, is_srezka, stock_qty, reserve_qty, cost_price_kop,
-                       (stock_qty - reserve_qty) * cost_price_kop AS free_cost,
-                       COUNT(*) FILTER (WHERE stock_qty - reserve_qty > 0) OVER() AS total_cnt,
-                       SUM(stock_qty - reserve_qty) OVER()                         AS total_free,
-                       SUM((stock_qty - reserve_qty) * cost_price_kop) OVER()      AS total_cost
+                SELECT product_name, is_srezka, stock_qty, cost_price_kop,
+                       stock_qty * cost_price_kop AS cost_total,
+                       COUNT(*) OVER() AS total_cnt,
+                       SUM(stock_qty) OVER() AS total_qty,
+                       SUM(stock_qty * cost_price_kop) OVER() AS total_cost
                 FROM stock_snapshot
-                WHERE day = %s AND (stock_qty - reserve_qty) > 0 AND store_name = %s {gf}
-                ORDER BY (stock_qty - reserve_qty) DESC
+                WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
+                ORDER BY stock_qty DESC
                 LIMIT 15
             """, [day, sname] + gp)
             rows = cur.fetchall()
 
         if not rows:
             continue
-        total_cnt  = rows[0][6]
-        store_free = float(rows[0][7] or 0)
-        store_cost = float(rows[0][8] or 0)
+        total_cnt  = rows[0][5]
+        store_qty  = float(rows[0][6] or 0)
+        store_cost = float(rows[0][7] or 0)
         lines.append(f"── 📍 {sname} ──")
         lines.append(
-            f"   Позиций: {total_cnt} · Своб.: {_qty(store_free)} ед. · {_rub(store_cost)} ₽"
+            f"   Позиций: {total_cnt} · {_qty(store_qty)} ед. · {_rub(store_cost)} ₽"
         )
-        for name, is_srezka, qty, reserve, cost_unit, free_cost, *_ in rows:
-            tag  = " [СР]" if is_srezka else ""
-            free = float(qty) - float(reserve)
-            res  = f" / рез.{_qty(float(reserve))}" if reserve else ""
+        for name, is_srezka, qty, cost_unit, cost_total, *_ in rows:
+            tag = " [СР]" if is_srezka else ""
             lines.append(
-                f"  • {name}{tag}: {_qty(free)}{res} ед. · {_rub(float(free_cost))} ₽"
+                f"  • {name}{tag}: {_qty(float(qty))} ед. · {_rub(float(cost_total))} ₽"
             )
         lines.append("")
 
@@ -225,7 +229,8 @@ def build_stock_report(
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COUNT(*) FROM stock_snapshot WHERE day = %s AND stock_qty > 0 {sf} {gf}
+            SELECT COUNT(*) FROM stock_snapshot
+            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
         """, p)
         total_rows = cur.fetchone()[0]
 
@@ -242,7 +247,7 @@ def build_stock_report(
             SELECT store_name, product_name, is_srezka, stock_qty,
                    cost_price_kop, stock_qty * cost_price_kop AS cost_total
             FROM stock_snapshot
-            WHERE day = %s AND stock_qty > 0 {sf} {gf}
+            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
             ORDER BY store_name, stock_qty DESC
         """, p)
         rows = cur.fetchall()

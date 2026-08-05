@@ -50,7 +50,8 @@ def main_reply_keyboard() -> dict:
             [{"text": "📊 Продажи"},   {"text": "📦 Остатки"}],
             [{"text": "🚨 Залежалые"}, {"text": "🗑 Списания"}],
             [{"text": "🎯 Резервы"},   {"text": "💸 Расходы"}],
-            [{"text": "📄 Отчёт PDF"}, {"text": "❓ Помощь"}],
+            [{"text": "🔍 Изменения"}, {"text": "📄 Отчёт PDF"}],
+            [{"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -131,12 +132,12 @@ def send_document(
     data: bytes,
     filename: str,
     caption: str = "",
-    reply_markup: dict | None = None,
 ) -> dict:
-    """Отправить файл как документ (multipart/form-data)."""
+    """Отправить файл как документ (multipart/form-data).
+    reply_markup НЕ передаём здесь — отправляем отдельным send_message.
+    """
     import uuid
-    boundary = uuid.uuid4().hex
-    body_parts: list[bytes] = []
+    boundary = "----HermesBoundary" + uuid.uuid4().hex
 
     def _field(name: str, value: str) -> bytes:
         return (
@@ -145,19 +146,21 @@ def send_document(
             f"{value}\r\n"
         ).encode("utf-8")
 
-    body_parts.append(_field("chat_id", str(chat_id)))
+    body_parts: list[bytes] = [
+        _field("chat_id", str(chat_id)),
+    ]
     if caption:
         body_parts.append(_field("caption", caption[:1024]))
-    if reply_markup:
-        body_parts.append(_field("reply_markup", json.dumps(reply_markup)))
 
+    # Только ASCII в имени файла — кириллица может ломать multipart в некоторых клиентах
+    safe_filename = filename.encode("ascii", errors="ignore").decode("ascii") or "report.pdf"
     body_parts.append((
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n"
-    ).encode("utf-8"))
+        f'Content-Disposition: form-data; name="document"; filename="{safe_filename}"\r\n'
+        f"Content-Type: application/pdf\r\n\r\n"
+    ).encode("ascii"))
     body_parts.append(data)
-    body_parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body_parts.append(f"\r\n--{boundary}--\r\n".encode("ascii"))
 
     body = b"".join(body_parts)
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"

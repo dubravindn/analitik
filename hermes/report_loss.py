@@ -68,6 +68,27 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
             lines.append(f"  📍 {sn}: {dcnt} докум. · {_qty(float(sqty))} ед. · {_rub(float(skop))} ₽")
         lines.append("")
 
+    # Разбивка по проектам (если есть)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(d.project_name, ''), 'Без проекта'),
+                   COUNT(DISTINCT d.doc_id),
+                   COALESCE(SUM(i.qty), 0),
+                   COALESCE(SUM(i.total_kop), 0)
+            FROM loss_doc d
+            JOIN loss_item i ON i.doc_id = d.doc_id
+            WHERE d.day BETWEEN %s AND %s {sf}
+            GROUP BY 1
+            ORDER BY 4 DESC
+        """, p)
+        by_project = cur.fetchall()
+
+    if len(by_project) > 1:
+        lines.append("── По проектам ──")
+        for proj, dcnt, sqty, skop in by_project:
+            lines.append(f"  📁 {proj}: {dcnt} докум. · {_qty(float(sqty))} ед. · {_rub(float(skop))} ₽")
+        lines.append("")
+
     # Топ-10 товаров по сумме
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -90,7 +111,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # Все документы с позициями
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT d.doc_id, d.moment, d.store_name, d.description
+            SELECT d.doc_id, d.moment, d.store_name, d.description, d.project_name
             FROM loss_doc d
             WHERE d.day BETWEEN %s AND %s {sf}
             ORDER BY d.moment
@@ -99,11 +120,13 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
 
     lines.append(f"── Все документы ({len(docs)}) ──")
     lines.append("")
-    for doc_id, moment, sn, description in docs:
+    for doc_id, moment, sn, description, project_name in docs:
         moment_str = moment.strftime("%d.%m.%Y %H:%M") if hasattr(moment, "strftime") else str(moment)[:16]
         header = f"📅 {moment_str}"
         if not store_name:
             header += f" · {sn}"
+        if project_name:
+            header += f" · [{project_name}]"
         if description:
             header += f" · {description}"
         lines.append(header)

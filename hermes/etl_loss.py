@@ -30,7 +30,7 @@ def _fetch_docs(client: MoyskladClient, d_from: date, d_to: date) -> list[dict]:
             "limit": _PAGE,
             "offset": offset,
             "filter": flt,
-            "expand": "store",
+            "expand": "store,project",
             "order": "moment,asc",
         })
         batch = page.get("rows", [])
@@ -82,18 +82,22 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         store_id = store.get("id", "")
         store_name = store.get("name", "")
         description = doc.get("description") or ""
+        project = doc.get("project", {})
+        project_name = project.get("name", "") if isinstance(project, dict) else ""
 
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO loss_doc (doc_id, moment, day, store_id, store_name, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO loss_doc (doc_id, moment, day, store_id, store_name, description, project_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (doc_id) DO UPDATE SET
                     moment=EXCLUDED.moment, day=EXCLUDED.day,
                     store_id=EXCLUDED.store_id, store_name=EXCLUDED.store_name,
-                    description=EXCLUDED.description, synced_at=now()
+                    description=EXCLUDED.description,
+                    project_name=EXCLUDED.project_name,
+                    synced_at=now()
                 """,
-                (doc_id, moment, doc_day, store_id, store_name, description),
+                (doc_id, moment, doc_day, store_id, store_name, description, project_name),
             )
 
         positions = _fetch_positions(client, doc_id)

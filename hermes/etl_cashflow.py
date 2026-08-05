@@ -41,7 +41,7 @@ def _fetch_type(client: MoyskladClient, doc_type: str, d_from: date, d_to: date)
             "limit": _PAGE,
             "offset": offset,
             "filter": flt,
-            "expand": "agent",
+            "expand": "agent,expenseItem,project",
             "order": "moment,asc",
         })
         batch = page.get("rows", [])
@@ -76,21 +76,30 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
             agent_name = agent.get("name", "") if isinstance(agent, dict) else ""
             description = doc.get("description") or ""
             amount = round(doc.get("sum", 0) or 0)
+            expense_item = doc.get("expenseItem", {})
+            expense_item_name = expense_item.get("name", "") if isinstance(expense_item, dict) else ""
+            project = doc.get("project", {})
+            project_name = project.get("name", "") if isinstance(project, dict) else ""
             records.append((doc_id, moment, doc_day, direction, doc_type,
-                            agent_name, description, amount))
+                            agent_name, description, amount, expense_item_name, project_name))
 
         if records:
             with conn.cursor() as cur:
                 cur.executemany(
                     """
                     INSERT INTO cashflow_event
-                        (event_id, moment, day, direction, doc_type, agent_name, description, amount_kop)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        (event_id, moment, day, direction, doc_type,
+                         agent_name, description, amount_kop,
+                         expense_item_name, project_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (event_id) DO UPDATE SET
                         moment=EXCLUDED.moment, day=EXCLUDED.day,
                         direction=EXCLUDED.direction, doc_type=EXCLUDED.doc_type,
                         agent_name=EXCLUDED.agent_name, description=EXCLUDED.description,
-                        amount_kop=EXCLUDED.amount_kop, synced_at=now()
+                        amount_kop=EXCLUDED.amount_kop,
+                        expense_item_name=EXCLUDED.expense_item_name,
+                        project_name=EXCLUDED.project_name,
+                        synced_at=now()
                     """,
                     records,
                 )
