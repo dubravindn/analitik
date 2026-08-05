@@ -19,10 +19,10 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     sf = "AND store_name = %s" if store_name else ""
     p  = [d_from, d_to] + ([store_name] if store_name else [])
 
-    # Сводка
+    # Сводка за период
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COUNT(DISTINCT agent_id), COUNT(*), COALESCE(SUM(amount_kop), 0)
+            SELECT COUNT(DISTINCT agent_id), COUNT(*), COALESCE(SUM(sum_kop), 0)
             FROM sales_doc
             WHERE day BETWEEN %s AND %s {sf}
               AND agent_id IS NOT NULL AND agent_id != ''
@@ -42,15 +42,15 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     )
     lines.append("")
 
-    # Топ-20 по выручке
+    # Топ-20 по выручке за период
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT agent_name, COUNT(*) AS orders, SUM(amount_kop) AS rev
+            SELECT agent_name, COUNT(*) AS orders, SUM(sum_kop) AS rev
             FROM sales_doc
             WHERE day BETWEEN %s AND %s {sf}
               AND agent_id IS NOT NULL AND agent_id != ''
             GROUP BY agent_id, agent_name
-            ORDER BY SUM(amount_kop) DESC
+            ORDER BY SUM(sum_kop) DESC
             LIMIT 20
         """, p)
         top = cur.fetchall()
@@ -65,42 +65,51 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
             )
         lines.append("")
 
-    # Детектор оттока: клиенты с интервалом ≥ 2 покупок, давно не приходившие
+    # Детектор оттока (канал «опт», история 180 дней, ≥3 покупки)
     with conn.cursor() as cur:
         cur.execute("""
-            WITH agent_stats AS (
-                SELECT
-                    agent_id,
-                    agent_name,
-                    MAX(day) AS last_order,
-                    (CURRENT_DATE - MAX(day)) AS days_since,
-                    AVG(
-                        COALESCE(
-                            day - LAG(day) OVER (PARTITION BY agent_id ORDER BY day),
-                            0
-                        )
-                    ) AS avg_gap
-                FROM sales_doc
-                WHERE agent_id IS NOT NULL AND agent_id != ''
+            WITH intervals AS (
+                SELECT agent_id, agent_name,
+                       day - LAG(day) OVER (PARTITION BY agent_id ORDER BY day) AS gap
+                FROM (
+                    SELECT DISTINCT agent_id, agent_name, day
+                    FROM sales_doc
+                    WHERE channel = 'опт' AND day >= CURRENT_DATE - 180
+                ) d
+            ),
+            avg_gap AS (
+                SELECT agent_id, agent_name,
+                       AVG(gap) AS avg_gap_days,
+                       COUNT(*) AS purchases
+                FROM intervals
+                WHERE gap IS NOT NULL
                 GROUP BY agent_id, agent_name
-                HAVING COUNT(*) >= 2
+                HAVING COUNT(*) >= 3
+            ),
+            last_seen AS (
+                SELECT agent_id, MAX(day) AS last_day
+                FROM sales_doc WHERE channel = 'опт'
+                GROUP BY agent_id
             )
-            SELECT agent_name, last_order, days_since::int, ROUND(avg_gap)::int
-            FROM agent_stats
-            WHERE avg_gap > 0 AND days_since > avg_gap * 1.5
-              AND days_since > 14
-            ORDER BY days_since DESC
+            SELECT a.agent_name, a.avg_gap_days, l.last_day,
+                   CURRENT_DATE - l.last_day AS days_since,
+                   (CURRENT_DATE - l.last_day)::float / NULLIF(a.avg_gap_days, 0) AS overdue_ratio
+            FROM avg_gap a JOIN last_seen l USING (agent_id)
+            WHERE (CURRENT_DATE - l.last_day) > a.avg_gap_days * 1.5
+            ORDER BY overdue_ratio DESC
             LIMIT 15
         """)
         churned = cur.fetchall()
 
     if churned:
-        lines.append("⚠️ Возможный отток клиентов:")
-        for name, last_day, days_since, avg_gap in churned:
+        lines.append("⚠️ Возможный отток (оптовики):")
+        for name, avg_gap, last_day, days_since, ratio in churned:
             last_str = last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day)
+            avg_str = f"{float(avg_gap):.0f}"
             lines.append(
                 f"  • {name}: посл. заказ {last_str}"
-                f" ({days_since} дн. назад, обычно кажд. {avg_gap} дн.)"
+                f" ({int(days_since)} дн. назад, обычно кажд. {avg_str} дн."
+                f" — просрочка ×{float(ratio):.1f})"
             )
 
     return "\n".join(lines)

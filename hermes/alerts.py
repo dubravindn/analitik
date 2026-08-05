@@ -1,52 +1,54 @@
-"""Проактивные алерты: аномалии выручки относительно базовой линии."""
+"""Проактивные алерты: аномалии выручки по складам относительно базовой линии."""
 from __future__ import annotations
 
 import logging
 from datetime import date
 
-from . import calc
-
 log = logging.getLogger("hermes.alerts")
 
-ANOMALY_THRESHOLD_PCT = 20.0  # % отклонения для триггера алерта
+ANOMALY_THRESHOLD = 0.20  # 20% отклонения = триггер
 
 
 def build_alerts(conn, day: date) -> str | None:
-    """Проверить выручку за day.
+    """Проверить выручку по каждому складу за day.
 
-    Если отклонение от базовой линии (тот же д.н. за 8 нед.) > 20% — вернуть текст алерта.
-    Если данных нет или отклонение в норме — вернуть None.
+    Сравниваем с тем же днём недели за последние 8 недель (окно 7–56 дней назад).
+    Если хотя бы один склад отклонился на ≥20% — формируем сообщение.
+    Возвращает None, если всё в норме или данных недостаточно.
     """
-    baseline = calc.weekday_baseline(conn, day)
-    if not baseline:
-        log.debug("Нет базовой линии для %s", day)
-        return None
-
-    avg_kop, n_weeks = baseline
-
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT SUM(revenue_kop) FROM sales_by_store_day WHERE day=%s",
-            (day,),
+        cur.execute("""
+            SELECT s.store_name, s.revenue_kop, AVG(h.revenue_kop) AS baseline
+            FROM sales_by_store_day s
+            JOIN sales_by_store_day h
+              ON h.store_id = s.store_id
+             AND h.day BETWEEN s.day - 56 AND s.day - 7
+             AND EXTRACT(DOW FROM h.day) = EXTRACT(DOW FROM s.day)
+            WHERE s.day = %s
+            GROUP BY s.store_name, s.revenue_kop
+        """, (day,))
+        rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    alerts: list[str] = []
+    for store_name, rev, baseline in rows:
+        if not baseline or float(baseline) == 0:
+            continue
+        rev_f  = float(rev or 0)
+        base_f = float(baseline)
+        diff   = (rev_f - base_f) / base_f
+        if abs(diff) < ANOMALY_THRESHOLD:
+            continue
+        direction = "выше" if diff > 0 else "ниже"
+        pct = abs(diff) * 100
+        alerts.append(
+            f"⚠️ {store_name}: выручка {pct:.0f}% {direction} обычного для этого дня недели"
         )
-        row = cur.fetchone()
-    today_kop = int(row[0] or 0) if row else 0
 
-    if avg_kop == 0 or today_kop == 0:
+    if not alerts:
         return None
 
-    diff = calc.delta_pct(today_kop, avg_kop)
-    if diff is None or abs(diff) < ANOMALY_THRESHOLD_PCT:
-        return None
-
-    def rub(kop: int) -> str:
-        return f"{kop / 100:,.0f}".replace(",", " ")
-
-    sign = "+" if diff >= 0 else ""
-    emoji = "🚀" if diff > 0 else "🔴"
-    log.info("Алерт выручки %s: факт=%d норма=%d delta=%.1f%%", day, today_kop, avg_kop, diff)
-    return (
-        f"{emoji} Аномалия выручки за {day.strftime('%d.%m.%Y')}\n"
-        f"Факт: {rub(today_kop)} ₽  |  Норма: ~{rub(avg_kop)} ₽\n"
-        f"Отклонение: {sign}{diff:.0f}%  (база: {n_weeks} нед.)"
-    )
+    log.info("Алерты выручки %s: %d складов", day, len(alerts))
+    return "🔔 Обратить внимание:\n\n" + "\n".join(alerts)

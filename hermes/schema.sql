@@ -153,13 +153,14 @@ CREATE TABLE IF NOT EXISTS sales_doc (
     moment       timestamptz NOT NULL,
     day          date        NOT NULL,
     store_id     text        NOT NULL,
-    store_name   text        NOT NULL,
-    agent_id     text,
-    agent_name   text,
-    positions    integer     NOT NULL DEFAULT 0,
-    amount_kop   bigint      NOT NULL DEFAULT 0,
+    channel      text        NOT NULL DEFAULT '',  -- розница | опт | ресторан
+    agent_id     text        NOT NULL DEFAULT '',
+    agent_name   text        NOT NULL DEFAULT '',
+    sum_kop      bigint      NOT NULL DEFAULT 0,
     synced_at    timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS store_name text;
+ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS positions  integer NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS ix_sales_doc_day   ON sales_doc (day);
 CREATE INDEX IF NOT EXISTS ix_sales_doc_agent ON sales_doc (agent_id, day);
