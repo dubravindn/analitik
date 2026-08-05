@@ -104,12 +104,18 @@ def build_stock_by_qty(
             rows = cur.fetchall()
 
         lines.append(f"── Топ-{min(50, len(rows))} ──")
+        nocost_n = 0
         for name, is_srezka, qty, cost_unit, cost_total in rows:
             tag = " [СР]" if is_srezka else ""
-            lines.append(
-                f"  • {name}{tag}: {_qty(float(qty))} ед.\n"
-                f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(cost_total))} ₽"
-            )
+            if not cost_unit:
+                nocost_n += 1
+                price_line = "    ⚠️ нет себестоимости"
+            else:
+                price_line = f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(cost_total))} ₽"
+            lines.append(f"  • {name}{tag}: {_qty(float(qty))} ед.\n{price_line}")
+        if nocost_n:
+            lines.append("")
+            lines.append(f"⚠️ Позиций без себестоимости: {nocost_n} (стоимость запаса занижена)")
         return "\n".join(lines)
 
     # Все склады — разбивка по складам, топ-15
@@ -139,8 +145,9 @@ def build_stock_by_qty(
         )
         for name, is_srezka, qty, cost_unit, cost_total, *_ in rows:
             tag = " [СР]" if is_srezka else ""
+            cost_str = "⚠️ нет себест." if not cost_unit else f"{_rub(float(cost_total))} ₽"
             lines.append(
-                f"  • {name}{tag}: {_qty(float(qty))} ед. · {_rub(float(cost_total))} ₽"
+                f"  • {name}{tag}: {_qty(float(qty))} ед. · {cost_str}"
             )
         lines.append("")
 
@@ -266,6 +273,7 @@ def build_stock_report(
         entry = {
             "name": pname, "qty": float(qty), "cost_unit": cost_unit,
             "cost_total": float(cost_total), "days": days_idle, "is_srezka": is_srezka,
+            "nocost": not cost_unit,   # себестоимость 0/NULL — запас занижен
         }
         if is_srezka:
             stale_srezka[sname].append(entry)
@@ -291,8 +299,9 @@ def build_stock_report(
             lines.append(f"  📍 {sn} — {len(items)} поз. · {_rub(sc)} ₽")
             for e in items:
                 idle = f"{e['days']} дн." if e["days"] < 9000 else "нет продаж"
+                cost_str = "⚠️ нет себест." if e["nocost"] else f"{_rub(e['cost_total'])} ₽"
                 lines.append(
-                    f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · {_rub(e['cost_total'])} ₽"
+                    f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · {cost_str}"
                 )
             lines.append("")
 
@@ -301,6 +310,15 @@ def build_stock_report(
 
     if not stale_srezka and not stale_other:
         lines.append("✅ Залежалых позиций нет.")
+        lines.append("")
+
+    # Позиции без себестоимости — занижают стоимость запаса и завышают маржу.
+    nocost_n = sum(
+        1 for items in list(stale_srezka.values()) + list(stale_other.values())
+        for e in items if e["nocost"]
+    )
+    if nocost_n:
+        lines.append(f"⚠️ Позиций без себестоимости: {nocost_n} (стоимость запаса занижена)")
         lines.append("")
 
     # Итоги по складам — только товар (папка «Ассортимент»).
