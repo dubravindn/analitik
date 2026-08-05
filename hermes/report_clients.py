@@ -41,9 +41,12 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     unique_clients = int(row[0])
     total_docs     = int(row[1])
     total_kop      = float(row[2])
+    # «Сумма», а не «нетто»: возвраты оптовикам оформляются расходным ордером
+    # (статья «Возврат»), документы salesreturn бизнесом фактически не
+    # используются — вычитать нечего. См. ANALYTICS_FORMULAS.md.
     lines.append(
         f"📋 Клиентов: {unique_clients} · Заказов: {total_docs}"
-        f" · Сумма (нетто): {_rub(total_kop)} ₽"
+        f" · Сумма: {_rub(total_kop)} ₽"
     )
 
     # Контроль покрытия: сумма по клиентам vs выручка из секции «Продажи»
