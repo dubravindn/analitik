@@ -66,8 +66,11 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     lines.append("")
 
     placeholders = config.RETAIL_PLACEHOLDER_AGENTS or [""]
+    internal = config.INTERNAL_AGENTS or [""]
+    hints = config.INTERNAL_HINTS or []
+    excluded = list(placeholders) + list(internal)
 
-    # Топ-20 по выручке за период — БЕЗ служебных заглушек розницы.
+    # Топ-20 по выручке — БЕЗ заглушек розницы и внутренних контрагентов.
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT agent_name,
@@ -80,34 +83,45 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
             GROUP BY agent_id, agent_name
             ORDER BY SUM(sum_kop) DESC
             LIMIT 20
-        """, p + [placeholders])
+        """, p + [excluded])
         top = cur.fetchall()
 
     if top:
         lines.append("🏆 Топ-20 клиентов:")
+        suspect = False
         for i, (name, orders, rev) in enumerate(top, 1):
             avg = float(rev) / orders if orders else 0
+            gear = " ⚙" if any(h in (name or "") for h in hints) else ""
+            if gear:
+                suspect = True
             lines.append(
-                f"  {i:2}. {name}\n"
+                f"  {i:2}. {name}{gear}\n"
                 f"      {orders} зак. · {_rub(float(rev))} ₽ · ср.чек {_rub(avg)} ₽"
             )
+        if suspect:
+            lines.append("  ⚙ похоже на внутренний контрагент — проверить (не исключён)")
         lines.append("")
 
-    # Обезличенная розница (заглушки) — одной строкой, чтобы итог сходился.
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COALESCE(SUM(sum_kop), 0),
-                   COUNT(*) FILTER (WHERE doc_type = 'demand')
-            FROM sales_doc
-            WHERE day BETWEEN %s AND %s {sf}
-              AND agent_name = ANY(%s)
-        """, p + [placeholders])
-        ph_kop, ph_docs = cur.fetchone()
+    # Две отдельные строки: розница без идентификации vs внутренние операции.
+    def _sum_for(names):
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(SUM(sum_kop), 0),
+                       COUNT(*) FILTER (WHERE doc_type = 'demand')
+                FROM sales_doc
+                WHERE day BETWEEN %s AND %s {sf} AND agent_name = ANY(%s)
+            """, p + [names])
+            return cur.fetchone()
+
+    ph_kop, ph_docs = _sum_for(placeholders)
     if ph_kop and float(ph_kop) != 0:
-        lines.append(
-            f"🏪 Розничные продажи без идентификации клиента: "
-            f"{_rub(float(ph_kop))} ₽ ({int(ph_docs)} док)"
-        )
+        lines.append(f"🏪 Розничные продажи без идентификации клиента: "
+                     f"{_rub(float(ph_kop))} ₽ ({int(ph_docs)} док)")
+    in_kop, in_docs = _sum_for(internal)
+    if in_kop and float(in_kop) != 0:
+        lines.append(f"⚙ Внутренние операции (свои точки, ИП): "
+                     f"{_rub(float(in_kop))} ₽ ({int(in_docs)} док)")
+    if (ph_kop and float(ph_kop) != 0) or (in_kop and float(in_kop) != 0):
         lines.append("")
 
     # Детектор оттока (канал «опт», история 180 дней, ≥3 покупки)
