@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes Telegram Bot (long-polling)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/opt/hermes/app
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/opt/hermes/venv/bin/python -m hermes bot
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-bot
+
+[Install]
+WantedBy=multi-user.target

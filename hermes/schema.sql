@@ -66,3 +66,76 @@ CREATE TABLE IF NOT EXISTS stock_snapshot (
 
 CREATE INDEX IF NOT EXISTS ix_stock_snapshot_day        ON stock_snapshot (day);
 CREATE INDEX IF NOT EXISTS ix_stock_snapshot_srezka_day ON stock_snapshot (is_srezka, day);
+
+-- Списания: заголовки документов списания МойСклад
+CREATE TABLE IF NOT EXISTS loss_doc (
+    doc_id       text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    store_id     text        NOT NULL,
+    store_name   text        NOT NULL,
+    description  text,
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Списания: позиции документов (что именно списали)
+CREATE TABLE IF NOT EXISTS loss_item (
+    doc_id       text        NOT NULL REFERENCES loss_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_name text        NOT NULL,
+    folder_path  text,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    cost_kop     bigint      NOT NULL DEFAULT 0,  -- себест. единицы в копейках
+    total_kop    bigint      NOT NULL DEFAULT 0,  -- qty × cost
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_loss_doc_day      ON loss_doc (day);
+CREATE INDEX IF NOT EXISTS ix_loss_doc_store    ON loss_doc (store_id, day);
+CREATE INDEX IF NOT EXISTS ix_loss_item_product ON loss_item (product_name);
+
+-- Поставки: заголовки входящих поставок (supply)
+CREATE TABLE IF NOT EXISTS supply_doc (
+    doc_id       text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    store_id     text        NOT NULL,
+    store_name   text        NOT NULL,
+    agent_name   text,                            -- поставщик
+    description  text,
+    total_kop    bigint      NOT NULL DEFAULT 0,  -- сумма поставки
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Поставки: позиции
+CREATE TABLE IF NOT EXISTS supply_item (
+    doc_id       text        NOT NULL REFERENCES supply_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_name text        NOT NULL,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    price_kop    bigint      NOT NULL DEFAULT 0,  -- закупочная цена единицы
+    total_kop    bigint      NOT NULL DEFAULT 0,
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_supply_doc_day    ON supply_doc (day);
+CREATE INDEX IF NOT EXISTS ix_supply_doc_store  ON supply_doc (store_id, day);
+CREATE INDEX IF NOT EXISTS ix_supply_doc_agent  ON supply_doc (agent_name);
+
+-- Движение денег: входящие и исходящие платежи (кассовые + банковские)
+CREATE TABLE IF NOT EXISTS cashflow_event (
+    event_id     text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    direction    text        NOT NULL,            -- 'in' | 'out'
+    doc_type     text        NOT NULL,            -- cashin | cashout | paymentin | paymentout
+    agent_name   text,
+    description  text,
+    amount_kop   bigint      NOT NULL DEFAULT 0,
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_cashflow_day       ON cashflow_event (day);
+CREATE INDEX IF NOT EXISTS ix_cashflow_direction ON cashflow_event (direction, day);

@@ -60,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Sync вчера (продажи) + сегодня (остатки) → отправить оба отчёта в Telegram",
     )
 
+    sub.add_parser("bot", help="Запустить Telegram-бот (long-polling, блокирующий)")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "whoami":
@@ -110,6 +112,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "send-stock":
         conn = db.connect(config.DATABASE_URL())
         _send_telegram(build_stock_report(conn, args.d), log)
+        return 0
+
+    if args.cmd == "bot":
+        from .bot import run as run_bot
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        run_bot(
+            conn_factory=lambda: db.connect(config.DATABASE_URL()),
+            client_factory=lambda: MoyskladClient(config.MOYSKLAD_TOKEN()),
+            bot_token=config.TELEGRAM_BOT_TOKEN(),
+            chat_id=config.TELEGRAM_CHAT_ID(),
+        )
         return 0
 
     if args.cmd == "daily":

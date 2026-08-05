@@ -117,3 +117,103 @@ def build_day_report(conn, day: date) -> str:
             )
 
     return "\n".join(lines)
+
+
+def build_period_report(conn, d_from: date, d_to: date) -> str:
+    """Агрегированный отчёт за произвольный период (несколько дней)."""
+    days = (d_to - d_from).days + 1
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT store_name, channel,
+                   SUM(revenue_kop)  AS revenue_kop,
+                   SUM(cost_kop)     AS cost_kop,
+                   SUM(checks)       AS checks
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s
+            GROUP BY store_name, channel
+            ORDER BY channel, store_name
+            """,
+            (d_from, d_to),
+        )
+        cols = [c.name for c in cur.description]
+        stores = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    period_str = (
+        f"{d_from.strftime('%d.%m.%Y')}"
+        if d_from == d_to
+        else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
+    )
+    lines: list[str] = []
+    lines.append(f"\U0001f4ca Продажи за {period_str} ({days} дн.)")
+    lines.append("")
+
+    if not stores:
+        lines.append("Нет данных за этот период.")
+        return "\n".join(lines)
+
+    grand_rev = grand_cost = grand_checks = 0
+    for channel in ("розница", "опт", "ресторан"):
+        chan = [s for s in stores if s["channel"] == channel]
+        if not chan:
+            continue
+        crev = sum(s["revenue_kop"] for s in chan)
+        ccost = sum(s["cost_kop"] for s in chan)
+        cchecks = sum(s["checks"] for s in chan)
+        if crev == 0 and cchecks == 0:
+            continue
+        grand_rev += crev
+        grand_cost += ccost
+        grand_checks += cchecks
+
+        lines.append(f"— {channel.upper()} —")
+        for s in chan:
+            if s["revenue_kop"] == 0 and s["checks"] == 0:
+                continue
+            gp = calc.gross_profit(s["revenue_kop"], s["cost_kop"])
+            margin = calc.gross_margin_pct(s["revenue_kop"], s["cost_kop"])
+            ac = calc.avg_check(s["revenue_kop"], s["checks"])
+            lines.append(
+                f"  {s['store_name']}: {_rub(s['revenue_kop'])} ₽ · "
+                f"прибыль {_rub(gp)} ₽ ({margin:.0f}%) · "
+                f"чеков {s['checks']} · ср.чек {_rub(ac)} ₽"
+            )
+        lines.append("")
+
+    gp_total = calc.gross_profit(grand_rev, grand_cost)
+    margin_total = calc.gross_margin_pct(grand_rev, grand_cost)
+    ac_total = calc.avg_check(grand_rev, grand_checks)
+    lines.append("— ИТОГО —")
+    lines.append(
+        f"  Выручка {_rub(grand_rev)} ₽ · "
+        f"Прибыль {_rub(gp_total)} ₽ "
+        f"({margin_total:.0f}%) · Чеков {grand_checks} · "
+        f"Ср.чек {_rub(ac_total)} ₽"
+    )
+    lines.append("")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT product_name, SUM(sell_qty) AS qty,
+                   SUM(revenue_kop) AS revenue_kop, SUM(profit_kop) AS profit_kop
+            FROM sales_by_product_day
+            WHERE day BETWEEN %s AND %s
+            GROUP BY product_name
+            ORDER BY SUM(revenue_kop) DESC
+            LIMIT 10
+            """,
+            (d_from, d_to),
+        )
+        top = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
+
+    if top:
+        lines.append(f"\U0001f3c6 Топ-10 по выручке:")
+        for i, p in enumerate(top, 1):
+            lines.append(
+                f"  {i}. {p['product_name']}: {_rub(p['revenue_kop'])} ₽ "
+                f"(прибыль {_rub(p['profit_kop'])} ₽)"
+            )
+
+    return "\n".join(lines)
