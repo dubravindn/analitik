@@ -343,7 +343,9 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
         if pid not in dim:
             continue   # не реальный товар «Ассортимент» (услуга/шар/расходник)
         name, folder = dim[pid]
-        consumption = (sales.get(pid, 0.0) + loss.get(pid, 0.0)) / n_cycles
+        cons_sales = sales.get(pid, 0.0) / n_cycles
+        cons_loss  = loss.get(pid, 0.0) / n_cycles
+        consumption = cons_sales + cons_loss
         free = stock.get(pid, 0.0)
         ordered = orders_by_pid.get(pid, {}).get("qty", 0.0)
         to_order = consumption + ordered - free
@@ -365,7 +367,8 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
 
         items.append({
             "pid": pid, "name": name, "cat": cat,
-            "consumption": consumption, "free": free, "orders": ordered,
+            "consumption": consumption, "cons_sales": cons_sales, "cons_loss": cons_loss,
+            "free": free, "orders": ordered,
             "raw_to_order": to_order, "to_order": final, "packs": packs, "pkg": pkg,
             "enough": enough, "price_kop": price, "buy_kop": round(final * price),
         })
@@ -539,10 +542,15 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
                     pkg_str = f" ({_qty(it['packs'])} упак.)"
                 else:
                     pkg_str = " *"; star = True
-                lines.append(f"  • {it['name']}: расход/цикл {_qty(it['consumption'])} · "
+                lines.append(f"  • {it['name']}: расход/цикл {_qty(it['consumption'])} "
+                             f"(прод. {_qty(it['cons_sales'])} + спис. {_qty(it['cons_loss'])}) · "
                              f"ост. {_qty(it['free'])} · заказы {_qty(it['orders'])}")
                 lines.append(f"      → К ЗАКАЗУ {_qty(it['to_order'])} ед.{pkg_str}"
                              + (f"  ≈{_rub(it['buy_kop'])} ₽" if it['buy_kop'] else ""))
+                loss_share = it['cons_loss'] / it['consumption'] if it['consumption'] else 0
+                if loss_share >= 0.3:
+                    lines.append(f"      ⚠️ {loss_share*100:.0f}% расхода — списание, "
+                                 f"заказывать столько нельзя (пересмотреть объём)")
             lines.append(f"  Итого по {cat}: {len(its)} поз. · ≈{_rub(sum(i['buy_kop'] for i in its))} ₽")
             lines.append("")
         if rest:
