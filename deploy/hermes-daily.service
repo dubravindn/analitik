@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes — ежедневный отчёт о продажах
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hermes
+WorkingDirectory=/opt/hermes/app
+ExecStart=/opt/hermes/venv/bin/python -m hermes daily
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-daily

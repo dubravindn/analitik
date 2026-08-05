@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes — ежедневный отчёт (таймер 08:00 МСК)
+
+[Timer]
+# 08:00 по московскому времени (UTC+3 → 05:00 UTC)
+OnCalendar=*-*-* 05:00:00
+AccuracySec=1min
+# Если сервер был выключен в момент срабатывания — запустить при следующем старте
+Persistent=true
+
+[Install]
+WantedBy=timers.target
