@@ -12,6 +12,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from . import config
+from . import synclock
 from . import telegram as tg
 
 log = logging.getLogger("hermes.bot")
@@ -106,6 +107,18 @@ _HELP_TEXT = """\
 # ─── состояние диалога (in-memory, один пользователь) ────────────────────────
 
 _dialog: dict[str, dict] = {}  # chat_id → state
+_restarted: bool = False       # был ли рестарт бота (для сообщения о сбросе сессии)
+
+
+def _is_dialog_button(norm: str) -> bool:
+    """Текст — это sub-кнопка диалога (период/склад/группа), а не команда/раздел."""
+    return (
+        norm in _PERIOD_BUTTONS
+        or norm in _STORE_BUTTONS
+        or norm == "✏️ ввести период"
+        or norm == "📦 все группы"
+        or norm.startswith("📁 ")
+    )
 
 
 def _get_state(chat_id: str) -> dict | None:
@@ -124,6 +137,10 @@ def _clear_state(chat_id: str) -> None:
 
 def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
     log.info("Бот запущен (long-polling)")
+    # При старте диалоги пусты (in-memory). Помечаем, что был рестарт — первое
+    # «висячее» нажатие в несуществующий диалог получит понятный ответ.
+    _dialog.clear()
+    globals()["_restarted"] = True
     offset = 0
     while True:
         try:
@@ -188,6 +205,15 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     state = _get_state(chat_id)
     if state:
         _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, bot_token)
+        return
+
+    # ── Висячее нажатие sub-кнопки без активного диалога (напр. бот перезапускался) ──
+    if _is_dialog_button(norm):
+        note = " (бот перезапускался)" if globals().get("_restarted") else ""
+        globals()["_restarted"] = False
+        tg.send_message(bot_token, chat_id,
+                        f"⚠️ Сессия сброшена{note}. Начни заново — выбери раздел из меню.",
+                        tg.main_reply_keyboard())
         return
 
     # ── Прямые команды (без диалога) ──
@@ -323,6 +349,22 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     d_to         = params.get("d_to")
     store_name   = params.get("store_name")    # None = все склады
     folder_group = params.get("folder_group")  # None = все группы
+
+    # Идёт фоновая выгрузка? Предупреждаем (данные могут быть неполными). Для PDF
+    # (тяжёлая ленивая догрузка, контенция с синком) — не запускаем вовсе.
+    sc = synclock.active()
+    if sc:
+        name, mins = sc
+        tg.send_message(
+            bot_token, chat_id,
+            f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
+            f"Отчёт может быть неточным — попробуй через несколько минут.",
+        )
+        if section == "pdf":
+            tg.send_message(bot_token, chat_id,
+                            "PDF пока не собираю, чтобы не зависнуть. Повтори чуть позже.",
+                            tg.main_reply_keyboard())
+            return
 
     # Для audit — нет фильтра по складу
     if section == "audit":
@@ -502,6 +544,29 @@ def _run_move(conn_factory, client_factory, d_from, d_to, store_name, bot_token,
 
 
 def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
+    """Собираем PDF в отдельном потоке с таймаутом — чтобы бот не завис навсегда
+    (сборка делает ленивую догрузку и может встать на контенции с синком)."""
+    import threading
+    done = threading.Event()
+
+    def _worker():
+        try:
+            _build_and_send_pdf(conn_factory, client_factory,
+                                d_from, d_to, store_name, bot_token, chat_id)
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=180):
+        tg.send_message(
+            bot_token, chat_id,
+            "⏳ Сборка PDF заняла дольше 3 минут (возможно, идёт перевыгрузка данных). "
+            "Если файл так и не пришёл — повтори позже.",
+            tg.main_reply_keyboard(),
+        )
+
+
+def _build_and_send_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_sales import run as etl_sales
     from .etl_stock import run as etl_stock
     from .etl_loss import run as etl_loss
