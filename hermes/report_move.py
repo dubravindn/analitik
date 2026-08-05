@@ -18,11 +18,14 @@ def _qty(q: float) -> str:
     return f"{q:,.1f}".replace(",", " ")
 
 
-def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
+def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None,
+                      max_docs: int | None = 50) -> str:
     """Полный отчёт по перемещениям: сводка по складам + документы с позициями.
 
     Без склада — общая картина потоков между всеми складами.
     С выбранным складом — раздельно «исходящие со склада» и «входящие на склад».
+    max_docs ограничивает число выводимых документов (последние N) — защита от
+    лимита Telegram 4096. В PDF передаём max_docs=None (показать все).
     """
     period_str = (
         d_from.strftime("%d.%m.%Y") if d_from == d_to
@@ -150,7 +153,13 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
         """, base_params)
         docs = cur.fetchall()
 
-    lines.append(f"── Все документы ({len(docs)}) ──")
+    total_docs = len(docs)
+    if max_docs is not None and total_docs > max_docs:
+        docs = docs[-max_docs:]   # последние N (самые свежие)
+        lines.append(f"── Документы: показаны {max_docs} из {total_docs} "
+                     f"(полный список — в PDF) ──")
+    else:
+        lines.append(f"── Все документы ({total_docs}) ──")
     lines.append("")
     for doc_id, moment, from_name, to_name, description in docs:
         moment_str = moment.strftime("%d.%m.%Y %H:%M") if hasattr(moment, "strftime") else str(moment)[:16]

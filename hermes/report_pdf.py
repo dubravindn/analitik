@@ -176,7 +176,7 @@ def build_pdf(
 
     # ── Секция 4: Списания ─────────────────────────────────────────────────────
     from .report_loss import build_loss_report
-    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name))
+    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name, max_docs=None))
 
     # ── Секция 5: Расходы ──────────────────────────────────────────────────────
     from .report_cashflow import build_expenses_report
