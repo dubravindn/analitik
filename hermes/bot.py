@@ -190,7 +190,7 @@ def _cmd_loss(args, conn_factory, client_factory, bot_token, chat_id) -> str:
     from .etl_loss import run as etl_loss
     from .report_loss import build_loss_report
 
-    d_from, d_to = _parse_period(args, default_days=30)
+    d_from, d_to = _parse_last_n_days(args)
     conn = conn_factory()
     client = client_factory()
 
@@ -213,7 +213,7 @@ def _cmd_supply(args, conn_factory, client_factory, bot_token, chat_id) -> str:
     from .etl_supply import run as etl_supply
     from .report_supply import build_supply_report
 
-    d_from, d_to = _parse_period(args, default_days=30)
+    d_from, d_to = _parse_last_n_days(args)
     conn = conn_factory()
     client = client_factory()
 
@@ -236,7 +236,7 @@ def _cmd_cashflow(args, conn_factory, client_factory, bot_token, chat_id) -> str
     from .etl_cashflow import run as etl_cashflow
     from .report_cashflow import build_cashflow_report
 
-    d_from, d_to = _parse_period(args, default_days=30)
+    d_from, d_to = _parse_last_n_days(args)
     conn = conn_factory()
     client = client_factory()
 
@@ -269,6 +269,15 @@ def _parse_period(args: list[str], default_days: int = 1) -> tuple[date, date]:
     if d_from > d_to:
         d_from, d_to = d_to, d_from
     return d_from, d_to
+
+
+def _parse_last_n_days(args: list[str], n: int = 30) -> tuple[date, date]:
+    """По умолчанию — последние N дней (включая сегодня).
+    Если переданы 1 или 2 даты — парсим как _parse_period."""
+    if not args:
+        today = date.today()
+        return today - timedelta(days=n - 1), today
+    return _parse_period(args)
 
 
 def _parse_single_date(args: list[str]) -> date:
