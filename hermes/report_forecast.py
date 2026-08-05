@@ -14,6 +14,10 @@ _PAGE = 100
 _PROJECT_KEYWORD = "ближайшая поставка"
 _STATE_KEYWORD   = "под заказ"
 
+# Служебные позиции (шары, услуги) имеют остаток-заглушку в МойСклад
+# (9 999 / 10 000 / 999 999). В прогнозе их не учитываем.
+_SENTINEL_QTY = 9999
+
 
 # ─── МойСклад: заказы ────────────────────────────────────────────────────────
 
@@ -193,7 +197,7 @@ def _holiday_multiplier(conn, holiday: dict, category: str) -> tuple[float, str]
 
 
 def _category_stock(conn, category: str) -> float:
-    """Текущий свободный остаток по категории (без резерва)."""
+    """Текущий свободный остаток по категории (без резерва, без служебных заглушек)."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT COALESCE(SUM(ss.available_qty), 0)
@@ -201,10 +205,27 @@ def _category_stock(conn, category: str) -> float:
             JOIN product_dim pd ON pd.product_id = ss.product_id
             WHERE ss.day = (SELECT MAX(day) FROM stock_snapshot)
               AND ss.reserve_qty = 0
+              AND ss.available_qty < %s
               AND pd.folder_path LIKE %s
               AND SPLIT_PART(pd.folder_path, '/', 2) = %s
-        """, ("Ассортимент/%", category))
+        """, (_SENTINEL_QTY, "Ассортимент/%", category))
         return float(cur.fetchone()[0] or 0)
+
+
+def _log_sentinel_positions(conn) -> int:
+    """Залогировать служебные позиции с остатком-заглушкой, отсечённые из прогноза."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT product_name, available_qty
+            FROM stock_snapshot
+            WHERE day = (SELECT MAX(day) FROM stock_snapshot)
+              AND available_qty >= %s
+            ORDER BY available_qty DESC
+        """, (_SENTINEL_QTY,))
+        rows = cur.fetchall()
+    for pn, q in rows:
+        log.info("Прогноз: отсечена служебная позиция (остаток-заглушка) — %s: %s ед.", pn, q)
+    return len(rows)
 
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
@@ -354,6 +375,7 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
             lines.append("")
 
         # По каждой категории
+        _log_sentinel_positions(conn)   # отсечённые служебные позиции — в лог
         categories = _categories(conn)
         if not categories:
             lines.append("  Нет данных в product_dim — запусти sync-stock для заполнения.")
