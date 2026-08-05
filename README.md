@@ -62,6 +62,24 @@ python -m hermes backfill --months 12      # за последние 12 меся
 - По завершении в лог выводится сводка: число строк и период покрытия по каждой
   таблице.
 
+## Бэкап и восстановление БД
+
+Ежедневный бэкап делает `hermes-backup.timer` (04:30 UTC, до daily-отчёта):
+`pg_dump` → `/opt/hermes/backups/hermes_YYYY-MM-DD.sql.gz`, хранятся последние 14.
+
+Ручной бэкап:
+
+```bash
+sudo systemctl start hermes-backup.service      # или напрямую:
+sudo -u hermes /opt/hermes/app/deploy/hermes-backup.sh
+```
+
+**Восстановление из бэкапа** (DATABASE_URL берётся из `/opt/hermes/.env`):
+
+```bash
+gunzip -c /opt/hermes/backups/hermes_2026-08-05.sql.gz | psql "$DATABASE_URL"
+```
+
 ## Тесты
 
 ```bash

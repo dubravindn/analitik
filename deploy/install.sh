@@ -21,15 +21,24 @@ echo "=== [3/5] Инициализация схемы БД ==="
 sudo -u hermes "$VENV/bin/python" -m hermes init-db
 
 echo "=== [4/5] Установка systemd-юнитов ==="
-sudo cp "$REPO_DIR/deploy/hermes-daily.service" "$UNIT_DIR/"
-sudo cp "$REPO_DIR/deploy/hermes-daily.timer"   "$UNIT_DIR/"
+sudo cp "$REPO_DIR/deploy/hermes-daily.service"  "$UNIT_DIR/"
+sudo cp "$REPO_DIR/deploy/hermes-daily.timer"    "$UNIT_DIR/"
+sudo cp "$REPO_DIR/deploy/hermes-backup.service" "$UNIT_DIR/"
+sudo cp "$REPO_DIR/deploy/hermes-backup.timer"   "$UNIT_DIR/"
+# Каталог для бэкапов (владелец — hermes, от него бежит бэкап-сервис).
+sudo mkdir -p "$APP_DIR/backups"
+sudo chown hermes:hermes "$APP_DIR/backups"
+sudo chmod +x "$REPO_DIR/deploy/hermes-backup.sh"
 sudo systemctl daemon-reload
 sudo systemctl enable --now hermes-daily.timer
+sudo systemctl enable --now hermes-backup.timer
 
-echo "=== [5/5] Статус таймера ==="
-systemctl status hermes-daily.timer --no-pager
+echo "=== [5/5] Статус таймеров ==="
+systemctl status hermes-daily.timer  --no-pager || true
+systemctl status hermes-backup.timer --no-pager || true
 
 echo ""
-echo "✓ Готово. Таймер: sudo systemctl list-timers hermes-daily.timer"
-echo "  Ручной запуск отчёта: sudo systemctl start hermes-daily.service"
+echo "✓ Готово. Таймеры: sudo systemctl list-timers 'hermes-*'"
+echo "  Ручной отчёт: sudo systemctl start hermes-daily.service"
+echo "  Ручной бэкап: sudo systemctl start hermes-backup.service"
 echo "  Логи: sudo journalctl -u hermes-daily.service -n 50"
