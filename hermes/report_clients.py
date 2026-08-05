@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date
 
+from . import config
+
 
 def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
@@ -41,11 +43,28 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     total_kop      = float(row[2])
     lines.append(
         f"📋 Клиентов: {unique_clients} · Заказов: {total_docs}"
-        f" · Сумма: {_rub(total_kop)} ₽"
+        f" · Сумма (нетто): {_rub(total_kop)} ₽"
     )
+
+    # Контроль покрытия: сумма по клиентам vs выручка из секции «Продажи»
+    # (sales_by_store_day). Расхождение — на возвраты; должно быть видно сразу.
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM(revenue_kop), 0)
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s {sf}
+        """, p)
+        sec1_kop = float(cur.fetchone()[0] or 0)
+    if sec1_kop > 0:
+        pct = total_kop / sec1_kop * 100
+        lines.append(
+            f"📊 Покрытие: {_rub(total_kop)} ₽ из {_rub(sec1_kop)} ₽ выручки ({pct:.0f}%)"
+        )
     lines.append("")
 
-    # Топ-20 по выручке за период
+    placeholders = config.RETAIL_PLACEHOLDER_AGENTS or [""]
+
+    # Топ-20 по выручке за период — БЕЗ служебных заглушек розницы.
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT agent_name,
@@ -54,10 +73,11 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
             FROM sales_doc
             WHERE day BETWEEN %s AND %s {sf}
               AND agent_id IS NOT NULL AND agent_id != ''
+              AND NOT (agent_name = ANY(%s))
             GROUP BY agent_id, agent_name
             ORDER BY SUM(sum_kop) DESC
             LIMIT 20
-        """, p)
+        """, p + [placeholders])
         top = cur.fetchall()
 
     if top:
@@ -68,6 +88,23 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
                 f"  {i:2}. {name}\n"
                 f"      {orders} зак. · {_rub(float(rev))} ₽ · ср.чек {_rub(avg)} ₽"
             )
+        lines.append("")
+
+    # Обезличенная розница (заглушки) — одной строкой, чтобы итог сходился.
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM(sum_kop), 0),
+                   COUNT(*) FILTER (WHERE doc_type = 'demand')
+            FROM sales_doc
+            WHERE day BETWEEN %s AND %s {sf}
+              AND agent_name = ANY(%s)
+        """, p + [placeholders])
+        ph_kop, ph_docs = cur.fetchone()
+    if ph_kop and float(ph_kop) != 0:
+        lines.append(
+            f"🏪 Розничные продажи без идентификации клиента: "
+            f"{_rub(float(ph_kop))} ₽ ({int(ph_docs)} док)"
+        )
         lines.append("")
 
     # Детектор оттока (канал «опт», история 180 дней, ≥3 покупки)
