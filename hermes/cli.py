@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import date, datetime, timedelta
 
 from . import config, db
@@ -112,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
         "daily",
         help="Sync вчера (продажи) + сегодня (остатки) → отправить оба отчёта в Telegram",
     )
+
+    p_backfill = sub.add_parser(
+        "backfill",
+        help="Разовая прогрузка истории помесячно (запускать вручную, ночью)",
+    )
+    p_backfill.add_argument("--months", dest="months", type=int, default=12,
+                            help="За сколько месяцев назад грузить (по умолчанию 12)")
 
     sub.add_parser("bot", help="Запустить Telegram-бот (long-polling, блокирующий)")
 
@@ -298,7 +306,109 @@ def main(argv: list[str] | None = None) -> int:
 
         return 0
 
+    if args.cmd == "backfill":
+        return _run_backfill(args.months, log)
+
     return 1
+
+
+def _month_ranges(months: int, today: date) -> list[tuple[date, date]]:
+    """Список (начало_месяца, конец_месяца) от старого к новому.
+
+    Последний диапазон заканчивается сегодняшним днём. months=1 → текущий месяц.
+    """
+    # Начинаем с первого дня месяца (months-1) назад.
+    y, m = today.year, today.month
+    back = months - 1
+    start_month = m - back
+    start_year = y
+    while start_month <= 0:
+        start_month += 12
+        start_year -= 1
+    cur = date(start_year, start_month, 1)
+    ranges: list[tuple[date, date]] = []
+    while cur <= today:
+        # Последний день месяца.
+        if cur.month == 12:
+            nxt = date(cur.year + 1, 1, 1)
+        else:
+            nxt = date(cur.year, cur.month + 1, 1)
+        m_end = min(nxt - timedelta(days=1), today)
+        ranges.append((cur, m_end))
+        cur = nxt
+    return ranges
+
+
+def _month_done(conn, tag: str) -> bool:
+    """Был ли месяц уже успешно прогружен (есть запись sync_log ok=true)?"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM sync_log WHERE task = %s AND ok = true LIMIT 1", (tag,)
+        )
+        return cur.fetchone() is not None
+
+
+def _run_backfill(months: int, log) -> int:
+    client = MoyskladClient(config.MOYSKLAD_TOKEN())
+    conn = db.connect(config.DATABASE_URL())
+    db.apply_schema(conn)
+
+    today = config.msk_today()
+    ranges = _month_ranges(months, today)
+    log.info("Backfill: %d мес., %d диапазонов (%s .. %s)",
+             months, len(ranges), ranges[0][0], ranges[-1][1])
+
+    # Сущности: (имя, функция синка). Продажи, клиенты(+возвраты), списания,
+    # ДДС, поставки, перемещения. Порядок — от старого к новому по месяцам.
+    entities = [
+        ("продажи",     run_sync),
+        ("клиенты",     run_sync_clients),
+        ("списания",    run_sync_loss),
+        ("ДДС",         run_sync_cashflow),
+        ("поставки",    run_sync_supply),
+        ("перемещения", run_sync_move),
+    ]
+
+    for i, (d_from, d_to) in enumerate(ranges):
+        tag = f"backfill-{d_from.strftime('%Y-%m')}"
+        if _month_done(conn, tag):
+            log.info("[%d/%d] %s — уже прогружен, пропуск", i + 1, len(ranges), tag)
+            continue
+
+        log.info("[%d/%d] %s: %s .. %s", i + 1, len(ranges), tag, d_from, d_to)
+        t0 = time.monotonic()
+        month_ok = True
+        errors: list[str] = []
+        for name, fn in entities:
+            try:
+                fn(client, conn, d_from, d_to)
+            except Exception as e:
+                month_ok = False
+                errors.append(f"{name}: {e}")
+                log.exception("backfill %s / %s упал: %s", tag, name, e)
+
+        dur_ms = int((time.monotonic() - t0) * 1000)
+        db.log_sync(conn, task=tag, period_from=d_from, period_to=d_to,
+                    rows_loaded=None, duration_ms=dur_ms, ok=month_ok,
+                    error="; ".join(errors) if errors else None)
+        log.info("[%d/%d] %s — %s за %d c", i + 1, len(ranges), tag,
+                 "OK" if month_ok else "С ОШИБКАМИ", dur_ms // 1000)
+
+        # Пауза между месяцами (щадим лимиты МойСклад), кроме последнего.
+        if i < len(ranges) - 1:
+            time.sleep(7)
+
+    # Сводка по таблицам и покрытию.
+    log.info("── Backfill завершён. Сводка ──")
+    tables = ["sales_by_store_day", "sales_doc", "loss_doc",
+              "cashflow_event", "supply_doc", "move_doc"]
+    for t in tables:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*), MIN(day), MAX(day) FROM {t}")
+            cnt, dmin, dmax = cur.fetchone()
+        log.info("  %-20s строк: %-7s покрытие: %s .. %s", t, cnt, dmin, dmax)
+    print("Backfill завершён. Подробности в логе.")
+    return 0
 
 
 def _send_telegram(text: str, log) -> None:
