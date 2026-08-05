@@ -313,14 +313,16 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
         """, (win_from, win_to))
         sales = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
+        # Списания по product_id (не по имени!), без служебных sentinel-позиций.
         cur.execute("""
-            SELECT pd.product_id, SUM(li.qty)
+            SELECT li.product_id, SUM(li.qty)
             FROM loss_item li
             JOIN loss_doc ld ON ld.doc_id = li.doc_id
-            JOIN product_dim pd ON pd.product_name = li.product_name
             WHERE ld.day BETWEEN %s AND %s
-            GROUP BY pd.product_id
-        """, (win_from, win_to))
+              AND li.product_id IS NOT NULL AND li.product_id != ''
+              AND li.qty < %s
+            GROUP BY li.product_id
+        """, (win_from, win_to, _SENTINEL_QTY))
         loss = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
         cur.execute("""
@@ -355,18 +357,31 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
         fs = first_sale.get(pid)
         enough = bool(fs and (today - fs).days >= n_cycles * avg_cycle)
 
-        pkg = _pkg_size(name)
-        final = to_order
-        packs = None
-        if round_pkg and pkg:
-            final = math.ceil(to_order / pkg) * pkg
-            packs = final / pkg
         price = prices.get(pid, 0)
         parts = folder.split("/")
         cat = parts[1] if len(parts) >= 2 else folder
 
+        # G3: округление до кратности упаковки — только для СРЕЗКИ (там «25 шт.» =
+        # пачка). Для прочих категорий «N шт.» — содержимое коробки, не заказ.
+        pkg = _pkg_size(name) if cat == "СРЕЗКА" else None
+
+        # Дефект 1: медленный товар — расход за цикл меньше половины упаковки и нет
+        # заказа клиента. Не гоним полную упаковку (12 недель запаса) — выносим в
+        # «брать под заказ клиента».
+        low_mover = bool(pkg and consumption < pkg / 2 and ordered <= 0)
+
+        final = to_order
+        packs = None
+        if round_pkg and pkg and not low_mover:
+            final = math.ceil(to_order / pkg) * pkg
+            packs = final / pkg
+
+        # Дефект 2: ниже 1 единицы не заказываем (0.3, 0.7 ед. — шум).
+        if not low_mover and final < 1:
+            continue
+
         items.append({
-            "pid": pid, "name": name, "cat": cat,
+            "pid": pid, "name": name, "cat": cat, "low_mover": low_mover,
             "consumption": consumption, "cons_sales": cons_sales, "cons_loss": cons_loss,
             "free": free, "orders": ordered,
             "raw_to_order": to_order, "to_order": final, "packs": packs, "pkg": pkg,
@@ -384,6 +399,7 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
         "🛒 Прогноз закупки",
         f"Прогноз. Основан на заказах в проекте «{_PROJECT_KEYWORD}» и остатках "
         f"на {today.strftime('%d.%m.%Y')}. Не учитывает незафиксированные договорённости.",
+        "⚠️ Прогноз всегда на текущий момент — не зависит от периода отчёта.",
         "",
     ]
 
@@ -503,7 +519,7 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
                      f"докупить локально или перекинуть с другой точки.")
         runout = []
         for it in items:
-            if not it["enough"]:
+            if not it["enough"] or it["low_mover"]:
                 continue
             need = it["consumption"] / avg_cycle * days_left
             short = need - it["free"]
@@ -526,8 +542,12 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
                          f"расход может быть выше среднего.")
         lines.append("")
 
-        ok_items  = sorted([it for it in items if it["enough"]], key=lambda x: -x["buy_kop"])
-        malo_items = [it for it in items if not it["enough"]]
+        # Сортировка по сумме закупки; при нулевых ценах (снимок цен не загружен) —
+        # по количеству (иначе сортировка бессмысленна).
+        ok_items = sorted([it for it in items if it["enough"] and not it["low_mover"]],
+                          key=lambda x: (-x["buy_kop"], -x["to_order"]))
+        low_movers = [it for it in items if it["low_mover"]]
+        malo_items = [it for it in items if not it["enough"] and not it["low_mover"]]
         _TOP = 40
         shown, rest = ok_items[:_TOP], ok_items[_TOP:]
 
@@ -563,6 +583,17 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
             names = ", ".join(i["name"] for i in malo_items[:8])
             more = "…" if len(malo_items) > 8 else ""
             lines.append(f"ℹ️ Мало истории (<3 циклов), не прогнозируем: {len(malo_items)} поз. — {names}{more}")
+
+        # Блок «брать под заказ клиента»: медленные позиции (расход < половины
+        # упаковки) — гнать целую пачку невыгодно, брать только под конкретный заказ.
+        if low_movers:
+            lines.append("")
+            lines.append("═══ БРАТЬ ПОД ЗАКАЗ КЛИЕНТА ═══")
+            lines.append("Расход меньше половины упаковки — целую пачку не гоним, "
+                         "берём под конкретный заказ.")
+            for it in sorted(low_movers, key=lambda x: -x["consumption"])[:20]:
+                lines.append(f"  • {it['name']}: расход/цикл {_qty(it['consumption'])} · "
+                             f"ост. {_qty(it['free'])}")
 
     elif van_list:
         last_van = van_list[-1]

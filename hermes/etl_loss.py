@@ -106,6 +106,7 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         for pos in positions:
             pos_id = pos["id"]
             assort = pos.get("assortment", {})
+            product_id = (assort.get("id", "") if isinstance(assort, dict) else "").split("?")[0]
             product_name = assort.get("name", "")
             folder_meta = assort.get("productFolder", {}).get("meta", {}).get("href", "")
             folder_path = ""
@@ -115,7 +116,7 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
             qty = float(pos.get("quantity", 0) or 0)
             price = round(pos.get("price", 0) or 0)
             total = round(qty * price)
-            pos_records.append((doc_id, pos_id, product_name, folder_path, qty, price, total))
+            pos_records.append((doc_id, pos_id, product_id, product_name, folder_path, qty, price, total))
 
         if pos_records:
             with conn.cursor() as cur:
@@ -123,9 +124,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 cur.executemany(
                     """
                     INSERT INTO loss_item
-                        (doc_id, position_id, product_name, folder_path, qty, cost_kop, total_kop)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (doc_id, position_id, product_id, product_name, folder_path, qty, cost_kop, total_kop)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (doc_id, position_id) DO UPDATE SET
+                        product_id=EXCLUDED.product_id,
                         product_name=EXCLUDED.product_name,
                         folder_path=EXCLUDED.folder_path,
                         qty=EXCLUDED.qty, cost_kop=EXCLUDED.cost_kop,

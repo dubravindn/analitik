@@ -102,9 +102,9 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     pdata = _sales_purchase_data(conn, d_from, d_to, store_id_f)
     by_store, by_product, tot = pdata["by_store"], pdata["by_product"], pdata["tot"]
 
-    lines.append("Прибыль = выручка − закупочная стоимость (цены из приёмок), без расходов/списаний.")
+    lines.append("Прибыль = выручка − закупочная стоимость (цены из карточки товара), без расходов/списаний.")
     lines.append(f"По закупочным ценам: {tot['coverage']:.0f}% выручки · "
-                 f"по себест. МойСклад: {100 - tot['coverage']:.0f}% (нет приёмок)")
+                 f"по себест. МойСклад: {100 - tot['coverage']:.0f}% (нет закупочной в карточке)")
     if store_name == "СОБРАНИЕ":
         lines.append("ℹ️ СОБРАНИЕ работает через перемещения — прибыль считается "
                      "по отгрузкам, поступление товара см. в «🔄 Перемещения».")
@@ -228,17 +228,23 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         cur.execute(f"""
             SELECT spd.product_name, SUM(spd.revenue_kop) AS rev,
                    SUM(spd.revenue_kop) - SUM({_pcost}) AS profit,
+                   SUM({_pcost}) AS pcost,
                    bool_or(pp.price_kop IS NULL OR pp.price_kop <= 0) AS uncov
             FROM sales_by_product_day spd {_asof}
             WHERE spd.day BETWEEN %s AND %s {sf2} AND {_srez}
             GROUP BY spd.product_name
-            ORDER BY SUM(spd.revenue_kop) - SUM({_pcost}) DESC LIMIT 10
+            ORDER BY SUM(spd.revenue_kop) - SUM({_pcost}) DESC LIMIT 25
         """, p2 + ["Ассортимент/%"])
-        top_profit = cur.fetchall()
+        rows = cur.fetchall()
+
+    # Дефект 3: позиции без себестоимости (pcost=0 → фальшивая маржа 100%) — не в
+    # топ прибыли, а отдельным списком «ошибка данных».
+    nocost = [r for r in rows if int(r[3] or 0) == 0 and int(r[1] or 0) > 0]
+    top_profit = [r for r in rows if int(r[3] or 0) > 0][:10]
 
     if top_profit:
         lines.append("💎 Топ-10 по прибыли:")
-        for i, (name, rev, profit, uncov) in enumerate(top_profit, 1):
+        for i, (name, rev, profit, pcost, uncov) in enumerate(top_profit, 1):
             rev = int(rev or 0); profit = int(profit or 0)
             mg = profit / rev * 100 if rev else 0
             star = " *" if uncov else ""
@@ -246,8 +252,14 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
             lines.append(f"  {i:2}. {name}{star}\n      {_rub(profit)} ₽ · маржа {mg:.0f}%")
         lines.append("")
 
+    if nocost:
+        lines.append("⚠️ Нет себестоимости (ошибка данных — заполнить закупочную цену в карточке):")
+        for name, rev, _profit, _pc, _uncov in nocost[:10]:
+            lines.append(f"  • {name}: выручка {_rub(int(rev or 0))} ₽")
+        lines.append("")
+
     if any_star:
-        lines.append("* себестоимость МойСклад — нет данных о приёмке")
+        lines.append("* закупочная цена не из карточки (фолбэк на себест. МойСклад)")
 
     return "\n".join(lines)
 

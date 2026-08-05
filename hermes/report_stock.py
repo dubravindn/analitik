@@ -105,7 +105,7 @@ def build_stock_by_qty(
         f"📋 Позиций: {total_pos} · Всего: {_qty(total_qty)} ед. · "
         f"Закуп. стоимость: {_rub(total_cost)} ₽"
     )
-    lines.append(f"(по закупочным ценам из приёмок: {cov_pct:.0f}% позиций, остальные — себест. МойСклад)")
+    lines.append(f"(по закупочным ценам из карточки: {cov_pct:.0f}% позиций, остальные — себест. МойСклад)")
     lines.append("")
 
     # Конкретный склад — топ-50 по остатку
@@ -316,7 +316,12 @@ def build_stock_report(
             sc = sum(e["cost_total"] for e in items)
             lines.append(f"  📍 {sn} — {len(items)} поз. · {_rub(sc)} ₽")
             for e in items:
-                idle = f"{e['days']} дн." if e["days"] < 9000 else "нет продаж"
+                if e["days"] >= 9000:
+                    idle = "нет продаж за всю историю"
+                elif e["days"] > 90:
+                    idle = "нет продаж за всю историю"   # >90 дн — это глубина данных, не срок
+                else:
+                    idle = f"{e['days']} дн."
                 cost_str = "⚠️ нет себест." if e["nocost"] else f"{_rub(e['cost_total'])} ₽"
                 lines.append(
                     f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · {cost_str}"

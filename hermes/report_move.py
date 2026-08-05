@@ -52,7 +52,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
     lines.append(f"🔄 Перемещения {period_str}{store_label}")
-    lines.append("Суммы в закупочных ценах из приёмок.")
+    lines.append("Суммы в закупочных ценах из карточки товара.")
 
     # Сводка (учитываем документ, если он касается выбранного склада как источник ИЛИ приёмник)
     store_cond = ""
@@ -78,7 +78,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
         return "\n".join(lines)
 
     coverage = (float(covered_ms) / float(all_ms) * 100) if all_ms else 0.0
-    lines.append(f"По закупочным ценам: {coverage:.0f}% стоимости · МойСклад: {100 - coverage:.0f}% (нет приёмок)")
+    lines.append(f"По закупочным ценам: {coverage:.0f}% стоимости · МойСклад: {100 - coverage:.0f}% (нет закупочной в карточке)")
     lines.append(f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. · Сумма: {_rub(float(total_kop))} ₽")
     lines.append("")
 
@@ -219,5 +219,5 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # total_qty/total_kop — из сводного запроса (не затирать переменной цикла!)
     lines.append(f"═══ ИТОГО: {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
     if any_star:
-        lines.append("* себестоимость МойСклад — нет данных о приёмке")
+        lines.append("* себестоимость МойСклад — нет закупочной цены в карточке")
     return "\n".join(lines)
