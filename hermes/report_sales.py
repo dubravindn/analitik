@@ -1,8 +1,4 @@
-"""Отчёт «Аналитик продаж» — считает по локальной БД и собирает текст по шаблону.
-
-Текст детерминированный: одни и те же данные всегда дают один и тот же отчёт,
-слово в слово. Никаких обращений к языковым моделям.
-"""
+"""Отчёт «Аналитик продаж»: лучшие позиции с разбивкой по складам."""
 from __future__ import annotations
 
 from datetime import date
@@ -10,210 +6,168 @@ from datetime import date
 from . import calc
 
 
-def _rub(kop: int) -> str:
-    """Форматирует копейки как рубли с разделителями тысяч: 3593100 → '35 931'."""
+def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
 
 
-def fetch_day(conn, day: date) -> list[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT store_name, channel, revenue_kop, cost_kop, checks,
-                   positions_total, positions_nocost
-            FROM sales_by_store_day
-            WHERE day = %s
-            ORDER BY channel, store_name
-            """,
-            (day,),
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+def _qty(q: float) -> str:
+    if q == int(q):
+        return f"{int(q):,}".replace(",", " ")
+    return f"{q:,.1f}".replace(",", " ")
 
 
-def top_products(conn, day: date, by: str = "revenue", limit: int = 20) -> list[dict]:
-    order_col = "revenue_kop" if by == "revenue" else "profit_kop"
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT product_name,
-                   SUM(sell_qty)     AS qty,
-                   SUM(revenue_kop)  AS revenue_kop,
-                   SUM(profit_kop)   AS profit_kop
-            FROM sales_by_product_day
-            WHERE day = %s
-            GROUP BY product_name
-            ORDER BY SUM({order_col}) DESC
-            LIMIT %s
-            """,
-            (day, limit),
-        )
-        cols = [c.name for c in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+# ─── Основной аналитический отчёт: лучшие позиции ────────────────────────────
 
-
-def build_day_report(conn, day: date) -> str:
-    stores = fetch_day(conn, day)
+def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
+    """Полная аналитика продаж: итоги + топ товаров, разбивка по складам."""
+    days = (d_to - d_from).days + 1
+    period_str = (
+        d_from.strftime("%d.%m.%Y") if d_from == d_to
+        else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
+    )
+    store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
-    lines.append(f"📊 Продажи за {day.strftime('%d.%m.%Y')}")
+    lines.append(f"📊 Продажи {period_str} ({days} дн.){store_label}")
     lines.append("")
 
+    # ── Итоги по складам ──
+    sf = "AND store_name = %s" if store_name else ""
+    p  = [d_from, d_to] + ([store_name] if store_name else [])
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT store_name, channel,
+                   SUM(revenue_kop) AS rev, SUM(cost_kop) AS cost, SUM(checks) AS chk
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s {sf}
+            GROUP BY store_name, channel
+            ORDER BY channel, SUM(revenue_kop) DESC
+        """, p)
+        stores = cur.fetchall()
+
     if not stores:
-        lines.append("Данных за этот день нет (выгрузка не проводилась).")
+        lines.append("Нет данных за выбранный период.")
         return "\n".join(lines)
 
-    # По каналам: розница / опт / ресторан
-    grand_rev = grand_cost = grand_checks = 0
+    grand_rev = grand_cost = grand_chk = 0
     for channel in ("розница", "опт", "ресторан"):
-        chan_stores = [s for s in stores if s["channel"] == channel]
-        if not chan_stores:
+        chan = [(sn, ch, rev, cost, chk) for sn, ch, rev, cost, chk in stores if ch == channel]
+        if not chan:
             continue
-        crev = sum(s["revenue_kop"] for s in chan_stores)
-        ccost = sum(s["cost_kop"] for s in chan_stores)
-        cchecks = sum(s["checks"] for s in chan_stores)
-        if crev == 0 and cchecks == 0:
+        c_rev  = sum(r[2] for r in chan)
+        c_cost = sum(r[3] for r in chan)
+        c_chk  = sum(r[4] for r in chan)
+        if c_rev == 0:
             continue
-        grand_rev += crev
-        grand_cost += ccost
-        grand_checks += cchecks
-
-        lines.append(f"— {channel.upper()} —")
-        for s in chan_stores:
-            if s["revenue_kop"] == 0 and s["checks"] == 0:
+        grand_rev  += c_rev
+        grand_cost += c_cost
+        grand_chk  += c_chk
+        gp     = calc.gross_profit(c_rev, c_cost)
+        margin = calc.gross_margin_pct(c_rev, c_cost)
+        ac     = calc.avg_check(c_rev, c_chk)
+        lines.append(f"── {channel.upper()} ──")
+        for sn, _, rev, cost, chk in chan:
+            if rev == 0:
                 continue
-            gp = calc.gross_profit(s["revenue_kop"], s["cost_kop"])
-            margin = calc.gross_margin_pct(s["revenue_kop"], s["cost_kop"])
-            ac = calc.avg_check(s["revenue_kop"], s["checks"])
-            warn = ""
-            if s["positions_total"]:
-                nocost_share = 100 * s["positions_nocost"] / s["positions_total"]
-                if nocost_share >= 10:
-                    warn = f"  ⚠️ без себест.: {nocost_share:.0f}% позиций"
+            sp = calc.gross_profit(rev, cost)
+            sm = calc.gross_margin_pct(rev, cost)
+            sa = calc.avg_check(rev, chk)
             lines.append(
-                f"  {s['store_name']}: выручка {_rub(s['revenue_kop'])} ₽ · "
-                f"прибыль {_rub(gp)} ₽ ({margin:.0f}%) · "
-                f"чеков {s['checks']} · ср.чек {_rub(ac)} ₽{warn}"
+                f"  📍 {sn}\n"
+                f"     Выручка {_rub(rev)} ₽ · Прибыль {_rub(sp)} ₽ ({sm:.0f}%)\n"
+                f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽"
             )
+        lines.append(
+            f"  Итого: {_rub(c_rev)} ₽ · {_rub(gp)} ₽ ({margin:.0f}%) · {c_chk} чек."
+        )
         lines.append("")
 
-    gp_total = calc.gross_profit(grand_rev, grand_cost)
-    margin_total = calc.gross_margin_pct(grand_rev, grand_cost)
-    ac_total = calc.avg_check(grand_rev, grand_checks)
-    lines.append("— ИТОГО —")
+    gp_t = calc.gross_profit(grand_rev, grand_cost)
+    mg_t = calc.gross_margin_pct(grand_rev, grand_cost)
+    ac_t = calc.avg_check(grand_rev, grand_chk)
+    lines.append("── ИТОГО ──")
     lines.append(
-        f"  Выручка {_rub(grand_rev)} ₽ · Грязная прибыль {_rub(gp_total)} ₽ "
-        f"({margin_total:.0f}%) · Чеков {grand_checks} · Ср.чек {_rub(ac_total)} ₽"
+        f"  Выручка: {_rub(grand_rev)} ₽\n"
+        f"  Прибыль: {_rub(gp_t)} ₽ ({mg_t:.0f}%)\n"
+        f"  Чеков: {grand_chk} · Ср.чек: {_rub(ac_t)} ₽"
     )
     lines.append("")
 
-    # Топ-5 товаров по выручке (для дневного отчёта; полный топ-20 — в недельном)
-    top = top_products(conn, day, by="revenue", limit=5)
-    if top:
-        lines.append("🏆 Топ-5 по выручке:")
-        for i, p in enumerate(top, 1):
+    # ── Топ товаров ──
+    p2 = [d_from, d_to] + ([store_name] if store_name else [])
+    sf2 = ""
+    if store_name:
+        # Ищем store_id для фильтра product_day (там нет store_name)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT store_id FROM sales_by_store_day WHERE store_name=%s LIMIT 1",
+                (store_name,)
+            )
+            row = cur.fetchone()
+        if row:
+            sf2 = "AND store_id = %s"
+            p2 = [d_from, d_to, row[0]]
+        else:
+            sf2 = ""
+            p2  = [d_from, d_to]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT product_name,
+                   SUM(sell_qty)    AS qty,
+                   SUM(revenue_kop) AS rev,
+                   SUM(cost_kop)    AS cost,
+                   SUM(profit_kop)  AS profit
+            FROM sales_by_product_day
+            WHERE day BETWEEN %s AND %s {sf2}
+            GROUP BY product_name
+            ORDER BY SUM(revenue_kop) DESC
+            LIMIT 20
+        """, p2)
+        top_rev = cur.fetchall()
+
+    if top_rev:
+        lines.append("🏆 Топ-20 по выручке:")
+        for i, (name, qty, rev, cost, profit) in enumerate(top_rev, 1):
+            mg = profit / rev * 100 if rev else 0
             lines.append(
-                f"  {i}. {p['product_name']}: {_rub(p['revenue_kop'])} ₽ "
-                f"(прибыль {_rub(p['profit_kop'])} ₽)"
+                f"  {i:2}. {name}\n"
+                f"      {_qty(qty)} ед. · {_rub(rev)} ₽ · прибыль {_rub(profit)} ₽ ({mg:.0f}%)"
+            )
+        lines.append("")
+
+    # Топ-10 по прибыли (отдельно)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT product_name,
+                   SUM(sell_qty)    AS qty,
+                   SUM(revenue_kop) AS rev,
+                   SUM(profit_kop)  AS profit
+            FROM sales_by_product_day
+            WHERE day BETWEEN %s AND %s {sf2}
+            GROUP BY product_name
+            ORDER BY SUM(profit_kop) DESC
+            LIMIT 10
+        """, p2)
+        top_profit = cur.fetchall()
+
+    if top_profit:
+        lines.append("💎 Топ-10 по прибыли:")
+        for i, (name, qty, rev, profit) in enumerate(top_profit, 1):
+            mg = profit / rev * 100 if rev else 0
+            lines.append(
+                f"  {i:2}. {name}\n"
+                f"      {_rub(profit)} ₽ · маржа {mg:.0f}%"
             )
 
     return "\n".join(lines)
+
+
+# ─── Дневной / периодный отчёт (для daily push) ───────────────────────────────
+
+def build_day_report(conn, day: date) -> str:
+    return build_sales_analytics(conn, day, day)
 
 
 def build_period_report(conn, d_from: date, d_to: date) -> str:
-    """Агрегированный отчёт за произвольный период (несколько дней)."""
-    days = (d_to - d_from).days + 1
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT store_name, channel,
-                   SUM(revenue_kop)  AS revenue_kop,
-                   SUM(cost_kop)     AS cost_kop,
-                   SUM(checks)       AS checks
-            FROM sales_by_store_day
-            WHERE day BETWEEN %s AND %s
-            GROUP BY store_name, channel
-            ORDER BY channel, store_name
-            """,
-            (d_from, d_to),
-        )
-        cols = [c.name for c in cur.description]
-        stores = [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    period_str = (
-        f"{d_from.strftime('%d.%m.%Y')}"
-        if d_from == d_to
-        else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
-    )
-    lines: list[str] = []
-    lines.append(f"\U0001f4ca Продажи за {period_str} ({days} дн.)")
-    lines.append("")
-
-    if not stores:
-        lines.append("Нет данных за этот период.")
-        return "\n".join(lines)
-
-    grand_rev = grand_cost = grand_checks = 0
-    for channel in ("розница", "опт", "ресторан"):
-        chan = [s for s in stores if s["channel"] == channel]
-        if not chan:
-            continue
-        crev = sum(s["revenue_kop"] for s in chan)
-        ccost = sum(s["cost_kop"] for s in chan)
-        cchecks = sum(s["checks"] for s in chan)
-        if crev == 0 and cchecks == 0:
-            continue
-        grand_rev += crev
-        grand_cost += ccost
-        grand_checks += cchecks
-
-        lines.append(f"— {channel.upper()} —")
-        for s in chan:
-            if s["revenue_kop"] == 0 and s["checks"] == 0:
-                continue
-            gp = calc.gross_profit(s["revenue_kop"], s["cost_kop"])
-            margin = calc.gross_margin_pct(s["revenue_kop"], s["cost_kop"])
-            ac = calc.avg_check(s["revenue_kop"], s["checks"])
-            lines.append(
-                f"  {s['store_name']}: {_rub(s['revenue_kop'])} ₽ · "
-                f"прибыль {_rub(gp)} ₽ ({margin:.0f}%) · "
-                f"чеков {s['checks']} · ср.чек {_rub(ac)} ₽"
-            )
-        lines.append("")
-
-    gp_total = calc.gross_profit(grand_rev, grand_cost)
-    margin_total = calc.gross_margin_pct(grand_rev, grand_cost)
-    ac_total = calc.avg_check(grand_rev, grand_checks)
-    lines.append("— ИТОГО —")
-    lines.append(
-        f"  Выручка {_rub(grand_rev)} ₽ · "
-        f"Прибыль {_rub(gp_total)} ₽ "
-        f"({margin_total:.0f}%) · Чеков {grand_checks} · "
-        f"Ср.чек {_rub(ac_total)} ₽"
-    )
-    lines.append("")
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT product_name, SUM(sell_qty) AS qty,
-                   SUM(revenue_kop) AS revenue_kop, SUM(profit_kop) AS profit_kop
-            FROM sales_by_product_day
-            WHERE day BETWEEN %s AND %s
-            GROUP BY product_name
-            ORDER BY SUM(revenue_kop) DESC
-            LIMIT 10
-            """,
-            (d_from, d_to),
-        )
-        top = [dict(zip([c.name for c in cur.description], r)) for r in cur.fetchall()]
-
-    if top:
-        lines.append(f"\U0001f3c6 Топ-10 по выручке:")
-        for i, p in enumerate(top, 1):
-            lines.append(
-                f"  {i}. {p['product_name']}: {_rub(p['revenue_kop'])} ₽ "
-                f"(прибыль {_rub(p['profit_kop'])} ₽)"
-            )
-
-    return "\n".join(lines)
+    return build_sales_analytics(conn, d_from, d_to)
