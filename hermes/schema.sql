@@ -147,6 +147,19 @@ ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS project_name text;
 -- Проект у документа списания (указывает подразделение/склад/цель)
 ALTER TABLE loss_doc ADD COLUMN IF NOT EXISTS project_name text;
 
+-- Товар в позиции поставки (id из МойСклад) — для связи с продажами/остатками
+-- по закупочной цене приёмки (D0.1). По названию связывать нельзя (дубли).
+ALTER TABLE supply_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_supply_item_product ON supply_item (product_id);
+
+-- Закупочные цены из приёмок: для товара — цена на дату приёмки. Для операции
+-- дня D берём строку с максимальным priced_from <= D (см. calc.purchase_price_at).
+CREATE OR REPLACE VIEW purchase_price_asof AS
+SELECT si.product_id, sd.day AS priced_from, si.price_kop
+FROM supply_item si
+JOIN supply_doc sd ON sd.doc_id = si.doc_id
+WHERE si.product_id IS NOT NULL AND si.product_id != '' AND si.price_kop > 0;
+
 -- Документы отгрузки (demand) для клиентской аналитики
 CREATE TABLE IF NOT EXISTS sales_doc (
     doc_id       text        PRIMARY KEY,

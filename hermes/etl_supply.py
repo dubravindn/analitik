@@ -10,6 +10,9 @@ from . import config
 log = logging.getLogger("hermes.etl_supply")
 
 _PAGE = 100
+# Санитарный потолок для сумм в копейках (100 млрд ₽). Выше — sentinel-мусор
+# из setup-документов МойСклад, который переполняет bigint.
+_MAX_KOP = 10**15
 
 
 def _moment_filter(d_from: date, d_to: date) -> str:
@@ -82,6 +85,9 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         agent_name = agent.get("name", "")
         description = doc.get("description") or ""
         total_kop = round(doc.get("sum", 0) or 0)
+        if total_kop > _MAX_KOP:   # sentinel-мусор (setup-документы) — не хранить сумму
+            log.warning("Поставка %s: сумма %s превышает потолок — обнуляю", doc_id, total_kop)
+            total_kop = 0
 
         with conn.cursor() as cur:
             cur.execute(
@@ -103,11 +109,21 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         for pos in positions:
             pos_id = pos["id"]
             assort = pos.get("assortment", {})
+            product_id = assort.get("id", "") if isinstance(assort, dict) else ""
             product_name = assort.get("name", "")
             qty = float(pos.get("quantity", 0) or 0)
             price = round(pos.get("price", 0) or 0)
             total = round(qty * price)
-            pos_records.append((doc_id, pos_id, product_name, qty, price, total))
+            # Служебные setup-документы МойСклад (напр. «00089») задают шарам/услугам
+            # sentinel-значения qty≈1e11 и price≈1e13 → total переполняет bigint.
+            # Пропускаем такие позиции, чтобы не падать и не хранить мусор.
+            if price > _MAX_KOP or total > _MAX_KOP:
+                log.warning(
+                    "Поставка %s: пропущена служебная позиция %s (qty=%s price_kop=%s) — sentinel-значения",
+                    doc_id, product_name, qty, price,
+                )
+                continue
+            pos_records.append((doc_id, pos_id, product_id, product_name, qty, price, total))
 
         if pos_records:
             with conn.cursor() as cur:
@@ -115,9 +131,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 cur.executemany(
                     """
                     INSERT INTO supply_item
-                        (doc_id, position_id, product_name, qty, price_kop, total_kop)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (doc_id, position_id, product_id, product_name, qty, price_kop, total_kop)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (doc_id, position_id) DO UPDATE SET
+                        product_id=EXCLUDED.product_id,
                         product_name=EXCLUDED.product_name, qty=EXCLUDED.qty,
                         price_kop=EXCLUDED.price_kop, total_kop=EXCLUDED.total_kop,
                         synced_at=now()
