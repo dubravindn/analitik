@@ -24,6 +24,7 @@ from .etl_supply import run as run_sync_supply
 from .etl_cashflow import run as run_sync_cashflow
 from .etl_clients import run as run_sync_clients
 from .etl_move import run as run_sync_move
+from .etl_prices import run as run_sync_prices
 from .logging_setup import setup
 from .moysklad import MoyskladClient
 from .report_sales import build_day_report
@@ -86,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_move.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_sync_move.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
+    p_sync_prices = sub.add_parser("sync-prices", help="Снимок цен номенклатуры (закупочная из карточки)")
+    p_sync_prices.add_argument("--date", dest="d", default=None, type=_parse_date)
+
     p_rep_loss = sub.add_parser("report-loss", help="Отчёт по списаниям (в stdout)")
     p_rep_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_rep_loss.add_argument("--to", dest="d_to", required=True, type=_parse_date)
@@ -124,6 +128,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("bot", help="Запустить Telegram-бот (long-polling, блокирующий)")
 
     args = parser.parse_args(argv)
+
+    # Долгие выгрузки помечают «идёт синхронизация» — бот покажет предупреждение
+    # вместо молчаливого зависания на контенции. Маркер снимается при выходе.
+    _SYNC_CMDS = {"sync", "sync-stock", "sync-loss", "sync-supply", "sync-cashflow",
+                  "sync-clients", "sync-move", "sync-prices", "backfill", "daily"}
+    if args.cmd in _SYNC_CMDS:
+        import atexit
+        from . import synclock
+        synclock.set_running(args.cmd)
+        atexit.register(synclock.clear)
 
     if args.cmd == "whoami":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
@@ -207,6 +221,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Выгружено отгрузок: {n} документов за {args.d_from}..{args.d_to}")
         return 0
 
+    if args.cmd == "sync-prices":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        db.apply_schema(conn)
+        n = run_sync_prices(client, conn, args.d or config.msk_today())
+        print(f"Снимок цен: {n} товаров")
+        return 0
+
     if args.cmd == "sync-move":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
@@ -279,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
 
         _safe("продажи",     run_sync,          client, conn, yesterday, yesterday)
         _safe("остатки",     run_sync_stock,    client, conn, today)
+        _safe("цены",        run_sync_prices,   client, conn, today)
         _safe("списания",    run_sync_loss,     client, conn, yesterday, yesterday)
         _safe("ДДС",         run_sync_cashflow, client, conn, yesterday, yesterday)
         _safe("клиенты",     run_sync_clients,  client, conn, yesterday, yesterday)

@@ -95,6 +95,25 @@ CREATE INDEX IF NOT EXISTS ix_loss_doc_day      ON loss_doc (day);
 CREATE INDEX IF NOT EXISTS ix_loss_doc_store    ON loss_doc (store_id, day);
 CREATE INDEX IF NOT EXISTS ix_loss_item_product ON loss_item (product_name);
 
+-- Товар в позиции списания (id из МойСклад) — join по имени ненадёжен (дубли).
+-- id брать чистым (.split('?')[0]) — урок бага ?expand=supplier.
+ALTER TABLE loss_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_loss_item_pid ON loss_item (product_id);
+
+-- Цены из карточки товара МойСклад (снимок раз в сутки → история цен).
+-- Блок G: закупочная цена берётся отсюда (buyPrice), а не из приёмок.
+CREATE TABLE IF NOT EXISTS product_price (
+    day            date        NOT NULL,
+    product_id     text        NOT NULL,
+    product_name   text        NOT NULL,
+    buy_price_kop  bigint      NOT NULL DEFAULT 0,   -- закупочная (buyPrice)
+    min_price_kop  bigint      NOT NULL DEFAULT 0,   -- минимальная (minPrice)
+    sale_prices    jsonb,                            -- {"Наличка":9900,"Розница":19900,...}
+    synced_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (day, product_id)
+);
+CREATE INDEX IF NOT EXISTS ix_product_price_pid ON product_price (product_id, day);
+
 -- Поставки: заголовки входящих поставок (supply)
 CREATE TABLE IF NOT EXISTS supply_doc (
     doc_id       text        PRIMARY KEY,
@@ -152,13 +171,24 @@ ALTER TABLE loss_doc ADD COLUMN IF NOT EXISTS project_name text;
 ALTER TABLE supply_item ADD COLUMN IF NOT EXISTS product_id text;
 CREATE INDEX IF NOT EXISTS ix_supply_item_product ON supply_item (product_id);
 
--- Закупочные цены из приёмок: для товара — цена на дату приёмки. Для операции
--- дня D берём строку с максимальным priced_from <= D (см. calc.purchase_price_at).
+-- Закупочная цена из КАРТОЧКИ товара (блок G): buy_price_kop из снимков
+-- product_price. Для операции дня D берётся строка с максимальным priced_from<=D
+-- (см. calc.purchase_price_at). Плюс «фолбэк-строка» от 2000-01-01 с самым ранним
+-- снимком каждого товара — чтобы продажи ДО начала снятия снимков тоже покрывались
+-- (приблизительно, самой ранней известной ценой). Так покрытие ~100% без правок
+-- логики asof в отчётах.
 CREATE OR REPLACE VIEW purchase_price_asof AS
-SELECT si.product_id, sd.day AS priced_from, si.price_kop
-FROM supply_item si
-JOIN supply_doc sd ON sd.doc_id = si.doc_id
-WHERE si.product_id IS NOT NULL AND si.product_id != '' AND si.price_kop > 0;
+    SELECT product_id, day AS priced_from, buy_price_kop AS price_kop
+    FROM product_price
+    WHERE buy_price_kop > 0
+UNION ALL
+    SELECT product_id, DATE '2000-01-01' AS priced_from, price_kop
+    FROM (
+        SELECT DISTINCT ON (product_id) product_id, buy_price_kop AS price_kop
+        FROM product_price
+        WHERE buy_price_kop > 0
+        ORDER BY product_id, day ASC
+    ) earliest;
 
 -- Документы отгрузки (demand) для клиентской аналитики
 CREATE TABLE IF NOT EXISTS sales_doc (
