@@ -53,22 +53,29 @@ def _header_and_total(text: str) -> tuple[int, int]:
 
 
 def test_loss_header_equals_total():
+    # H2: отчёт из трёх блоков. Сверяем «🌸 Порча (розница): X ₽» с
+    # «═══ ИТОГО ПОРЧА … X ₽» (инвариант A1 для блока порчи).
     def script(sql):
-        if "SELECT COUNT(DISTINCT d.doc_id)" in sql:        # сводка
-            return [(2, 513, 4_941_500)]
+        if "COUNT(DISTINCT d.doc_id)" in sql and "GROUP BY" not in sql:   # _loss_sum
+            return [(2, 513, 4_941_500)] if "NOT (d.store_name = ANY" in sql else [(0, 0, 0)]
+        if "expense_item_name ILIKE" in sql:                # возвраты (cashflow)
+            return [(0, 0)]
         if "GROUP BY d.store_name" in sql:                  # по складам
             return [("Склад", 2, 513, 4_941_500)]
         if "NULLIF(d.project_name" in sql:                  # по проектам
             return []
         if "i.product_name, SUM" in sql:                    # топ
             return [("Роза", 500, 4_940_000)]
-        if "d.doc_id, d.moment" in sql:                     # документы (+d.day = 6 колонок)
+        if "d.doc_id, d.moment" in sql:                     # документы (6 колонок)
             return [("doc1", None, date(2026, 8, 1), "Склад", "", "")]
         if "i.cost_kop, i.total_kop" in sql:                # позиции +pp.price_kop (5 колонок)
             return [("Лента", 5, 1900, 9500, 1900)]
         return []
     text = report_loss.build_loss_report(_Conn(script), date(2026, 8, 1), date(2026, 8, 5))
-    h, t = _header_and_total(text)
+    header = next(l for l in text.split("\n") if l.startswith("🌸 Порча"))
+    total = next(l for l in text.split("\n") if l.startswith("═══ ИТОГО ПОРЧА"))
+    h = _num(header.split(":")[1].split("₽")[0])
+    t = _num(total.split("·")[-1].split("₽")[0])
     assert h == t == 49415, (h, t, text)
 
 
