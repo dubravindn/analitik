@@ -141,9 +141,17 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     pdata = _sales_purchase_data(conn, d_from, d_to, store_id_f)
     by_store, by_product, tot = pdata["by_store"], pdata["by_product"], pdata["tot"]
 
-    lines.append("Прибыль = выручка − закупочная стоимость (цены из карточки товара), без расходов/списаний.")
-    lines.append(f"По закупочным ценам: {tot['coverage']:.0f}% выручки · "
-                 f"по себест. МойСклад: {100 - tot['coverage']:.0f}% (нет закупочной в карточке)")
+    # J1.1: методику в шапке — полными словами, каждая мысль отдельной строкой,
+    # без сокращений (владельцу были непонятны «себест.», «закуп.»).
+    cov = tot["coverage"]
+    lines.append("Как считается прибыль: выручка минус закупочная стоимость товара.")
+    lines.append("Закупочная цена берётся из карточки товара в МойСклад.")
+    lines.append("Расходы и списания в этой прибыли не учтены — они в своих разделах.")
+    lines.append(
+        f"У {cov:.0f}% выручки есть закупочная цена в карточке; остальные "
+        f"{100 - cov:.0f}% посчитаны"
+    )
+    lines.append("по себестоимости МойСклад (закупочная цена в карточке не заполнена).")
     if store_name == "СОБРАНИЕ":
         lines.append("ℹ️ СОБРАНИЕ работает через перемещения — прибыль считается "
                      "по отгрузкам, поступление товара см. в «🔄 Перемещения».")
@@ -192,12 +200,18 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
             sp = rev - _pc(sid)
             sm = sp / rev * 100 if rev else 0
             sa = calc.avg_check(rev, chk)
-            note = "\n     ℹ️ опт+розница через одну кассу" if sn in mixed else ""
             lines.append(
                 f"  📍 {sn}\n"
                 f"     Выручка {_rub(rev)} ₽ · Прибыль {_rub(sp)} ₽ ({sm:.0f}%)\n"
-                f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽{note}"
+                f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽"
             )
+            # J1.2: пояснение смешанной кассы — отдельными строками под цифрами,
+            # понятными без контекста (не суффиксом в строке цифр).
+            if sn in mixed:
+                lines.append(
+                    "     ℹ️ Через эту кассу продаётся и опт, и розница, поэтому процент\n"
+                    "     прибыли здесь всегда ниже, чем у чисто розничных точек. Это норма."
+                )
             if channel == "розница" and sn not in mixed:
                 retail_margins.append((sn, sm, rev))
         lines.append(
@@ -287,20 +301,11 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         """, p2 + ["Ассортимент/%"])
         rows = cur.fetchall()
 
-    # Дефект 3: позиции без себестоимости (pcost=0 → фальшивая маржа 100%) — не в
-    # топ прибыли, а отдельным списком «ошибка данных».
+    # J1.3: «Топ-10 по прибыли» удалён (прибыль и так печатается рядом с каждой
+    # позицией в топ-20 по выручке). Запрос сохранён ради дефекта 3 ниже:
+    # позиции без себестоимости (pcost=0 → фальшивая маржа 100%) — отдельным
+    # списком «ошибка данных», а не в топе.
     nocost = [r for r in rows if int(r[3] or 0) == 0 and int(r[1] or 0) > 0]
-    top_profit = [r for r in rows if int(r[3] or 0) > 0][:10]
-
-    if top_profit:
-        lines.append("💎 Топ-10 по прибыли:")
-        for i, (name, rev, profit, pcost, uncov) in enumerate(top_profit, 1):
-            rev = int(rev or 0); profit = int(profit or 0)
-            mg = profit / rev * 100 if rev else 0
-            star = " *" if uncov else ""
-            any_star = any_star or bool(uncov)
-            lines.append(f"  {i:2}. {name}{star}\n      {_rub(profit)} ₽ · маржа {mg:.0f}%")
-        lines.append("")
 
     if nocost:
         lines.append("⚠️ Нет себестоимости (ошибка данных — заполнить закупочную цену в карточке):")
