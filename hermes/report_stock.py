@@ -38,6 +38,60 @@ _ST_JOIN = """
 _ST_UNIT  = "COALESCE(NULLIF(pp.price_kop, 0), stock_snapshot.cost_price_kop)"
 _ST_VALUE = f"stock_qty * {_ST_UNIT}"
 
+# Оптовая цена «Наличка» на дату снимка (блок I) — вторая цена в строках.
+_NAL_JOIN = """
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM nal_price_asof n
+        WHERE n.product_id = stock_snapshot.product_id AND n.priced_from <= stock_snapshot.day
+        ORDER BY n.priced_from DESC LIMIT 1
+    ) np ON true
+"""
+
+STALE_SREZKA_MIN_DAYS = 5   # I3: залежалая СРЕЗКА — строго больше 5 дней без продаж
+
+
+def _two_price(cost_unit, nal_unit) -> str:
+    """«закуп X ₽ · нал Y ₽» (прочерк, если цены нет)."""
+    c = f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
+    n = f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
+    return f"{c} · {n}"
+
+
+def _supply_days_map(conn):
+    """({product_id: дата последней приёмки}, дата первого снимка) — для «дней на складе»."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT si.product_id, MAX(sd.day)
+            FROM supply_item si JOIN supply_doc sd ON sd.doc_id = si.doc_id
+            WHERE si.product_id IS NOT NULL AND si.product_id != ''
+            GROUP BY si.product_id
+        """)
+        last_supply = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT MIN(day) FROM stock_snapshot")
+        first_snap = cur.fetchone()[0]
+    return last_supply, first_snap
+
+
+def _render_stock_by_store(conn, lines, day, order):
+    """Блок «Остатки по складам» (только «Ассортимент», sentinel-строки отфильтрованы).
+
+    Единый sentinel-фильтр stock_qty < 9999 (тот же, что в прогнозе) — иначе
+    служебные заглушки (лента 509 979, шары 9 999) искажают итог.
+    """
+    lines.append("── ОСТАТКИ ПО СКЛАДАМ (товар «Ассортимент», закуп. цены) ──")
+    with conn.cursor() as cur:
+        for sn in order:
+            cur.execute(f"""
+                SELECT COUNT(*), SUM(stock_qty), SUM({_ST_VALUE})
+                FROM stock_snapshot {_ST_JOIN}
+                WHERE day = %s AND stock_qty > 0 AND stock_qty < 9999 AND store_name = %s
+                  AND folder_path LIKE %s
+            """, [day, sn, "Ассортимент/%"])
+            r = cur.fetchone()
+            if not r or not r[0]:
+                continue
+            lines.append(f"  📍 {sn}: {r[0]} поз. · {_qty(float(r[1] or 0))} ед. · {_rub(float(r[2] or 0))} ₽")
+
 
 # ─── Отчёт «Остатки»: позиции с наибольшим количеством ───────────────────────
 
@@ -105,47 +159,60 @@ def build_stock_by_qty(
         f"📋 Позиций: {total_pos} · Всего: {_qty(total_qty)} ед. · "
         f"Закуп. стоимость: {_rub(total_cost)} ₽"
     )
-    lines.append(f"(по закупочным ценам из карточки: {cov_pct:.0f}% позиций, остальные — себест. МойСклад)")
+    lines.append(f"По закупочным ценам из карточки: {cov_pct:.0f}% позиций · МойСклад: {100 - cov_pct:.0f}%")
     lines.append("")
+
+    last_supply, first_snap = _supply_days_map(conn)
+
+    def _days_on_shelf(pid) -> str:
+        ls = last_supply.get(pid)
+        if ls:
+            return f"{(day - ls).days} дн."
+        if first_snap:
+            return f"≥{(day - first_snap).days} дн. (вся история)"
+        return "—"
 
     # Конкретный склад — топ-50 по остатку
     if store_name:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT product_name, is_srezka, stock_qty,
-                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
-                FROM stock_snapshot {_ST_JOIN}
+                SELECT stock_snapshot.product_id, product_name, is_srezka, stock_qty,
+                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit
+                FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 50
             """, [day, store_name] + gp)
             rows = cur.fetchall()
 
-        lines.append(f"── Топ-{min(50, len(rows))} ──")
+        lines.append(f"── Топ-{len(rows)} по остатку ──")
         nocost_n = 0
-        for name, is_srezka, qty, cost_unit, cost_total in rows:
+        for pid, name, is_srezka, qty, cost_unit, cost_total, nal_unit in rows:
             tag = " [СР]" if is_srezka else ""
             if not cost_unit:
                 nocost_n += 1
-                price_line = "    ⚠️ нет себестоимости"
-            else:
-                price_line = f"    Цена: {_rub(cost_unit)} ₽/ед. · Сумма: {_rub(float(cost_total))} ₽"
-            lines.append(f"  • {name}{tag}: {_qty(float(qty))} ед.\n{price_line}")
+            tail = "⚠️ нет закуп. цены" if not cost_unit else _rub(float(cost_total)) + " ₽"
+            lines.append(
+                f"  • {name}{tag}: {_qty(float(qty))} ед. · {_days_on_shelf(pid)} · "
+                f"{_two_price(cost_unit, nal_unit)} · {tail}"
+            )
         if nocost_n:
             lines.append("")
-            lines.append(f"⚠️ Позиций без себестоимости: {nocost_n} (стоимость запаса занижена)")
+            lines.append(f"⚠️ Позиций без закупочной цены: {nocost_n} (заполнить в карточке)")
+        lines.append("")
+        _render_stock_by_store(conn, lines, day, [store_name])
         return "\n".join(lines)
 
     # Все склады — разбивка по складам, топ-15
     for sname in _STORE_ORDER:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT product_name, is_srezka, stock_qty, {_ST_UNIT} AS cost_unit,
-                       {_ST_VALUE} AS cost_total,
+                SELECT stock_snapshot.product_id, product_name, is_srezka, stock_qty,
+                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit,
                        COUNT(*) OVER() AS total_cnt,
                        SUM(stock_qty) OVER() AS total_qty,
                        SUM({_ST_VALUE}) OVER() AS total_cost
-                FROM stock_snapshot {_ST_JOIN}
+                FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 15
@@ -154,20 +221,23 @@ def build_stock_by_qty(
 
         if not rows:
             continue
-        total_cnt  = rows[0][5]
-        store_qty  = float(rows[0][6] or 0)
-        store_cost = float(rows[0][7] or 0)
+        total_cnt  = rows[0][7]
+        store_qty  = float(rows[0][8] or 0)
+        store_cost = float(rows[0][9] or 0)
         lines.append(f"── 📍 {sname} ──")
         lines.append(
             f"   Позиций: {total_cnt} · {_qty(store_qty)} ед. · {_rub(store_cost)} ₽"
         )
-        for name, is_srezka, qty, cost_unit, cost_total, *_ in rows:
+        for pid, name, is_srezka, qty, cost_unit, cost_total, nal_unit, *_ in rows:
             tag = " [СР]" if is_srezka else ""
-            cost_str = "⚠️ нет себест." if not cost_unit else f"{_rub(float(cost_total))} ₽"
+            tail = "⚠️ нет закуп." if not cost_unit else f"{_rub(float(cost_total))} ₽"
             lines.append(
-                f"  • {name}{tag}: {_qty(float(qty))} ед. · {cost_str}"
+                f"  • {name}{tag}: {_qty(float(qty))} ед. · {_days_on_shelf(pid)} · "
+                f"{_two_price(cost_unit, nal_unit)} · {tail}"
             )
         lines.append("")
+
+    _render_stock_by_store(conn, lines, day, _STORE_ORDER)
 
     return "\n".join(lines)
 
@@ -244,24 +314,13 @@ def build_stock_report(
     store_label = f" · {store_name}" if store_name else " · Все склады"
     group_label = f" · Группа: {folder_group}" if folder_group else ""
     lines: list[str] = []
-    lines.append(f"🚨 Залежалые на {day.strftime('%d.%m.%Y')}{store_label}{group_label}")
-    lines.append(f"   СРЕЗКА ≥{STALE_SREZKA_DAYS} дн. · Прочие ≥{STALE_OTHER_DAYS} дн.")
+    lines.append(f"🚨 Залежалые СРЕЗКА на {day.strftime('%d.%m.%Y')}{store_label}")
+    lines.append(f"   Только СРЕЗКА без продаж > {STALE_SREZKA_MIN_DAYS} дн., по количеству.")
     lines.append("")
 
-    gf, gp = _group_filter(folder_group)
+    gf, gp = _group_filter("СРЕЗКА")   # I3: только СРЕЗКА
     sf = "AND store_name = %s" if store_name else ""
     p  = [day] + ([store_name] if store_name else []) + gp
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COUNT(*) FROM stock_snapshot
-            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
-        """, p)
-        total_rows = cur.fetchone()[0]
-
-    if not total_rows:
-        lines.append("Снимок остатков за этот день не найден.")
-        return "\n".join(lines)
 
     with conn.cursor() as cur:
         cur.execute("SELECT product_name, MAX(day) FROM sales_by_product_day GROUP BY product_name")
@@ -269,100 +328,55 @@ def build_stock_report(
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT store_name, product_name, is_srezka, stock_qty,
-                   {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
-            FROM stock_snapshot {_ST_JOIN}
+            SELECT store_name, product_name, stock_qty,
+                   {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit
+            FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
             ORDER BY store_name, stock_qty DESC
         """, p)
         rows = cur.fetchall()
 
     stale_srezka: dict[str, list] = defaultdict(list)
-    stale_other:  dict[str, list] = defaultdict(list)
-
-    for sname, pname, is_srezka, qty, cost_unit, cost_total in rows:
+    for sname, pname, qty, cost_unit, cost_total, nal_unit in rows:
         last = last_sales.get(pname)
         days_idle = (day - last).days if last else 9999
-        threshold = STALE_SREZKA_DAYS if is_srezka else STALE_OTHER_DAYS
-        if days_idle < threshold:
+        if days_idle <= STALE_SREZKA_MIN_DAYS:   # I3: строго > 5 дней
             continue
-        if not is_srezka and days_idle == 9999:
-            continue
-        entry = {
-            "name": pname, "qty": float(qty), "cost_unit": cost_unit,
-            "cost_total": float(cost_total), "days": days_idle, "is_srezka": is_srezka,
-            "nocost": not cost_unit,   # себестоимость 0/NULL — запас занижен
-        }
-        if is_srezka:
-            stale_srezka[sname].append(entry)
-        else:
-            stale_other[sname].append(entry)
+        stale_srezka[sname].append({
+            "name": pname, "qty": float(qty), "cost_unit": cost_unit, "nal_unit": nal_unit,
+            "cost_total": float(cost_total), "days": days_idle, "nocost": not cost_unit,
+        })
 
-    def _sort_qty(lst):
-        return sorted(lst, key=lambda x: x["qty"], reverse=True)
-
-    def _render_stale(by_store, label, emoji):
-        total = sum(len(v) for v in by_store.values())
-        if not total:
-            return
-        total_cost = sum(e["cost_total"] for items in by_store.values() for e in items)
-        lines.append(f"{emoji} {label}: {total} поз. · {_rub(total_cost)} ₽")
+    total = sum(len(v) for v in stale_srezka.values())
+    if total:
+        total_cost = sum(e["cost_total"] for items in stale_srezka.values() for e in items)
+        lines.append(f"🚨 Залежалая СРЕЗКА: {total} поз. · {_rub(total_cost)} ₽")
         lines.append("")
         order = _STORE_ORDER if not store_name else [store_name]
         for sn in order:
-            items = _sort_qty(by_store.get(sn, []))
+            items = sorted(stale_srezka.get(sn, []), key=lambda x: x["qty"], reverse=True)
             if not items:
                 continue
             sc = sum(e["cost_total"] for e in items)
             lines.append(f"  📍 {sn} — {len(items)} поз. · {_rub(sc)} ₽")
             for e in items:
-                if e["days"] >= 9000:
-                    idle = "нет продаж за всю историю"
-                elif e["days"] > 90:
-                    idle = "нет продаж за всю историю"   # >90 дн — это глубина данных, не срок
-                else:
-                    idle = f"{e['days']} дн."
-                cost_str = "⚠️ нет себест." if e["nocost"] else f"{_rub(e['cost_total'])} ₽"
+                idle = ("нет продаж за всю историю" if e["days"] > 90
+                        else f"{e['days']} дн. без продаж")
+                tail = "⚠️ нет закуп. цены" if e["nocost"] else _rub(e["cost_total"]) + " ₽"
                 lines.append(
-                    f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · {cost_str}"
+                    f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · "
+                    f"{_two_price(e['cost_unit'], e['nal_unit'])} · {tail}"
                 )
             lines.append("")
 
-    _render_stale(stale_srezka, f"ЗАЛЕЖАЛЫЕ СРЕЗКА ≥{STALE_SREZKA_DAYS} дн.", "🚨")
-    _render_stale(stale_other,  f"ЗАЛЕЖАЛЫЕ прочие ≥{STALE_OTHER_DAYS} дн.", "⚠️")
-
-    if not stale_srezka and not stale_other:
-        lines.append("✅ Залежалых позиций нет.")
+    if not stale_srezka:
+        lines.append("✅ Залежалой СРЕЗКИ нет.")
         lines.append("")
 
-    # Позиции без себестоимости — занижают стоимость запаса и завышают маржу.
-    nocost_n = sum(
-        1 for items in list(stale_srezka.values()) + list(stale_other.values())
-        for e in items if e["nocost"]
-    )
+    # Позиции без закупочной цены — занижают стоимость запаса.
+    nocost_n = sum(1 for items in stale_srezka.values() for e in items if e["nocost"])
     if nocost_n:
-        lines.append(f"⚠️ Позиций без себестоимости: {nocost_n} (стоимость запаса занижена)")
-        lines.append("")
+        lines.append(f"⚠️ Позиций без закупочной цены: {nocost_n} (заполнить в карточке)")
 
-    # Итоги по складам — только товар (папка «Ассортимент»).
-    # Служебные позиции (папка «РАБОЧЕЕ»: сборка букета, лента, упаковка, шары)
-    # в МойСклад имеют остатки-заглушки (999 999 / 10 000 ед.) и искажали итог
-    # на 3–4 порядка (2 млн ед. / 200 млн ₽ по рознице). Считаем только реальный
-    # товар из «Ассортимент/%».
-    lines.append("── ОСТАТКИ ПО СКЛАДАМ (только товар «Ассортимент», закуп. цены) ──")
-    order = _STORE_ORDER if not store_name else [store_name]
-    with conn.cursor() as cur:
-        for sn in order:
-            cur.execute(f"""
-                SELECT COUNT(*), SUM(stock_qty), SUM({_ST_VALUE})
-                FROM stock_snapshot {_ST_JOIN}
-                WHERE day = %s AND stock_qty > 0 AND store_name = %s
-                  AND folder_path LIKE %s
-            """, [day, sn, "Ассортимент/%"])
-            r = cur.fetchone()
-            if not r or not r[0]:
-                continue
-            cnt, sq, sc = r[0], float(r[1] or 0), float(r[2] or 0)
-            lines.append(f"  📍 {sn}: {cnt} поз. · {_qty(sq)} ед. · {_rub(sc)} ₽")
-
+    # Блок «Остатки по складам» перенесён в секцию «Остатки» (I2/I3).
     return "\n".join(lines)
