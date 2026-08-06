@@ -31,6 +31,7 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
     "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
+    "prices":   [],                  # качество цен — снимок, без диалога
     "pdf":      ["period", "store"],
 }
 
@@ -45,6 +46,7 @@ _SECTION_TITLE = {
     "audit":    "🔍 Изменения",
     "clients":  "👥 Клиенты",
     "forecast": "🛒 Прогноз",
+    "prices":   "🏷 Цены",
     "pdf":      "📄 Отчёт PDF",
 }
 
@@ -59,6 +61,7 @@ _BUTTON_TO_SECTION = {
     "🔍 изменения":  "audit",
     "👥 клиенты":    "clients",
     "🛒 прогноз":    "forecast",
+    "🏷 цены":       "prices",
     "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
     "/меню":         "show",
@@ -92,6 +95,8 @@ _HELP_TEXT = """\
   🎯 Резервы    — товары отложены под клиента
   💸 Расходы    — все платежи за период
   🔄 Перемещения — движение товара между складами
+  🛒 Прогноз    — что заказать на фургон (5 блоков)
+  🏷 Цены       — где не заполнена закупочная цена
   📄 Отчёт PDF  — полный отчёт одним файлом
 
 Клавиатуру можно скрыть стрелкой ↓ внизу
@@ -386,6 +391,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                         f"⏳ Генерирую PDF-отчёт…\n"
                         f"Период: {_fmt_period(d_from, d_to)}\n"
                         f"Склад: {store_name or 'Все склады'}")
+    elif section == "prices":
+        tg.send_message(bot_token, chat_id, "⏳ Проверяю качество цен…")
     else:
         tg.send_message(bot_token, chat_id,
                         f"⏳ Готовлю отчёт…\n"
@@ -425,6 +432,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                                 bot_token, chat_id)
         elif section == "forecast":
             text = _run_forecast(conn_factory, client_factory, bot_token, chat_id)
+        elif section == "prices":
+            text = _run_prices(conn_factory, bot_token, chat_id)
         elif section == "audit":
             text = _run_audit(client_factory, d_from, d_to, bot_token, chat_id)
         else:
@@ -501,6 +510,11 @@ def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
     client = client_factory()
     tg.send_message(bot_token, chat_id, "⏳ Запрашиваю заказы и остатки…")
     return build_forecast_report(client, conn)
+
+
+def _run_prices(conn_factory, bot_token, chat_id):
+    from .report_prices import build_price_quality_report
+    return build_price_quality_report(conn_factory())
 
 
 def _run_clients(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):

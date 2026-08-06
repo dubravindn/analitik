@@ -118,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rep_emp.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
     sub.add_parser("report-forecast", help="Прогноз закупки (заказы + история фургонов)")
+    sub.add_parser("report-prices", help="Качество цен (товары без закупочной цены)")
 
     sub.add_parser(
         "daily",
@@ -273,6 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn   = db.connect(config.DATABASE_URL())
         print(build_forecast_report(client, conn))
+        return 0
+
+    if args.cmd == "report-prices":
+        from .report_prices import build_price_quality_report
+        conn = db.connect(config.DATABASE_URL())
+        print(build_price_quality_report(conn))
         return 0
 
     if args.cmd == "bot":
