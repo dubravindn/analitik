@@ -160,6 +160,25 @@ def build_stock_by_qty(
         f"Закуп. стоимость: {_rub(total_cost)} ₽"
     )
     lines.append(f"По закупочным ценам из карточки: {cov_pct:.0f}% позиций · МойСклад: {100 - cov_pct:.0f}%")
+    # K2: строка покрытия «Наличка»
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COUNT(*) FILTER (WHERE np.price_kop IS NOT NULL AND np.price_kop > 0),
+                   COUNT(*),
+                   COALESCE(SUM(CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0
+                                    THEN {_ST_VALUE} ELSE 0 END), 0),
+                   COALESCE(SUM({_ST_VALUE}), 0)
+            FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
+            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
+        """, p)
+        _nal_r = cur.fetchone() or (0, 0, 0, 0)
+    _nal_pos = int(_nal_r[0] or 0)
+    _nal_sum = float(_nal_r[2] or 0)
+    _nal_all = float(_nal_r[3] or 0)
+    if int(_nal_r[1] or 0):
+        _pct = _nal_sum / _nal_all * 100 if _nal_all else 0
+        _pfx = "⚠️ " if _pct < 90 else ""
+        lines.append(f"{_pfx}Наличная цена известна для {_nal_pos} из {int(_nal_r[1])} поз. ({_pct:.0f}% суммы)")
     lines.append("")
 
     last_supply, first_snap = _supply_days_map(conn)
@@ -349,8 +368,15 @@ def build_stock_report(
 
     total = sum(len(v) for v in stale_srezka.values())
     if total:
-        total_cost = sum(e["cost_total"] for items in stale_srezka.values() for e in items)
+        all_items = [e for items in stale_srezka.values() for e in items]
+        total_cost = sum(e["cost_total"] for e in all_items)
+        nal_pos = sum(1 for e in all_items if e["nal_unit"])
+        nal_cost = sum(e["cost_total"] for e in all_items if e["nal_unit"])
         lines.append(f"🚨 Залежалая СРЕЗКА: {total} поз. · {_rub(total_cost)} ₽")
+        if total_cost:
+            _pct = nal_cost / total_cost * 100
+            _pfx = "⚠️ " if _pct < 90 else ""
+            lines.append(f"{_pfx}Наличная цена известна для {nal_pos} из {total} поз. ({_pct:.0f}% суммы)")
         lines.append("")
         order = _STORE_ORDER if not store_name else [store_name]
         for sn in order:

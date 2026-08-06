@@ -39,8 +39,8 @@ class _Conn:
                 ("p3", "Оазис флор", "АКСЕССУАРЫ", False, 0, None),
                 ("p4", "Роза Фридом 50 см. 25 шт.", "СРЕЗКА", True, 7500, {"Наличка": "12000"}),
             ]
-        if "DISTINCT assortment_id" in sql:
-            return [("p1",)]        # только Роза Ред Наоми продавалась
+        if "assortment_id" in sql and "sales_by_product_day" in sql:
+            return [("p1", 1_000_000)]  # Роза Ред Наоми продавалась, 10 000 ₽ выручки
         return []
 
 

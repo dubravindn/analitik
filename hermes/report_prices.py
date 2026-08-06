@@ -58,13 +58,15 @@ def build_price_quality_report(conn) -> str:
         """, (snap_day, "Ассортимент/%"))
         rows = cur.fetchall()
 
-        # Кто продавался за последние _RECENT_DAYS — приоритет заполнения.
+        # K3: продажи за последние _RECENT_DAYS — кто продавался + выручка по продукту.
         cur.execute("""
-            SELECT DISTINCT assortment_id
+            SELECT assortment_id, COALESCE(SUM(revenue_kop), 0)
             FROM sales_by_product_day
             WHERE day BETWEEN %s AND %s AND sell_qty > 0
+            GROUP BY assortment_id
         """, (today - timedelta(days=_RECENT_DAYS), today))
-        sold = {r[0] for r in cur.fetchall()}
+        turnover = {r[0]: float(r[1]) for r in cur.fetchall()}
+        sold = set(turnover.keys())
 
     total = len(rows)
     if not total:
@@ -72,12 +74,35 @@ def build_price_quality_report(conn) -> str:
         return "\n".join(lines)
 
     no_buy = [r for r in rows if int(r[4] or 0) == 0]
+    no_nal = [r for r in rows if _nal(r[5]) == 0]
     have = total - len(no_buy)
+    have_nal = total - len(no_nal)
     p_have = have / total * 100
+    p_have_nal = have_nal / total * 100
+
     lines.append(f"Товаров «Ассортимент»: {total}")
     lines.append(f"  ✅ с закупочной ценой: {have} ({p_have:.0f}%)")
     lines.append(f"  ⚠️ без закупочной цены: {len(no_buy)} ({100 - p_have:.0f}%)")
+    lines.append(f"  ✅ с наличной ценой: {have_nal} ({p_have_nal:.0f}%)")
+    lines.append(f"  ⚠️ без наличной цены: {len(no_nal)} ({100 - p_have_nal:.0f}%)")
     lines.append("")
+
+    # K3: доля выручки за последние _RECENT_DAYS по позициям без цены.
+    total_rev = sum(turnover.values())
+    if total_rev:
+        no_buy_rev = sum(turnover.get(r[0], 0) for r in no_buy)
+        no_nal_rev = sum(turnover.get(r[0], 0) for r in no_nal)
+        no_buy_pct = no_buy_rev / total_rev * 100
+        no_nal_pct = no_nal_rev / total_rev * 100
+        lines.append(f"Доля выручки за {_RECENT_DAYS} дн. по позициям без цены:")
+        lines.append(f"  без закупочной: {no_buy_pct:.0f}%")
+        lines.append(f"  без наличной: {no_nal_pct:.0f}%")
+        if no_buy_pct > 10 or no_nal_pct > 10:
+            lines.append(
+                f"⚠️ Пока эти карточки не заполнены, итоговые суммы в прибыли, "
+                f"прогнозе и покрытии занижены на эту долю."
+            )
+        lines.append("")
 
     # ── Приоритет: продаётся, но нет закупочной цены ──
     priority = [r for r in no_buy if r[0] in sold]

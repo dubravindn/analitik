@@ -255,6 +255,26 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         cov = _cov_kop / _all_kop * 100
         lines.append(f"По закупочным ценам: {cov:.0f}% стоимости · "
                      f"МойСклад: {100 - cov:.0f}% (нет закупочной в карточке)")
+        # K2: симметричная строка покрытия «Наличка»
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(*) FILTER (WHERE np.price_kop IS NOT NULL AND np.price_kop > 0),
+                       COUNT(*),
+                       COALESCE(SUM(CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0
+                                        THEN {_LS_TOTAL} ELSE 0 END), 0),
+                       COALESCE(SUM({_LS_TOTAL}), 0)
+                {_LS_JOIN} {_LS_NAL}
+                WHERE d.day BETWEEN %s AND %s
+                  AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
+            """, p)
+            _nal_r = cur.fetchone() or (0, 0, 0, 0)
+        _nal_pos = int(_nal_r[0] or 0)
+        _nal_kop2 = float(_nal_r[2] or 0)
+        _nal_all2 = float(_nal_r[3] or 0)
+        if int(_nal_r[1] or 0):
+            _pct = _nal_kop2 / _nal_all2 * 100 if _nal_all2 else 0
+            _pfx = "⚠️ " if _pct < 90 else ""
+            lines.append(f"{_pfx}Наличная цена известна для {_nal_pos} из {int(_nal_r[1])} поз. ({_pct:.0f}% суммы)")
         lines.append("")
 
     # Разбивка по складам
