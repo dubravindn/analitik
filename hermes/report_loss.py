@@ -30,6 +30,104 @@ _LS_JOIN = """
 _LS_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
              "THEN round(i.qty * pp.price_kop) ELSE i.total_kop END")
 
+# Оприходования (enter) — «+»-сторона инвентаризации. Та же методика цены, что и
+# у списаний (закупочная из карточки на дату, фолбэк на цену документа).
+_EN_JOIN = """
+    FROM enter_doc d
+    JOIN enter_item i ON i.doc_id = d.doc_id
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM purchase_price_asof p
+        WHERE p.product_id = i.product_id AND p.priced_from <= d.day
+        ORDER BY p.priced_from DESC LIMIT 1
+    ) pp ON true
+"""
+_EN_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
+             "THEN round(i.qty * pp.price_kop) ELSE i.total_kop END")
+
+_ASSORT = ("i.product_id IN (SELECT product_id FROM product_dim "
+           "WHERE folder_path LIKE 'Ассортимент/%%')")
+
+
+def _enter_summary(conn, d_from, d_to, adj):
+    """Сводка оприходований Базы (Ассортимент), той же методикой цены."""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COUNT(DISTINCT d.doc_id), COALESCE(SUM(i.qty), 0),
+                   COALESCE(SUM({_EN_TOTAL}), 0)
+            {_EN_JOIN}
+            WHERE d.day BETWEEN %s AND %s AND {_ASSORT} AND d.store_name = ANY(%s)
+        """, [d_from, d_to, adj])
+        return cur.fetchone()
+
+
+def _inventory_block(conn, lines, d_from, d_to, adj, adj_qty, adj_kop,
+                     ent_cnt, ent_qty, ent_kop):
+    """J2: полный блок инвентаризации Базы — списания и оприходования в обе
+    стороны, документы с позициями, итоговая корректировка. Сводки по обеим
+    сторонам уже посчитаны в основном отчёте (не пересчитываем)."""
+    lines.append("── 📋 ИНВЕНТАРИЗАЦИЯ (База) — корректировки учёта, НЕ потери ──")
+    lines.append(
+        f"Списано: {_qty(float(adj_qty))} ед. · {_rub(float(adj_kop))} ₽ · "
+        f"Оприходовано: {_qty(float(ent_qty))} ед. · {_rub(float(ent_kop))} ₽"
+    )
+    net = float(adj_kop) - float(ent_kop)   # >0 → учётный остаток был завышен (недостача)
+    sign = "−" if net > 0 else ("+" if net < 0 else "")
+    lines.append(f"Итог корректировки: {sign}{_rub(abs(net))} ₽")
+    if not ent_cnt:
+        lines.append("ℹ️ Оприходований за период нет "
+                     "(если инвентаризация давала «плюс» — проверь sync-enter).")
+    lines.append("")
+
+    # Документы обеих сторон, по времени. sign_char печатаем перед суммой позиции.
+    def _emit_docs(join_sql, total_expr, table, item_table, kind_label, pos_sign):
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT d.doc_id, d.moment, d.day, d.description
+                FROM {table} d
+                WHERE d.day BETWEEN %s AND %s AND d.store_name = ANY(%s)
+                  AND EXISTS (SELECT 1 FROM {item_table} i
+                              WHERE i.doc_id = d.doc_id AND {_ASSORT})
+                ORDER BY d.moment
+            """, [d_from, d_to, adj])
+            docs = cur.fetchall()
+        for doc_id, moment, doc_day, description in docs:
+            moment_str = (moment.strftime("%d.%m.%Y %H:%M")
+                          if hasattr(moment, "strftime") else str(moment)[:16])
+            header = f"📅 {moment_str} · {kind_label}"
+            if description:
+                header += f" · {description}"
+            lines.append(header)
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT i.product_name, i.qty, i.cost_kop, i.total_kop, pp.price_kop
+                    FROM {item_table} i
+                    LEFT JOIN LATERAL (
+                        SELECT price_kop FROM purchase_price_asof p
+                        WHERE p.product_id = i.product_id AND p.priced_from <= %s
+                        ORDER BY p.priced_from DESC LIMIT 1
+                    ) pp ON true
+                    WHERE i.doc_id = %s AND {_ASSORT}
+                    ORDER BY i.total_kop DESC
+                """, [doc_day, doc_id])
+                positions = cur.fetchall()
+            doc_total = 0.0
+            for pname, qty, ms_cost, ms_total, purch in positions:
+                covered = purch is not None and purch > 0
+                unit = int(purch) if covered else int(ms_cost or 0)
+                pos_total = round(float(qty) * unit) if covered else float(ms_total)
+                doc_total += float(pos_total)
+                cost_str = f" × {_rub(unit)} ₽/ед." if unit else ""
+                lines.append(
+                    f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = "
+                    f"{pos_sign}{_rub(float(pos_total))} ₽"
+                )
+            lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · "
+                         f"{pos_sign}{_rub(doc_total)} ₽")
+            lines.append("")
+
+    _emit_docs(_LS_JOIN, _LS_TOTAL, "loss_doc", "loss_item", "Списание", "−")
+    _emit_docs(_EN_JOIN, _EN_TOTAL, "enter_doc", "enter_item", "Оприходование", "+")
+
 
 def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = None,
                        max_docs: int | None = 50) -> str:
@@ -89,9 +187,22 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
                      f"(те же операции в разделе «Расходы»)")
     lines.append("")
 
+    # J2: полный блок инвентаризации Базы (списания + оприходования в обе стороны).
+    # Показываем, когда склад не выбран или выбрана сама База.
+    show_inventory = (not store_name) or (store_name in adj)
+    ent_cnt, ent_qty, ent_kop = _enter_summary(conn, d_from, d_to, adj)
+    if show_inventory and (adj_cnt or ent_cnt):
+        _inventory_block(conn, lines, d_from, d_to, adj,
+                         adj_qty, adj_kop, ent_cnt, ent_qty, ent_kop)
+
+    # Порчу (розницу) детализируем, когда склад не выбран или выбран НЕ База.
+    show_spoilage = (not store_name) or (store_name not in adj)
+    if not show_spoilage:
+        return "\n".join(lines).rstrip()
+
     if not spoil_cnt:
         lines.append("Порчи (списаний на рознице) за период нет.")
-        return "\n".join(lines)
+        return "\n".join(lines).rstrip()
 
     # Детализация ниже — только ПОРЧА (розница); корректировки Базы не смешиваем.
     lines.append("── 🌸 ПОРЧА (розница) ──")

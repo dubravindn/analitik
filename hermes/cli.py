@@ -20,6 +20,7 @@ from . import config, db
 from .etl_sales import run as run_sync
 from .etl_stock import run as run_sync_stock
 from .etl_loss import run as run_sync_loss
+from .etl_enter import run as run_sync_enter
 from .etl_supply import run as run_sync_supply
 from .etl_cashflow import run as run_sync_cashflow
 from .etl_clients import run as run_sync_clients
@@ -71,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     p_sync_loss = sub.add_parser("sync-loss", help="Выгрузить списания за период")
     p_sync_loss.add_argument("--from", dest="d_from", required=True, type=_parse_date)
     p_sync_loss.add_argument("--to", dest="d_to", required=True, type=_parse_date)
+
+    p_sync_enter = sub.add_parser("sync-enter", help="Выгрузить оприходования за период")
+    p_sync_enter.add_argument("--from", dest="d_from", required=True, type=_parse_date)
+    p_sync_enter.add_argument("--to", dest="d_to", required=True, type=_parse_date)
 
     p_sync_supply = sub.add_parser("sync-supply", help="Выгрузить поставки за период")
     p_sync_supply.add_argument("--from", dest="d_from", required=True, type=_parse_date)
@@ -132,8 +137,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Долгие выгрузки помечают «идёт синхронизация» — бот покажет предупреждение
     # вместо молчаливого зависания на контенции. Маркер снимается при выходе.
-    _SYNC_CMDS = {"sync", "sync-stock", "sync-loss", "sync-supply", "sync-cashflow",
-                  "sync-clients", "sync-move", "sync-prices", "backfill", "daily"}
+    _SYNC_CMDS = {"sync", "sync-stock", "sync-loss", "sync-enter", "sync-supply",
+                  "sync-cashflow", "sync-clients", "sync-move", "sync-prices",
+                  "backfill", "daily"}
     if args.cmd in _SYNC_CMDS:
         import atexit
         from . import synclock
@@ -193,6 +199,13 @@ def main(argv: list[str] | None = None) -> int:
         conn = db.connect(config.DATABASE_URL())
         n = run_sync_loss(client, conn, args.d_from, args.d_to)
         print(f"Выгружено списаний: {n} документов за {args.d_from}..{args.d_to}")
+        return 0
+
+    if args.cmd == "sync-enter":
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        conn = db.connect(config.DATABASE_URL())
+        n = run_sync_enter(client, conn, args.d_from, args.d_to)
+        print(f"Выгружено оприходований: {n} документов за {args.d_from}..{args.d_to}")
         return 0
 
     if args.cmd == "sync-supply":
@@ -300,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         _safe("остатки",     run_sync_stock,    client, conn, today)
         _safe("цены",        run_sync_prices,   client, conn, today)
         _safe("списания",    run_sync_loss,     client, conn, yesterday, yesterday)
+        _safe("оприходования", run_sync_enter,  client, conn, yesterday, yesterday)
         _safe("ДДС",         run_sync_cashflow, client, conn, yesterday, yesterday)
         _safe("клиенты",     run_sync_clients,  client, conn, yesterday, yesterday)
         _safe("поставки",    run_sync_supply,   client, conn, yesterday, yesterday)
@@ -384,6 +398,7 @@ def _run_backfill(months: int, log) -> int:
         ("продажи",     run_sync),
         ("клиенты",     run_sync_clients),
         ("списания",    run_sync_loss),
+        ("оприходования", run_sync_enter),
         ("ДДС",         run_sync_cashflow),
         ("поставки",    run_sync_supply),
         ("перемещения", run_sync_move),
@@ -420,7 +435,7 @@ def _run_backfill(months: int, log) -> int:
 
     # Сводка по таблицам и покрытию.
     log.info("── Backfill завершён. Сводка ──")
-    tables = ["sales_by_store_day", "sales_doc", "loss_doc",
+    tables = ["sales_by_store_day", "sales_doc", "loss_doc", "enter_doc",
               "cashflow_event", "supply_doc", "move_doc"]
     for t in tables:
         with conn.cursor() as cur:

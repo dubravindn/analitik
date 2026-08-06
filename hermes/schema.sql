@@ -301,3 +301,35 @@ CREATE INDEX IF NOT EXISTS ix_move_item_product   ON move_item (product_name);
 -- ценам из приёмок (E2). id брать чистым (без ?expand=…), см. баг остатков.
 ALTER TABLE move_item ADD COLUMN IF NOT EXISTS product_id text;
 CREATE INDEX IF NOT EXISTS ix_move_item_pid ON move_item (product_id);
+
+-- ── Оприходования (enter) — «+»-сторона инвентаризации (H2.3/J2) ──────────────
+-- Зеркало loss: заголовки документов оприходования МойСклад (/entity/enter).
+-- Нужны, чтобы видеть инвентаризацию Базы в обе стороны: списано vs оприходовано.
+CREATE TABLE IF NOT EXISTS enter_doc (
+    doc_id       text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    store_id     text        NOT NULL,
+    store_name   text        NOT NULL,
+    description  text,
+    project_name text,
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Оприходования: позиции (что именно оприходовали)
+CREATE TABLE IF NOT EXISTS enter_item (
+    doc_id       text        NOT NULL REFERENCES enter_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_id   text,
+    product_name text        NOT NULL,
+    folder_path  text,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    cost_kop     bigint      NOT NULL DEFAULT 0,  -- цена оприходования единицы (коп.)
+    total_kop    bigint      NOT NULL DEFAULT 0,  -- qty × cost
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_enter_doc_day     ON enter_doc (day);
+CREATE INDEX IF NOT EXISTS ix_enter_doc_store   ON enter_doc (store_id, day);
+CREATE INDEX IF NOT EXISTS ix_enter_item_pid    ON enter_item (product_id);

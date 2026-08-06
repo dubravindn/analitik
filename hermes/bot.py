@@ -654,14 +654,22 @@ def _build_and_send_pdf(conn_factory, client_factory, d_from, d_to, store_name, 
 
 def _run_loss(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_loss import run as etl_loss
+    from .etl_enter import run as etl_enter
     from .report_loss import build_loss_report
     conn   = conn_factory()
     client = client_factory()
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-        if cur.fetchone()[0] == 0:
-            tg.send_message(bot_token, chat_id, "⏳ Подгружаю списания из МойСклад…")
+        loss_empty = cur.fetchone()[0] == 0
+        # Оприходования (J2: «+»-сторона инвентаризации Базы) подгружаем вместе.
+        cur.execute("SELECT COUNT(*) FROM enter_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+        enter_empty = cur.fetchone()[0] == 0
+    if loss_empty or enter_empty:
+        tg.send_message(bot_token, chat_id, "⏳ Подгружаю списания и оприходования из МойСклад…")
+        if loss_empty:
             etl_loss(client, conn, d_from, d_to)
+        if enter_empty:
+            etl_enter(client, conn, d_from, d_to)
     return build_loss_report(conn, d_from, d_to, store_name)
 
 
