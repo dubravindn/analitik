@@ -12,12 +12,24 @@ _SCHEMA = Path(__file__).resolve().parent / "schema.sql"
 
 
 def connect(database_url: str) -> psycopg.Connection:
-    return psycopg.connect(database_url, autocommit=False)
+    conn = psycopg.connect(database_url, autocommit=False)
+    # Отдавать timestamptz в московском времени. Храним в UTC (ETL помечают
+    # moment как config.MSK), но по умолчанию сессия Postgres в UTC и отчёты
+    # печатали время на 3 ч назад. Ставим зону сессии — чинит вывод во всех
+    # отчётах разом (report_loss/move/cashflow/audit, alerts).
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'Europe/Moscow'")
+    conn.commit()
+    return conn
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
     sql = _SCHEMA.read_text(encoding="utf-8")
     with conn.cursor() as cur:
+        # CREATE OR REPLACE VIEW берёт ACCESS EXCLUSIVE и может ждать вечно, если
+        # бот в этот момент читает вью. Ограничиваем ожидание — лучше явная ошибка,
+        # чем зависание (migrate тогда запускать при остановленном боте).
+        cur.execute("SET lock_timeout = '15s'")
         cur.execute(sql)
     conn.commit()
     log.info("Схема применена (idempotent)")

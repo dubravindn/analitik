@@ -98,7 +98,7 @@ def build_supply_report(conn, d_from: date, d_to: date) -> str:
         top_items = cur.fetchall()
 
     if top_items:
-        lines.append("🏆 Топ-10 закупаемых товаров:")
+        lines.append(f"🏆 Топ-{len(top_items)} закупаемых товаров:")
         for idx, (name, qty, kop) in enumerate(top_items, 1):
             lines.append(f"  {idx}. {name}: {_qty(qty)} ед. · {_rub(kop)} ₽")
 

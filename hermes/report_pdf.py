@@ -26,9 +26,12 @@ def _clean(text: str) -> str:
 
 
 def build_pdf(
-    conn, d_from: date, d_to: date, store_name: str | None = None
+    conn, client, d_from: date, d_to: date, store_name: str | None = None
 ) -> bytes:
-    """Сформировать PDF-отчёт. Возвращает bytes."""
+    """Сформировать PDF-отчёт. Возвращает bytes.
+
+    client — MoyskladClient, нужен секции «Прогноз» (live-данные заказов).
+    """
     try:
         from fpdf import FPDF
     except ImportError:
@@ -96,11 +99,15 @@ def build_pdf(
     pdf.set_font("DejaVu", size=9)
     pdf.set_text_color(100, 100, 100)
     for s in [
-        "1. Продажи   — выручка, прибыль, топ позиций",
-        "2. Остатки   — СРЕЗКА без резерва на дату",
-        "3. Залежалые — СРЕЗКА без движения",
-        "4. Списания  — документы с позициями",
-        "5. Расходы   — движение денег",
+        "1. Продажи     — выручка, прибыль от продаж, топ позиций",
+        "2. Остатки     — СРЕЗКА без резерва на дату",
+        "3. Залежалые   — СРЕЗКА без движения",
+        "4. Списания    — документы с позициями",
+        "5. Расходы     — движение денег по складам",
+        "6. Клиенты     — топ и возможный отток",
+        "7. Прогноз     — заказы, спрос и что брать на фургон",
+        "8. Перемещения — движение товара между складами",
+        "9. Изменения   — удалённые и изменённые документы",
     ]:
         pdf.set_x(_MARGIN)
         pdf.cell(eff_w, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
@@ -176,10 +183,34 @@ def build_pdf(
 
     # ── Секция 4: Списания ─────────────────────────────────────────────────────
     from .report_loss import build_loss_report
-    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name))
+    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name, max_docs=None))
 
     # ── Секция 5: Расходы ──────────────────────────────────────────────────────
     from .report_cashflow import build_expenses_report
     _section("5. РАСХОДЫ", build_expenses_report(conn, d_from, d_to, store_name))
+
+    # ── Секция 6: Клиенты ──────────────────────────────────────────────────────
+    from .report_clients import build_clients_report
+    _section("6. КЛИЕНТЫ", build_clients_report(conn, d_from, d_to, store_name))
+
+    # ── Секция 7: Прогноз закупки (live-данные из МойСклад) ────────────────────
+    from .report_forecast import build_forecast_report
+    try:
+        forecast_text = build_forecast_report(client, conn)
+    except Exception as e:
+        forecast_text = f"Не удалось построить прогноз: {e}"
+    _section("7. ПРОГНОЗ", forecast_text)
+
+    # ── Секция 8: Перемещения (полный список — max_docs=None) ──────────────────
+    from .report_move import build_move_report
+    _section("8. ПЕРЕМЕЩЕНИЯ", build_move_report(conn, d_from, d_to, store_name, max_docs=None))
+
+    # ── Секция 9: Изменения и удаления (live-данные из МойСклад) ───────────────
+    from .report_audit import build_audit_report
+    try:
+        audit_text = build_audit_report(client, d_from, d_to)
+    except Exception as e:
+        audit_text = f"Не удалось получить аудит изменений: {e}"
+    _section("9. ИЗМЕНЕНИЯ И УДАЛЕНИЯ", audit_text)
 
     return bytes(pdf.output())

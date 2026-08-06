@@ -1,17 +1,42 @@
-"""Прогноз закупки: заказы «Ближайшие заказы» (статус «Под заказ») + прогноз по циклам с праздниками."""
+"""Прогноз закупки (J4): пять блоков в фиксированном порядке.
+
+1. ЧТО ЗАКАЗАНО — заказы клиентов (проект «Ближайшая поставка», статус «Под заказ»).
+2. ЗАКАЗАНО МИНУС ОСТАТОК — сколько из заказанного не покрыто свободным остатком.
+3. ПРОГНОЗ СПРОСА — продажи за прошлую неделю и тот же период год назад.
+4. ИТОГО К ЗАКАЗУ НА ФУРГОН — прогноз спроса + заказы − свободный остаток,
+   округление до упаковки (только СРЕЗКА). Списания в расчёт НЕ входят.
+5. ЧТО БРАТЬ НЕ НАДО — остатка хватает надолго или позиция не продаётся.
+"""
 from __future__ import annotations
 
 import logging
+import math
+import re
 from datetime import date, timedelta
 from typing import Optional
 
 from .moysklad import MoyskladClient
+from . import config
 
 log = logging.getLogger("hermes.report_forecast")
 
 _PAGE = 100
 _PROJECT_KEYWORD = "ближайшая поставка"
 _STATE_KEYWORD   = "под заказ"
+
+# Служебные позиции (шары, услуги) имеют остаток-заглушку в МойСклад
+# (9 999 / 10 000 / 999 999). В прогнозе их не учитываем.
+_SENTINEL_QTY = 9999
+
+# Блок 5: остатка «хватает надолго», если он ≥ этого числа недельных спросов.
+_OVERSTOCK_WEEKS = 2
+# Блок 5(б): залежалая СРЕЗКА — строго больше стольких дней без продаж.
+_STALE_SREZKA_DAYS = 5
+
+# Лимиты вывода на блок (защита от лимита Telegram 4096).
+_TOP_DEMAND = 30
+_TOP_ORDER  = 40
+_TOP_NOBUY  = 25
 
 
 # ─── МойСклад: заказы ────────────────────────────────────────────────────────
@@ -71,10 +96,44 @@ def _fetch_order_positions(client: MoyskladClient, order_id: str) -> list[dict]:
     return rows
 
 
-# ─── БД: фургоны, категории, праздники ───────────────────────────────────────
+def _orders_detail(client: MoyskladClient, project_href: str,
+                   state_href: Optional[str]) -> dict:
+    """Оформленные заказы клиентов → {product_id: {name, qty, n_orders}}.
 
-def _van_dates(conn, limit: int = 10) -> list[date]:
-    from . import config
+    n_orders — в скольких разных заказах встречается позиция (для «(N заказов)»).
+    """
+    by_pid: dict[str, dict] = {}
+    for order in _fetch_orders(client, project_href, state_href):
+        oid = order.get("id", "")
+        try:
+            positions = _fetch_order_positions(client, oid)
+        except Exception as e:
+            log.warning("Позиции заказа %s недоступны: %s", oid, e)
+            continue
+        for pos in positions:
+            assort = pos.get("assortment", {}) or {}
+            pid = (assort.get("id", "") or "").split("?")[0]
+            if not pid:
+                continue
+            qty = float(pos.get("quantity", 0) or 0)
+            e = by_pid.setdefault(pid, {"name": assort.get("name", ""),
+                                        "qty": 0.0, "orders": set()})
+            e["qty"] += qty
+            e["orders"].add(oid)
+    # свернуть set заказов в число
+    for e in by_pid.values():
+        e["n_orders"] = len(e.pop("orders"))
+    return by_pid
+
+
+# ─── БД: фургоны, праздники ──────────────────────────────────────────────────
+
+def _van_dates(conn, limit: int = 10, cluster_gap: int = 2) -> list[date]:
+    """Даты приходов московского фургона (контрагенты MOSCOW_SUPPLIERS).
+
+    Одна машина дробится на несколько документов приёмки за несколько дней,
+    поэтому кластеризуем: приёмки в пределах cluster_gap дней — одна поставка.
+    """
     suppliers = config.MOSCOW_SUPPLIERS
     if not suppliers:
         return []
@@ -82,112 +141,49 @@ def _van_dates(conn, limit: int = 10) -> list[date]:
         cur.execute("""
             SELECT DISTINCT day FROM supply_doc
             WHERE agent_name = ANY(%s)
-            ORDER BY day DESC
-            LIMIT %s
-        """, (suppliers, limit))
-        return sorted([r[0] for r in cur.fetchall()])
+            ORDER BY day
+        """, (suppliers,))
+        days = [r[0] for r in cur.fetchall()]
+    if not days:
+        return []
+    clusters: list[date] = [days[0]]
+    prev = days[0]
+    for d in days[1:]:
+        if (d - prev).days > cluster_gap:
+            clusters.append(d)
+        prev = d
+    return clusters[-limit:]
 
 
-def _categories(conn) -> list[str]:
-    """Все категории второго уровня из product_dim (Ассортимент/...)."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT SPLIT_PART(folder_path, '/', 2)
-            FROM product_dim
-            WHERE folder_path LIKE %s
-              AND folder_path IS NOT NULL AND folder_path != ''
-            ORDER BY 1
-        """, ("Ассортимент/%",))
-        return [r[0] for r in cur.fetchall() if r[0]]
-
-
-def _category_daily_avg(conn, category: str, d_from: date, d_to: date) -> float:
-    """Средний суточный расход по категории (продажи + списания) за период."""
-    days = (d_to - d_from).days + 1
-    if days <= 0:
-        return 0.0
-
-    # Продажи через product_dim
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COALESCE(SUM(spd.sell_qty), 0)
-            FROM sales_by_product_day spd
-            JOIN product_dim pd ON pd.product_id = spd.assortment_id
-            WHERE spd.day BETWEEN %s AND %s
-              AND pd.folder_path LIKE %s
-              AND SPLIT_PART(pd.folder_path, '/', 2) = %s
-        """, (d_from, d_to, "Ассортимент/%", category))
-        sales_qty = float(cur.fetchone()[0] or 0)
-
-    # Списания через product_name (folder_path в loss_item — UUID, не путь)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COALESCE(SUM(li.qty), 0)
-            FROM loss_item li
-            JOIN loss_doc ld ON ld.doc_id = li.doc_id
-            JOIN product_dim pd ON pd.product_name = li.product_name
-            WHERE ld.day BETWEEN %s AND %s
-              AND pd.folder_path LIKE %s
-              AND SPLIT_PART(pd.folder_path, '/', 2) = %s
-        """, (d_from, d_to, "Ассортимент/%", category))
-        loss_qty = float(cur.fetchone()[0] or 0)
-
-    return (sales_qty + loss_qty) / days
-
-
-def _holidays_in_window(conn, d_from: date, d_to: date) -> list[dict]:
-    """Праздники, чей ажиотажный период пересекается с [d_from, d_to]."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT holiday_date, name, lead_days, fallback_multiplier
-            FROM holiday
-            WHERE holiday_date - (lead_days || ' days')::interval <= %s
-              AND holiday_date >= %s
-            ORDER BY holiday_date
-        """, (d_to, d_from))
-        return [
-            {"date": r[0], "name": r[1], "lead_days": r[2], "fallback": float(r[3])}
-            for r in cur.fetchall()
-        ]
-
-
-def _holiday_multiplier(conn, holiday: dict, category: str) -> tuple[float, str]:
-    """Фактический множитель по категории за прошлый год или fallback."""
-    hdate     = holiday["date"]
-    lead_days = holiday["lead_days"]
+def _holidays_in_window(conn, d_from: date, d_to: date) -> list[str]:
+    """Названия праздников, чьё ажиотажное окно пересекает [d_from, d_to]."""
     try:
-        prev_date = hdate.replace(year=hdate.year - 1)
-    except ValueError:
-        return holiday["fallback"], "справочник"
-
-    window_from = prev_date - timedelta(days=lead_days)
-    window_to   = prev_date
-
-    holiday_avg  = _category_daily_avg(conn, category, window_from, window_to)
-    baseline_avg = _category_daily_avg(
-        conn, category,
-        window_from - timedelta(days=21),
-        window_from - timedelta(days=1),
-    )
-
-    if baseline_avg > 0 and holiday_avg > 0:
-        return holiday_avg / baseline_avg, f"факт {prev_date.year} г."
-    return holiday["fallback"], "справочник (нет истории)"
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name FROM holiday
+                WHERE holiday_date - (lead_days || ' days')::interval <= %s
+                  AND holiday_date >= %s
+                ORDER BY holiday_date
+            """, (d_to, d_from))
+            return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
 
 
-def _category_stock(conn, category: str) -> float:
-    """Текущий свободный остаток по категории (без резерва)."""
+def _log_sentinel_positions(conn) -> int:
+    """Залогировать служебные позиции с остатком-заглушкой, отсечённые из прогноза."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT COALESCE(SUM(ss.available_qty), 0)
-            FROM stock_snapshot ss
-            JOIN product_dim pd ON pd.product_id = ss.product_id
-            WHERE ss.day = (SELECT MAX(day) FROM stock_snapshot)
-              AND ss.reserve_qty = 0
-              AND pd.folder_path LIKE %s
-              AND SPLIT_PART(pd.folder_path, '/', 2) = %s
-        """, ("Ассортимент/%", category))
-        return float(cur.fetchone()[0] or 0)
+            SELECT DISTINCT product_name, available_qty
+            FROM stock_snapshot
+            WHERE day = (SELECT MAX(day) FROM stock_snapshot)
+              AND available_qty >= %s
+            ORDER BY available_qty DESC
+        """, (_SENTINEL_QTY,))
+        rows = cur.fetchall()
+    for pn, q in rows:
+        log.info("Прогноз: отсечена служебная позиция (остаток-заглушка) — %s: %s ед.", pn, q)
+    return len(rows)
 
 
 # ─── Форматирование ───────────────────────────────────────────────────────────
@@ -202,207 +198,267 @@ def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
 
 
+_PKG_RE = re.compile(r"(\d+)\s*шт\.?", re.IGNORECASE)
+_PKG_MAX = 100   # реальная кратность пучка/упаковки цветов ≤ 100
+
+
+def _pkg_size(name: str) -> "int | None":
+    """Кратность упаковки из названия: «Роза … 25 шт.» → 25. None — не распознано.
+
+    Большие «N шт.» (напр. «Кризал 1000 шт.») — содержимое коробки, не кратность.
+    """
+    m = _PKG_RE.search(name or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= _PKG_MAX else None
+
+
+# ─── Сбор данных по товарам (Ассортимент) ─────────────────────────────────────
+
+def _gather(conn, today: date, orders_by_pid: dict) -> dict:
+    """Собрать по product_id: имя, категория, заказы, свободный остаток,
+    продажи за прошлую неделю и год назад, дату последней продажи."""
+    week_from = today - timedelta(days=7)
+    week_to   = today - timedelta(days=1)
+    year_from = week_from - timedelta(days=365)
+    year_to   = week_to - timedelta(days=365)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT product_id, product_name, folder_path FROM product_dim "
+            "WHERE folder_path LIKE %s", ("Ассортимент/%",),
+        )
+        dim = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT assortment_id, SUM(sell_qty)
+            FROM sales_by_product_day WHERE day BETWEEN %s AND %s
+            GROUP BY assortment_id
+        """, (week_from, week_to))
+        sales_week = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT assortment_id, SUM(sell_qty)
+            FROM sales_by_product_day WHERE day BETWEEN %s AND %s
+            GROUP BY assortment_id
+        """, (year_from, year_to))
+        sales_year = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("""
+            SELECT ss.product_id, SUM(ss.available_qty)
+            FROM stock_snapshot ss
+            WHERE ss.day = (SELECT MAX(day) FROM stock_snapshot)
+              AND ss.reserve_qty = 0 AND ss.available_qty < %s
+            GROUP BY ss.product_id
+        """, (_SENTINEL_QTY,))
+        free = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        cur.execute("SELECT assortment_id, MAX(day) FROM sales_by_product_day GROUP BY assortment_id")
+        last_sale = {r[0]: r[1] for r in cur.fetchall()}
+
+        cur.execute("SELECT MIN(day) FROM sales_by_product_day")
+        min_sales_day = cur.fetchone()[0]
+
+    # Есть ли история продаж за прошлогоднее окно (иначе честная пометка).
+    has_year = bool(min_sales_day and min_sales_day <= year_to)
+
+    items: dict[str, dict] = {}
+    pids = set(dim) & (set(sales_week) | set(sales_year) | set(free) | set(orders_by_pid))
+    for pid in pids:
+        if pid not in dim:
+            continue
+        name, folder = dim[pid]
+        parts = folder.split("/")
+        cat = parts[1] if len(parts) >= 2 else folder
+        items[pid] = {
+            "name": name, "cat": cat,
+            "ordered": orders_by_pid.get(pid, {}).get("qty", 0.0),
+            "n_orders": orders_by_pid.get(pid, {}).get("n_orders", 0),
+            "free": free.get(pid, 0.0),
+            "week": sales_week.get(pid, 0.0),
+            "year": sales_year.get(pid, 0.0),
+            "last_sale": last_sale.get(pid),
+        }
+    return {"items": items, "has_year": has_year,
+            "week_from": week_from, "week_to": week_to}
+
+
 # ─── Главная функция ──────────────────────────────────────────────────────────
 
 def build_forecast_report(client: MoyskladClient, conn) -> str:
-    today = date.today()
-    state_note = " · статус «Под заказ»" if True else ""
-    lines: list[str] = ["🛒 Прогноз закупки — ближайшие заказы", ""]
+    today = config.msk_today()
+    lines: list[str] = [f"🛒 Прогноз закупки на {today.strftime('%d.%m.%Y')}", ""]
 
-    # ── 1. Заказы проект «Ближайшие заказы» + статус «Под заказ» ────────────
+    # Методика (I7) — полными словами, без сокращений.
+    lines += [
+        "Как читать прогноз (пять блоков):",
+        "1. Что заказано — товары, которые клиенты уже заказали.",
+        "2. Заказано минус остаток — сколько из заказанного не покрыто остатком.",
+        "3. Прогноз спроса — продажи за прошлую неделю и тот же период год назад.",
+        "4. Итого к заказу на фургон — прогноз спроса плюс заказы минус свободный",
+        "   остаток, с округлением до упаковки (только срезка). Списания не входят.",
+        "5. Что брать не надо — остатка хватает надолго или товар не продаётся.",
+        "Остатки и заказы — на текущий момент, от периода отчёта не зависят.",
+        "",
+    ]
+
+    _log_sentinel_positions(conn)
+
     project_href = _find_project_href(client)
     state_href   = _find_state_href(client)
+    orders_by_pid: dict = {}
     if project_href:
-        orders = _fetch_orders(client, project_href, state_href)
-        if orders:
-            lines.append(f"📋 Заказов в проекте: {len(orders)}")
-
-            demand: dict[str, dict] = {}
-            for order in orders:
-                try:
-                    positions = _fetch_order_positions(client, order["id"])
-                except Exception as e:
-                    log.warning("Позиции заказа %s недоступны: %s", order["id"], e)
-                    continue
-                for pos in positions:
-                    assort = pos.get("assortment", {})
-                    name  = assort.get("name", "—")
-                    qty   = float(pos.get("quantity", 0) or 0)
-                    price = round(pos.get("price", 0) or 0)
-                    if name not in demand:
-                        demand[name] = {"qty": 0.0, "sum_kop": 0}
-                    demand[name]["qty"]     += qty
-                    demand[name]["sum_kop"] += round(qty * price)
-
-            if demand:
-                # Остатки для сравнения
-                stock_by_name: dict[str, float] = {}
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT product_name, SUM(available_qty)
-                        FROM stock_snapshot
-                        WHERE day = (SELECT MAX(day) FROM stock_snapshot)
-                          AND reserve_qty = 0
-                        GROUP BY product_name
-                    """)
-                    for pn, av in cur.fetchall():
-                        stock_by_name[pn] = float(av or 0)
-
-                # Продажи прошлая неделя и год назад
-                week_ago = today - timedelta(days=7)
-                year_ago = today - timedelta(days=365)
-
-                def _sales_period(d_from: date, d_to: date) -> dict[str, float]:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT spd.product_name, SUM(spd.sell_qty)
-                            FROM sales_by_product_day spd
-                            JOIN product_dim pd ON pd.product_id = spd.assortment_id
-                            WHERE spd.day BETWEEN %s AND %s
-                              AND pd.folder_path LIKE %s
-                            GROUP BY spd.product_name
-                        """, (d_from, d_to, "Ассортимент/%"))
-                        return {r[0]: float(r[1] or 0) for r in cur.fetchall()}
-
-                sales_week = _sales_period(week_ago, today - timedelta(days=1))
-                sales_year = _sales_period(year_ago - timedelta(days=3), year_ago + timedelta(days=3))
-
-                total_ordered = sum(d["qty"]     for d in demand.values())
-                total_kop     = sum(d["sum_kop"] for d in demand.values())
-                lines.append(f"Всего заказано: {_qty(total_ordered)} ед. · ≈{_rub(total_kop)} ₽")
-                lines.append("")
-
-                need_buy = [(n, d, stock_by_name.get(n, 0.0)) for n, d in
-                            sorted(demand.items(), key=lambda x: -x[1]["qty"])
-                            if d["qty"] - stock_by_name.get(n, 0.0) > 0]
-                ok_list  = [(n, d, stock_by_name.get(n, 0.0)) for n, d in
-                            sorted(demand.items(), key=lambda x: -x[1]["qty"])
-                            if d["qty"] - stock_by_name.get(n, 0.0) <= 0]
-
-                if need_buy:
-                    lines.append(f"🛒 Нужно докупить ({len(need_buy)} поз.):")
-                    for name, d, on_hand in need_buy:
-                        to_buy = d["qty"] - on_hand
-                        ctx = []
-                        if sales_week.get(name, 0) > 0:
-                            ctx.append(f"прошл.нед. {_qty(sales_week[name])}")
-                        if sales_year.get(name, 0) > 0:
-                            ctx.append(f"год назад {_qty(sales_year[name])}")
-                        line = f"  • {name}: {_qty(to_buy)} ед.  (заказ {_qty(d['qty'])}, ост. {_qty(on_hand)})"
-                        if ctx:
-                            line += f"  [{', '.join(ctx)}]"
-                        lines.append(line)
-                    lines.append("")
-
-                if ok_list:
-                    lines.append(f"✅ Покрыто остатком ({len(ok_list)} поз.):")
-                    for name, d, on_hand in ok_list:
-                        lines.append(f"  • {name}: {_qty(d['qty'])} ед. — ост. {_qty(on_hand)}")
-                    lines.append("")
+        orders_by_pid = _orders_detail(client, project_href, state_href)
     else:
-        lines.append(f"⚠️ Проект «{_PROJECT_KEYWORD}» не найден в МойСклад.")
+        lines.append(f"⚠️ Проект «{_PROJECT_KEYWORD}» в МойСклад не найден — "
+                     f"блоки заказов пустые.")
         lines.append("")
 
-    # ── 2. Категорийный прогноз по циклам с поправкой на праздники ───────────
-    van_list = _van_dates(conn)
-    if len(van_list) >= 3:
-        last_van = van_list[-1]
-        gaps = [(van_list[i + 1] - van_list[i]).days for i in range(len(van_list) - 1)]
-        avg_cycle = round(sum(gaps) / len(gaps))
-        next_van  = last_van + timedelta(days=avg_cycle)
-        days_left = (next_van - today).days
+    data = _gather(conn, today, orders_by_pid)
+    items = data["items"]
+    has_year = data["has_year"]
 
-        lines.append("── Категорийный прогноз по циклам ──")
-        lines.append(
-            f"  Последняя приемка: {last_van.strftime('%d.%m.%Y')}"
-            f" | Цикл: ~{avg_cycle} дн."
-            f" | Следующая: ~{next_van.strftime('%d.%m.%Y')}"
-            f" (через {max(days_left, 0)} дн.)"
-        )
-        lines.append("")
+    # ── Блок 1. ЧТО ЗАКАЗАНО ──────────────────────────────────────────────────
+    lines.append("═══ 1. ЧТО ЗАКАЗАНО ═══")
+    lines.append("Заказы клиентов: проект «Ближайшая поставка» + статус «Под заказ».")
+    ordered_items = sorted([it for it in items.values() if it["ordered"] > 0],
+                           key=lambda x: -x["ordered"])
+    if ordered_items:
+        for it in ordered_items:
+            no = it["n_orders"]
+            suff = f" ({no} заказ.)" if no else ""
+            lines.append(f"  • {it['name']}: {_qty(it['ordered'])} ед.{suff}")
+        tot_qty = sum(it["ordered"] for it in ordered_items)
+        lines.append(f"  Итого: {len(ordered_items)} поз. · {_qty(tot_qty)} ед.")
+    else:
+        lines.append("  Оформленных заказов нет.")
+    lines.append("")
 
-        # Праздники в окне прогноза
-        holidays = _holidays_in_window(conn, today, next_van)
-        if holidays:
-            hnames = ", ".join(h["name"] for h in holidays)
-            lines.append(f"  ⚠️ Праздники в окне: {hnames}")
-            lines.append("")
+    # ── Блок 2. ЗАКАЗАНО МИНУС ОСТАТОК ────────────────────────────────────────
+    lines.append("═══ 2. ЗАКАЗАНО МИНУС ОСТАТОК ═══")
+    lines.append("Что реально нужно докупить под уже оформленные заказы.")
+    short_items = sorted(
+        [(it["ordered"] - it["free"], it) for it in items.values()
+         if it["ordered"] > 0 and it["ordered"] - it["free"] > 0],
+        key=lambda x: -x[0],
+    )
+    if short_items:
+        for gap, it in short_items:
+            lines.append(f"  • {it['name']}: заказано {_qty(it['ordered'])} · "
+                         f"свободный остаток {_qty(it['free'])} → докупить {_qty(gap)}")
+        lines.append("  (позиции, где остатка хватает, сюда не входят)")
+    else:
+        lines.append("  Всё заказанное покрыто свободным остатком.")
+    lines.append("")
 
-        # По каждой категории
-        categories = _categories(conn)
-        if not categories:
-            lines.append("  Нет данных в product_dim — запусти sync-stock для заполнения.")
-        else:
-            # Базовый период: последние 2–3 цикла (без текущего)
-            if len(van_list) >= 4:
-                base_from = van_list[-4]
+    # ── Блок 3. ПРОГНОЗ СПРОСА ────────────────────────────────────────────────
+    lines.append("═══ 3. ПРОГНОЗ СПРОСА ═══")
+    lines.append("Продажи за прошлую неделю и тот же период год назад.")
+    if not has_year:
+        lines.append("(истории за прошлый год пока нет — будет после загрузки истории)")
+    movers = sorted([it for it in items.values() if it["week"] > 0],
+                    key=lambda x: -x["week"])
+    if movers:
+        for it in movers[:_TOP_DEMAND]:
+            if has_year and it["year"] > 0:
+                pct = (it["week"] / it["year"] - 1) * 100
+                sign = "+" if pct >= 0 else "−"
+                yr = f"год назад {_qty(it['year'])} ед. ({sign}{abs(pct):.0f}%)"
+            elif has_year:
+                yr = "год назад 0 ед."
             else:
-                base_from = van_list[0]
-            base_to = last_van - timedelta(days=1)
-
-            for cat in categories:
-                base_daily = _category_daily_avg(conn, cat, base_from, base_to)
-                if base_daily == 0:
-                    continue
-
-                # Рассчитываем прогноз с учётом праздников
-                # Для каждого дня в окне [today, next_van) определяем множитель
-                total_forecast = 0.0
-                holiday_notes: list[str] = []
-
-                # Помечаем дни как «ажиотажные» (по max-множителю)
-                day_mult: dict[date, tuple[float, str]] = {}
-                for h in holidays:
-                    mult, src = _holiday_multiplier(conn, h, cat)
-                    h_start = h["date"] - timedelta(days=h["lead_days"])
-                    d = max(h_start, today)
-                    while d <= min(h["date"], next_van):
-                        if d not in day_mult or mult > day_mult[d][0]:
-                            day_mult[d] = (mult, f"{h['name']} ×{mult:.1f} ({src})")
-                        d += timedelta(days=1)
-
-                d = today
-                while d < next_van:
-                    if d in day_mult:
-                        mult, _ = day_mult[d]
-                        total_forecast += base_daily * mult
-                    else:
-                        total_forecast += base_daily
-                    d += timedelta(days=1)
-
-                # Уникальные заметки о праздниках
-                seen_notes: set[str] = set()
-                for mult, note in day_mult.values():
-                    if note not in seen_notes:
-                        holiday_notes.append(note)
-                        seen_notes.add(note)
-
-                stock = _category_stock(conn, cat)
-                to_buy = max(0.0, total_forecast - stock)
-                norm = base_daily * avg_cycle
-
-                line = (
-                    f"  📦 {cat}: обычно ~{_qty(norm)} ед./цикл"
-                    f" → прогноз {_qty(total_forecast)} ед."
-                    f" | ост. {_qty(stock)} | докупить {_qty(to_buy)} ед."
-                )
-                lines.append(line)
-                for note in holiday_notes:
-                    lines.append(f"     ⚠️ {note}")
-
-            lines.append("")
-
-    elif van_list:
-        last_van = van_list[-1]
-        lines.append(
-            f"  ⚠️ Недостаточно истории приемок для прогноза по циклам"
-            f" (нужно ≥3, найдено {len(van_list)})."
-            f" Последняя: {last_van.strftime('%d.%m.%Y')}."
-        )
+                yr = "год назад — нет данных"
+            lines.append(f"  • {it['name']}: прошлая неделя {_qty(it['week'])} ед. · {yr}")
+        if len(movers) > _TOP_DEMAND:
+            lines.append(f"  … и ещё {len(movers) - _TOP_DEMAND} позиций с продажами")
     else:
-        lines.append(
-            "  ⚠️ Нет данных о приемках от московских поставщиков в supply_doc."
-            " Проверь MOSCOW_SUPPLIERS в config.py."
-        )
+        lines.append("  Продаж за прошлую неделю нет.")
+    lines.append("")
 
-    return "\n".join(lines)
+    # ── Блок 4. ИТОГО К ЗАКАЗУ НА ФУРГОН ──────────────────────────────────────
+    van = _van_dates(conn)
+    van_hint = ""
+    if len(van) >= 2:
+        gaps = [(van[i + 1] - van[i]).days for i in range(len(van) - 1)]
+        cyc = round(sorted(gaps)[len(gaps) // 2]) or 7
+        next_van = van[-1] + timedelta(days=cyc)
+        if next_van >= today:
+            van_hint = f" (ближайший фургон ≈ {next_van.strftime('%d.%m')})"
+    lines.append(f"═══ 4. ИТОГО К ЗАКАЗУ НА ФУРГОН{van_hint} ═══")
+    lines.append("Прогноз спроса + заказано − свободный остаток, округление до "
+                 "упаковки (только срезка).")
+    holidays = _holidays_in_window(conn, today, today + timedelta(days=8))
+    if holidays:
+        lines.append(f"⚠️ Впереди праздник: {', '.join(holidays)} — спрос может быть выше.")
+
+    to_order = []
+    for it in items.values():
+        raw = it["week"] + it["ordered"] - it["free"]
+        if raw <= 0:
+            continue
+        pkg = _pkg_size(it["name"]) if it["cat"] == "СРЕЗКА" else None
+        if pkg:
+            final = math.ceil(raw / pkg) * pkg
+            packs = final // pkg
+        else:
+            final = math.ceil(raw)
+            packs = None
+        if final < 1:
+            continue
+        to_order.append({**it, "raw": raw, "final": final, "packs": packs})
+    to_order.sort(key=lambda x: -x["final"])
+
+    if to_order:
+        for it in to_order[:_TOP_ORDER]:
+            pk = f" ({it['packs']} упак.)" if it["packs"] else ""
+            lines.append(
+                f"  • {it['name']}: {_qty(it['week'])} + {_qty(it['ordered'])} − "
+                f"{_qty(it['free'])} = {_qty(it['raw'])} → "
+                f"К ЗАКАЗУ {_qty(it['final'])} ед.{pk}"
+            )
+        if len(to_order) > _TOP_ORDER:
+            lines.append(f"  … и ещё {len(to_order) - _TOP_ORDER} позиций "
+                         f"(полный список — в PDF)")
+    else:
+        lines.append("  Докупать нечего: спрос и заказы покрыты остатком.")
+    lines.append("")
+
+    # ── Блок 5. ЧТО БРАТЬ НЕ НАДО ─────────────────────────────────────────────
+    lines.append("═══ 5. ЧТО БРАТЬ НЕ НАДО ═══")
+    lines.append("Остатка хватает с запасом или позиция не продаётся.")
+    nobuy: list[str] = []
+    # (а) остаток ≥ 2× недельного спроса
+    over = sorted(
+        [it for it in items.values()
+         if it["week"] > 0 and it["free"] >= _OVERSTOCK_WEEKS * it["week"]],
+        key=lambda x: -x["free"],
+    )
+    for it in over:
+        weeks = int(it["free"] // it["week"]) if it["week"] else 0
+        nobuy.append(f"  • {it['name']}: остаток {_qty(it['free'])} · "
+                     f"продажи/нед {_qty(it['week'])} — запас на {weeks}+ недель")
+    # (б) залежалая СРЕЗКА > 5 дн. без продаж, но с остатком
+    stale = []
+    for it in items.values():
+        if it["cat"] != "СРЕЗКА" or it["free"] <= 0 or it["week"] > 0:
+            continue
+        last = it["last_sale"]
+        idle = (today - last).days if last else None
+        if idle is None or idle > _STALE_SREZKA_DAYS:
+            stale.append((idle if idle is not None else 10 ** 6, it))
+    stale.sort(key=lambda x: -x[0])
+    for idle, it in stale:
+        when = f"без продаж {idle} дн." if idle < 10 ** 6 else "нет продаж за всю историю"
+        nobuy.append(f"  • {it['name']}: {_qty(it['free'])} ед. {when} — "
+                     f"не брать, продавать остаток")
+
+    if nobuy:
+        for ln in nobuy[:_TOP_NOBUY]:
+            lines.append(ln)
+        if len(nobuy) > _TOP_NOBUY:
+            lines.append(f"  … и ещё {len(nobuy) - _TOP_NOBUY} позиций")
+    else:
+        lines.append("  Явных излишков не найдено.")
+
+    return "\n".join(lines).rstrip()

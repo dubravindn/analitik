@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes — ежедневный бэкап БД (04:30 UTC, до daily-отчёта в 05:00)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+AccuracySec=1min
+# Если сервер был выключен в момент срабатывания — запустить при следующем старте
+Persistent=true
+
+[Install]
+WantedBy=timers.target

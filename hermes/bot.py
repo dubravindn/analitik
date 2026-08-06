@@ -12,6 +12,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from . import config
+from . import synclock
 from . import telegram as tg
 
 log = logging.getLogger("hermes.bot")
@@ -25,10 +26,12 @@ _DIALOG_STEPS: dict[str, list[str]] = {
     "stale":    ["period", "store", "group"],
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
-    "expenses": ["period"],           # нет фильтра по складу у кассовых документов
+    "expenses": ["period", "store"],  # фильтр по складу через project_name
+    "move":     ["period", "store"],  # перемещения между складами
     "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
     "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
     "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
+    "prices":   [],                  # качество цен — снимок, без диалога
     "pdf":      ["period", "store"],
 }
 
@@ -39,9 +42,11 @@ _SECTION_TITLE = {
     "loss":     "🗑 Списания",
     "reserves": "🎯 Резервы",
     "expenses": "💸 Расходы",
+    "move":     "🔄 Перемещения",
     "audit":    "🔍 Изменения",
     "clients":  "👥 Клиенты",
     "forecast": "🛒 Прогноз",
+    "prices":   "🏷 Цены",
     "pdf":      "📄 Отчёт PDF",
 }
 
@@ -52,9 +57,11 @@ _BUTTON_TO_SECTION = {
     "🗑 списания":   "loss",
     "🎯 резервы":    "reserves",
     "💸 расходы":    "expenses",
+    "🔄 перемещения": "move",
     "🔍 изменения":  "audit",
     "👥 клиенты":    "clients",
     "🛒 прогноз":    "forecast",
+    "🏷 цены":       "prices",
     "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
     "/меню":         "show",
@@ -87,6 +94,9 @@ _HELP_TEXT = """\
   🗑 Списания   — все документы с позициями
   🎯 Резервы    — товары отложены под клиента
   💸 Расходы    — все платежи за период
+  🔄 Перемещения — движение товара между складами
+  🛒 Прогноз    — что заказать на фургон (5 блоков)
+  🏷 Цены       — где не заполнена закупочная цена
   📄 Отчёт PDF  — полный отчёт одним файлом
 
 Клавиатуру можно скрыть стрелкой ↓ внизу
@@ -102,6 +112,18 @@ _HELP_TEXT = """\
 # ─── состояние диалога (in-memory, один пользователь) ────────────────────────
 
 _dialog: dict[str, dict] = {}  # chat_id → state
+_restarted: bool = False       # был ли рестарт бота (для сообщения о сбросе сессии)
+
+
+def _is_dialog_button(norm: str) -> bool:
+    """Текст — это sub-кнопка диалога (период/склад/группа), а не команда/раздел."""
+    return (
+        norm in _PERIOD_BUTTONS
+        or norm in _STORE_BUTTONS
+        or norm == "✏️ ввести период"
+        or norm == "📦 все группы"
+        or norm.startswith("📁 ")
+    )
 
 
 def _get_state(chat_id: str) -> dict | None:
@@ -120,6 +142,10 @@ def _clear_state(chat_id: str) -> None:
 
 def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
     log.info("Бот запущен (long-polling)")
+    # При старте диалоги пусты (in-memory). Помечаем, что был рестарт — первое
+    # «висячее» нажатие в несуществующий диалог получит понятный ответ.
+    _dialog.clear()
+    globals()["_restarted"] = True
     offset = 0
     while True:
         try:
@@ -163,6 +189,13 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
                         "📋 Меню восстановлено.", tg.main_reply_keyboard())
         return
 
+    # ── Снять залипший флаг выгрузки вручную ──
+    if norm in ("/unlock", "/разблокировать"):
+        synclock.clear()
+        tg.send_message(bot_token, chat_id,
+                        "🔓 Флаг выгрузки снят. Отчёты доступны.", tg.main_reply_keyboard())
+        return
+
     # ── Помощь ──
     if norm in ("❓ помощь", "/помощь", "/help", "помощь"):
         _clear_state(chat_id)
@@ -186,6 +219,15 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, bot_token)
         return
 
+    # ── Висячее нажатие sub-кнопки без активного диалога (напр. бот перезапускался) ──
+    if _is_dialog_button(norm):
+        note = " (бот перезапускался)" if globals().get("_restarted") else ""
+        globals()["_restarted"] = False
+        tg.send_message(bot_token, chat_id,
+                        f"⚠️ Сессия сброшена{note}. Начни заново — выбери раздел из меню.",
+                        tg.main_reply_keyboard())
+        return
+
     # ── Прямые команды (без диалога) ──
     _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id)
 
@@ -207,7 +249,7 @@ def _ask_step(
     if step == "period":
         if section in ("stale", "stock", "reserves"):
             prompt = f"{title}\n\n📅 На какую дату показать снимок остатков?"
-        elif section in ("expenses", "audit"):
+        elif section == "audit":
             prompt = f"{title}\n\n📅 За какой период?"
         elif section == "pdf":
             prompt = f"{title}\n\n📅 За какой период сформировать отчёт?"
@@ -320,8 +362,28 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     store_name   = params.get("store_name")    # None = все склады
     folder_group = params.get("folder_group")  # None = все группы
 
-    # Для expenses/audit — нет фильтра по складу
-    if section in ("expenses", "audit"):
+    # Идёт фоновая выгрузка? Тяжёлые секции (PDF, прогноз — контенция с синком)
+    # не запускаем; лёгкие (продажи/остатки/клиенты — читают готовые таблицы)
+    # пускаем с пометкой о возможной неполноте.
+    sc = synclock.active()
+    if sc:
+        name, mins = sc
+        if section in ("pdf", "forecast"):
+            tg.send_message(
+                bot_token, chat_id,
+                f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
+                f"«{section}» пока не собираю, чтобы не зависнуть — повтори чуть позже "
+                f"(или /unlock, если синк точно завершён).",
+                tg.main_reply_keyboard(),
+            )
+            return
+        tg.send_message(
+            bot_token, chat_id,
+            f"⚠️ Данные могут быть неполными — идёт обновление ({name}, ~{mins} мин).",
+        )
+
+    # Для audit — нет фильтра по складу
+    if section == "audit":
         tg.send_message(bot_token, chat_id,
                         f"⏳ Запрашиваю данные…\nПериод: {_fmt_period(d_from, d_to)}")
     elif section == "pdf":
@@ -329,6 +391,8 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                         f"⏳ Генерирую PDF-отчёт…\n"
                         f"Период: {_fmt_period(d_from, d_to)}\n"
                         f"Склад: {store_name or 'Все склады'}")
+    elif section == "prices":
+        tg.send_message(bot_token, chat_id, "⏳ Проверяю качество цен…")
     else:
         tg.send_message(bot_token, chat_id,
                         f"⏳ Готовлю отчёт…\n"
@@ -360,11 +424,16 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "expenses":
             text = _run_expenses(conn_factory, client_factory, d_from, d_to, store_name,
                                  bot_token, chat_id)
+        elif section == "move":
+            text = _run_move(conn_factory, client_factory, d_from, d_to, store_name,
+                             bot_token, chat_id)
         elif section == "clients":
             text = _run_clients(conn_factory, client_factory, d_from, d_to, store_name,
                                 bot_token, chat_id)
         elif section == "forecast":
             text = _run_forecast(conn_factory, client_factory, bot_token, chat_id)
+        elif section == "prices":
+            text = _run_prices(conn_factory, bot_token, chat_id)
         elif section == "audit":
             text = _run_audit(client_factory, d_from, d_to, bot_token, chat_id)
         else:
@@ -443,6 +512,11 @@ def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
     return build_forecast_report(client, conn)
 
 
+def _run_prices(conn_factory, bot_token, chat_id):
+    from .report_prices import build_price_quality_report
+    return build_price_quality_report(conn_factory())
+
+
 def _run_clients(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_clients import run as etl_clients
     from .report_clients import build_clients_report
@@ -478,11 +552,52 @@ def _run_expenses(conn_factory, client_factory, d_from, d_to, store_name, bot_to
     return build_expenses_report(conn, d_from, d_to, store_name)
 
 
+def _run_move(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
+    from .etl_move import run as etl_move
+    from .report_move import build_move_report
+    conn   = conn_factory()
+    client = client_factory()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s",
+            (d_from, d_to),
+        )
+        if cur.fetchone()[0] == 0:
+            tg.send_message(bot_token, chat_id, "⏳ Подгружаю перемещения из МойСклад…")
+            etl_move(client, conn, d_from, d_to)
+    return build_move_report(conn, d_from, d_to, store_name)
+
+
 def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
+    """Собираем PDF в отдельном потоке с таймаутом — чтобы бот не завис навсегда
+    (сборка делает ленивую догрузку и может встать на контенции с синком)."""
+    import threading
+    done = threading.Event()
+
+    def _worker():
+        try:
+            _build_and_send_pdf(conn_factory, client_factory,
+                                d_from, d_to, store_name, bot_token, chat_id)
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=180):
+        tg.send_message(
+            bot_token, chat_id,
+            "⏳ Сборка PDF заняла дольше 3 минут (возможно, идёт перевыгрузка данных). "
+            "Если файл так и не пришёл — повтори позже.",
+            tg.main_reply_keyboard(),
+        )
+
+
+def _build_and_send_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_sales import run as etl_sales
     from .etl_stock import run as etl_stock
     from .etl_loss import run as etl_loss
     from .etl_cashflow import run as etl_cashflow
+    from .etl_clients import run as etl_clients
+    from .etl_move import run as etl_move
     from .report_pdf import build_pdf
     try:
         conn   = conn_factory()
@@ -518,8 +633,24 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
                 tg.send_message(bot_token, chat_id, "⏳ Загружаю платежи…")
                 etl_cashflow(client, conn, d_from, d_to)
 
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM sales_doc WHERE day BETWEEN %s AND %s", (d_from, d_to)
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю отгрузки (клиенты)…")
+                etl_clients(client, conn, d_from, d_to)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s", (d_from, d_to)
+            )
+            if cur.fetchone()[0] == 0:
+                tg.send_message(bot_token, chat_id, "⏳ Загружаю перемещения…")
+                etl_move(client, conn, d_from, d_to)
+
         tg.send_message(bot_token, chat_id, "📝 Формирую PDF…")
-        pdf_bytes = build_pdf(conn, d_from, d_to, store_name)
+        pdf_bytes = build_pdf(conn, client, d_from, d_to, store_name)
 
         period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
         filename    = f"hermes_{period_safe}.pdf"   # только ASCII, без кириллицы
@@ -537,14 +668,22 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
 
 def _run_loss(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_loss import run as etl_loss
+    from .etl_enter import run as etl_enter
     from .report_loss import build_loss_report
     conn   = conn_factory()
     client = client_factory()
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-        if cur.fetchone()[0] == 0:
-            tg.send_message(bot_token, chat_id, "⏳ Подгружаю списания из МойСклад…")
+        loss_empty = cur.fetchone()[0] == 0
+        # Оприходования (J2: «+»-сторона инвентаризации Базы) подгружаем вместе.
+        cur.execute("SELECT COUNT(*) FROM enter_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+        enter_empty = cur.fetchone()[0] == 0
+    if loss_empty or enter_empty:
+        tg.send_message(bot_token, chat_id, "⏳ Подгружаю списания и оприходования из МойСклад…")
+        if loss_empty:
             etl_loss(client, conn, d_from, d_to)
+        if enter_empty:
+            etl_enter(client, conn, d_from, d_to)
     return build_loss_report(conn, d_from, d_to, store_name)
 
 
@@ -608,7 +747,7 @@ def _exec_employees(client_factory, d_from, d_to, bot_token, chat_id):
 # ─── вспомогательные ─────────────────────────────────────────────────────────
 
 def _parse_period_button(norm: str) -> tuple[date, date] | None:
-    today = date.today()
+    today = config.msk_today()
     code  = _PERIOD_BUTTONS.get(norm)
     if not code:
         return None
@@ -657,7 +796,7 @@ def _fmt_period(d_from: date | None, d_to: date | None) -> str:
 
 def _parse_last_n(args: list[str], n: int = 30) -> tuple[date, date]:
     if not args:
-        today = date.today()
+        today = config.msk_today()
         return today - timedelta(days=n - 1), today
     import re
     found = re.findall(r"\d{4}-\d{2}-\d{2}", " ".join(args))
@@ -671,7 +810,7 @@ def _parse_last_n(args: list[str], n: int = 30) -> tuple[date, date]:
             return d, d
     except ValueError:
         pass
-    today = date.today()
+    today = config.msk_today()
     return today - timedelta(days=n - 1), today
 
 

@@ -95,6 +95,25 @@ CREATE INDEX IF NOT EXISTS ix_loss_doc_day      ON loss_doc (day);
 CREATE INDEX IF NOT EXISTS ix_loss_doc_store    ON loss_doc (store_id, day);
 CREATE INDEX IF NOT EXISTS ix_loss_item_product ON loss_item (product_name);
 
+-- Товар в позиции списания (id из МойСклад) — join по имени ненадёжен (дубли).
+-- id брать чистым (.split('?')[0]) — урок бага ?expand=supplier.
+ALTER TABLE loss_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_loss_item_pid ON loss_item (product_id);
+
+-- Цены из карточки товара МойСклад (снимок раз в сутки → история цен).
+-- Блок G: закупочная цена берётся отсюда (buyPrice), а не из приёмок.
+CREATE TABLE IF NOT EXISTS product_price (
+    day            date        NOT NULL,
+    product_id     text        NOT NULL,
+    product_name   text        NOT NULL,
+    buy_price_kop  bigint      NOT NULL DEFAULT 0,   -- закупочная (buyPrice)
+    min_price_kop  bigint      NOT NULL DEFAULT 0,   -- минимальная (minPrice)
+    sale_prices    jsonb,                            -- {"Наличка":9900,"Розница":19900,...}
+    synced_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (day, product_id)
+);
+CREATE INDEX IF NOT EXISTS ix_product_price_pid ON product_price (product_id, day);
+
 -- Поставки: заголовки входящих поставок (supply)
 CREATE TABLE IF NOT EXISTS supply_doc (
     doc_id       text        PRIMARY KEY,
@@ -147,6 +166,44 @@ ALTER TABLE cashflow_event ADD COLUMN IF NOT EXISTS project_name text;
 -- Проект у документа списания (указывает подразделение/склад/цель)
 ALTER TABLE loss_doc ADD COLUMN IF NOT EXISTS project_name text;
 
+-- Товар в позиции поставки (id из МойСклад) — для связи с продажами/остатками
+-- по закупочной цене приёмки (D0.1). По названию связывать нельзя (дубли).
+ALTER TABLE supply_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_supply_item_product ON supply_item (product_id);
+
+-- Закупочная цена из КАРТОЧКИ товара (блок G): buy_price_kop из снимков
+-- product_price. Для операции дня D берётся строка с максимальным priced_from<=D
+-- (см. calc.purchase_price_at). Плюс «фолбэк-строка» от 2000-01-01 с самым ранним
+-- снимком каждого товара — чтобы продажи ДО начала снятия снимков тоже покрывались
+-- (приблизительно, самой ранней известной ценой). Так покрытие ~100% без правок
+-- логики asof в отчётах.
+CREATE OR REPLACE VIEW purchase_price_asof AS
+    SELECT product_id, day AS priced_from, buy_price_kop AS price_kop
+    FROM product_price
+    WHERE buy_price_kop > 0
+UNION ALL
+    SELECT product_id, DATE '2000-01-01' AS priced_from, price_kop
+    FROM (
+        SELECT DISTINCT ON (product_id) product_id, buy_price_kop AS price_kop
+        FROM product_price
+        WHERE buy_price_kop > 0
+        ORDER BY product_id, day ASC
+    ) earliest;
+
+-- Оптовая цена продажи «Наличка» из карточки (блок I) — asof так же, как закупочная.
+CREATE OR REPLACE VIEW nal_price_asof AS
+    SELECT product_id, day AS priced_from, (sale_prices->>'Наличка')::bigint AS price_kop
+    FROM product_price
+    WHERE (sale_prices->>'Наличка') ~ '^[0-9]+$' AND (sale_prices->>'Наличка')::bigint > 0
+UNION ALL
+    SELECT product_id, DATE '2000-01-01' AS priced_from, price_kop
+    FROM (
+        SELECT DISTINCT ON (product_id) product_id, (sale_prices->>'Наличка')::bigint AS price_kop
+        FROM product_price
+        WHERE (sale_prices->>'Наличка') ~ '^[0-9]+$' AND (sale_prices->>'Наличка')::bigint > 0
+        ORDER BY product_id, day ASC
+    ) earliest;
+
 -- Документы отгрузки (demand) для клиентской аналитики
 CREATE TABLE IF NOT EXISTS sales_doc (
     doc_id       text        PRIMARY KEY,
@@ -161,6 +218,9 @@ CREATE TABLE IF NOT EXISTS sales_doc (
 );
 ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS store_name text;
 ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS positions  integer NOT NULL DEFAULT 0;
+-- Тип документа: 'demand' (отгрузка) | 'salesreturn' (возврат, sum_kop < 0).
+-- Для нетто-сумм по клиенту и корректного детектора оттока (интервалы — только по demand).
+ALTER TABLE sales_doc ADD COLUMN IF NOT EXISTS doc_type text NOT NULL DEFAULT 'demand';
 
 CREATE INDEX IF NOT EXISTS ix_sales_doc_day   ON sales_doc (day);
 CREATE INDEX IF NOT EXISTS ix_sales_doc_agent ON sales_doc (agent_id, day);
@@ -203,3 +263,73 @@ INSERT INTO holiday (holiday_date, name, lead_days, fallback_multiplier) VALUES
     ('2027-11-28', 'День матери',      2, 2.0),
     ('2027-12-31', 'Новый год',        3, 2.0)
 ON CONFLICT (holiday_date) DO NOTHING;
+
+-- Перемещения между складами (/entity/move).
+-- Канал «ресторан» (СОБРАНИЕ) работает через перемещения, поэтому без них
+-- цифры по СОБРАНИЮ недостоверны, а управленческая прибыль невозможна.
+CREATE TABLE IF NOT EXISTS move_doc (
+    doc_id           text        PRIMARY KEY,
+    moment           timestamptz NOT NULL,
+    day              date        NOT NULL,
+    store_from_id    text        NOT NULL DEFAULT '',
+    store_from_name  text        NOT NULL DEFAULT '',
+    store_to_id      text        NOT NULL DEFAULT '',
+    store_to_name    text        NOT NULL DEFAULT '',
+    description      text,
+    total_kop        bigint      NOT NULL DEFAULT 0,   -- сумма перемещения (по себест.)
+    synced_at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- Перемещения: позиции
+CREATE TABLE IF NOT EXISTS move_item (
+    doc_id       text        NOT NULL REFERENCES move_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_name text        NOT NULL,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    cost_kop     bigint      NOT NULL DEFAULT 0,   -- себест. единицы в копейках
+    total_kop    bigint      NOT NULL DEFAULT 0,   -- qty × cost
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_move_doc_day       ON move_doc (day);
+CREATE INDEX IF NOT EXISTS ix_move_doc_from       ON move_doc (store_from_id, day);
+CREATE INDEX IF NOT EXISTS ix_move_doc_to         ON move_doc (store_to_id, day);
+CREATE INDEX IF NOT EXISTS ix_move_item_product   ON move_item (product_name);
+
+-- Товар в позиции перемещения (id из МойСклад) — для пересчёта по закупочным
+-- ценам из приёмок (E2). id брать чистым (без ?expand=…), см. баг остатков.
+ALTER TABLE move_item ADD COLUMN IF NOT EXISTS product_id text;
+CREATE INDEX IF NOT EXISTS ix_move_item_pid ON move_item (product_id);
+
+-- ── Оприходования (enter) — «+»-сторона инвентаризации (H2.3/J2) ──────────────
+-- Зеркало loss: заголовки документов оприходования МойСклад (/entity/enter).
+-- Нужны, чтобы видеть инвентаризацию Базы в обе стороны: списано vs оприходовано.
+CREATE TABLE IF NOT EXISTS enter_doc (
+    doc_id       text        PRIMARY KEY,
+    moment       timestamptz NOT NULL,
+    day          date        NOT NULL,
+    store_id     text        NOT NULL,
+    store_name   text        NOT NULL,
+    description  text,
+    project_name text,
+    synced_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Оприходования: позиции (что именно оприходовали)
+CREATE TABLE IF NOT EXISTS enter_item (
+    doc_id       text        NOT NULL REFERENCES enter_doc(doc_id) ON DELETE CASCADE,
+    position_id  text        NOT NULL,
+    product_id   text,
+    product_name text        NOT NULL,
+    folder_path  text,
+    qty          numeric(14,3) NOT NULL DEFAULT 0,
+    cost_kop     bigint      NOT NULL DEFAULT 0,  -- цена оприходования единицы (коп.)
+    total_kop    bigint      NOT NULL DEFAULT 0,  -- qty × cost
+    synced_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (doc_id, position_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_enter_doc_day     ON enter_doc (day);
+CREATE INDEX IF NOT EXISTS ix_enter_doc_store   ON enter_doc (store_id, day);
+CREATE INDEX IF NOT EXISTS ix_enter_item_pid    ON enter_item (product_id);

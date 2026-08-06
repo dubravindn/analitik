@@ -13,6 +13,16 @@ def kop_to_rub(kop: int) -> float:
     return kop / 100
 
 
+# Единый фильтр «только товар» (решение владельца): всё, что не под корнем
+# «Ассортимент/», — рабочие группы (лента, сборка букета, шары-услуги), не товар,
+# в отчёты не попадает. Используется во всех секциях, чтобы условие не расходилось.
+# %% — литеральный % для psycopg (запросы содержат %s-параметры).
+def assortment_filter(id_col: str = "product_id") -> str:
+    """SQL-фрагмент: product_id принадлежит группе «Ассортимент». Для f-string SQL."""
+    return (f"{id_col} IN (SELECT product_id FROM product_dim "
+            f"WHERE folder_path LIKE 'Ассортимент/%%')")
+
+
 def gross_profit(revenue_kop: int, cost_kop: int) -> int:
     """Грязная прибыль = Выручка − Себестоимость (в копейках)."""
     return revenue_kop - cost_kop
@@ -59,6 +69,52 @@ def expected_transfer_price(cash_price: float) -> float:
 
 def expected_retail_price(cash_price: float) -> float:
     return round(cash_price * COEFF_RETAIL, 2)
+
+
+def purchase_price_at(conn, product_id: str, day: "date") -> "int | None":
+    """Закупочная цена товара (копейки) из последней приёмки на дату day или раньше.
+
+    Именно на дату операции: продажа 15.07 считается по цене приёмки от 10.07,
+    даже если 20.07 пришла партия дороже. None — если приёмок до этой даты нет.
+    """
+    if not product_id:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT price_kop FROM purchase_price_asof
+            WHERE product_id = %s AND priced_from <= %s
+            ORDER BY priced_from DESC
+            LIMIT 1
+        """, (product_id, day))
+        row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def purchase_prices_asof(conn, day: "date", product_ids=None) -> "dict[str, int]":
+    """Пакетно: для товаров — закупочная цена на дату day (один запрос, без N+1).
+
+    DISTINCT ON берёт по каждому product_id строку с максимальным priced_from<=day.
+    product_ids=None — по всем товарам. Возвращает {product_id: price_kop}.
+    """
+    with conn.cursor() as cur:
+        if product_ids is not None:
+            ids = [pid for pid in set(product_ids) if pid]
+            if not ids:
+                return {}
+            cur.execute("""
+                SELECT DISTINCT ON (product_id) product_id, price_kop
+                FROM purchase_price_asof
+                WHERE priced_from <= %s AND product_id = ANY(%s)
+                ORDER BY product_id, priced_from DESC
+            """, (day, ids))
+        else:
+            cur.execute("""
+                SELECT DISTINCT ON (product_id) product_id, price_kop
+                FROM purchase_price_asof
+                WHERE priced_from <= %s
+                ORDER BY product_id, priced_from DESC
+            """, (day,))
+        return {r[0]: int(r[1]) for r in cur.fetchall()}
 
 
 def weekday_baseline(conn, day: "date", weeks: int = 8) -> "tuple[int, int] | None":

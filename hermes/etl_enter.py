@@ -1,16 +1,19 @@
-"""ETL списаний: выгружает документы /entity/loss из МойСклад в PostgreSQL.
+"""ETL оприходований: выгружает документы /entity/enter из МойСклад в PostgreSQL.
 
-Списания из МойСклад не имеют поля «причина» — только склад, товар, количество, цена.
+Оприходование — это «+»-сторона учёта: товар ставится на склад (в т.ч. при
+инвентаризации, когда фактический остаток оказался больше учётного). Вместе со
+списаниями (loss) даёт полную картину инвентаризационной корректировки Базы (J2).
+Зеркало etl_loss: тот же формат заголовков и позиций.
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime
 
-from .moysklad import MoyskladClient, BASE_URL
+from .moysklad import MoyskladClient
 from . import config
 
-log = logging.getLogger("hermes.etl_loss")
+log = logging.getLogger("hermes.etl_enter")
 
 _PAGE = 100
 
@@ -27,7 +30,7 @@ def _fetch_docs(client: MoyskladClient, d_from: date, d_to: date) -> list[dict]:
     offset = 0
     flt = _moment_filter(d_from, d_to)
     while True:
-        page = client._get("/entity/loss", {
+        page = client._get("/entity/enter", {
             "limit": _PAGE,
             "offset": offset,
             "filter": flt,
@@ -47,7 +50,7 @@ def _fetch_positions(client: MoyskladClient, doc_id: str) -> list[dict]:
     rows: list[dict] = []
     offset = 0
     while True:
-        page = client._get(f"/entity/loss/{doc_id}/positions", {
+        page = client._get(f"/entity/enter/{doc_id}/positions", {
             "limit": 100,
             "offset": offset,
             "expand": "assortment",
@@ -62,15 +65,14 @@ def _fetch_positions(client: MoyskladClient, doc_id: str) -> list[dict]:
 
 
 def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
-    """Синхронизировать списания за период. Возвращает число документов."""
+    """Синхронизировать оприходования за период. Возвращает число документов."""
     docs = _fetch_docs(client, d_from, d_to)
-    log.info("Найдено списаний за %s..%s: %d", d_from, d_to, len(docs))
+    log.info("Найдено оприходований за %s..%s: %d", d_from, d_to, len(docs))
 
     total_docs = 0
     for doc in docs:
         doc_id = doc["id"]
         moment_str = doc.get("moment", "")
-        # moment приходит как "2026-07-01 12:34:00.000" без timezone
         try:
             moment = datetime.strptime(moment_str[:19], "%Y-%m-%d %H:%M:%S").replace(
                 tzinfo=config.MSK
@@ -89,7 +91,7 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO loss_doc (doc_id, moment, day, store_id, store_name, description, project_name)
+                INSERT INTO enter_doc (doc_id, moment, day, store_id, store_name, description, project_name)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (doc_id) DO UPDATE SET
                     moment=EXCLUDED.moment, day=EXCLUDED.day,
@@ -120,10 +122,10 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
 
         if pos_records:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM loss_item WHERE doc_id = %s", (doc_id,))
+                cur.execute("DELETE FROM enter_item WHERE doc_id = %s", (doc_id,))
                 cur.executemany(
                     """
-                    INSERT INTO loss_item
+                    INSERT INTO enter_item
                         (doc_id, position_id, product_id, product_name, folder_path, qty, cost_kop, total_kop)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (doc_id, position_id) DO UPDATE SET
@@ -138,5 +140,5 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         conn.commit()
         total_docs += 1
 
-    log.info("Списания %s..%s: загружено %d документов", d_from, d_to, total_docs)
+    log.info("Оприходования %s..%s: загружено %d документов", d_from, d_to, total_docs)
     return total_docs

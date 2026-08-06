@@ -119,15 +119,20 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
         else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
     )
     lines: list[str] = []
-    lines.append(f"💸 Расходы {period_str}")
+    store_label = store_name or "Все склады"
+    lines.append(f"💸 Расходы {period_str} · {store_label}")
     lines.append("(кассовые и банковские исходящие документы)")
     lines.append("")
 
+    # Фильтр по складу.
+    #  • Конкретный склад → только его project_name.
+    #  • Все склады → БЕЗ фильтра: показываем все расходы, в т.ч. без проекта,
+    #    чтобы итог бился с ДДС. Расходы без проекта выделяем группой «Без проекта».
     if store_name:
         _proj_filter = "AND project_name = %s"
         _extra: tuple = (store_name,)
     else:
-        _proj_filter = "AND project_name IS NOT NULL AND project_name != ''"
+        _proj_filter = ""
         _extra = ()
 
     with conn.cursor() as cur:
@@ -148,73 +153,71 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
     lines.append(f"📉 Итого расходов: {_rub(out_kop)} ₽  ({out_cnt} документов)")
     lines.append("")
 
-    # Разбивка по статьям расходов
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COALESCE(NULLIF(expense_item_name, ''), 'Без статьи'),
-                   SUM(amount_kop), COUNT(*)
-            FROM cashflow_event
-            WHERE day BETWEEN %s AND %s AND direction = 'out'
-            {_proj_filter}
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """, (d_from, d_to) + _extra)
-        by_item = cur.fetchall()
+    # I5: «По проектам (складам)» — только компактная сводка (≤5 строк).
+    # Полное дерево строится по статьям, не по проектам.
+    if not store_name:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(NULLIF(project_name, ''), '⚠️ Без проекта'),
+                       SUM(amount_kop), COUNT(*),
+                       (project_name IS NULL OR project_name = '') AS no_proj
+                FROM cashflow_event
+                WHERE day BETWEEN %s AND %s AND direction = 'out'
+                {_proj_filter}
+                GROUP BY 1, 4
+                ORDER BY no_proj ASC, 2 DESC
+            """, (d_from, d_to) + _extra)
+            by_project = cur.fetchall()
+        if len(by_project) > 1:
+            lines.append("── По складам (сводка) ──")
+            for proj_name, kop, cnt, _no in by_project[:5]:
+                lines.append(f"  📍 {proj_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
+            if len(by_project) > 5:
+                rest_kop = sum(float(r[1]) for r in by_project[5:])
+                lines.append(f"  … и ещё {len(by_project) - 5} складов · {_rub(rest_kop)} ₽")
+            lines.append("")
 
-    if len(by_item) > 1:
-        lines.append("── По статьям расходов ──")
-        for item_name, kop, cnt in by_item:
-            lines.append(f"  {item_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
-        lines.append("")
-
-    # Разбивка по проектам (склад/подразделение)
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT project_name,
-                   SUM(amount_kop), COUNT(*)
-            FROM cashflow_event
-            WHERE day BETWEEN %s AND %s AND direction = 'out'
-            {_proj_filter}
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """, (d_from, d_to) + _extra)
-        by_project = cur.fetchall()
-
-    if len(by_project) > 1:
-        lines.append("── По проектам (складам) ──")
-        for proj_name, kop, cnt in by_project:
-            lines.append(f"  📍 {proj_name}: {_rub(float(kop))} ₽ ({cnt} опер.)")
-        lines.append("")
-
-    # Каждый документ
+    # I5: дерево «статья расходов → документы по убыванию суммы».
+    # Один запрос, группировку и сортировку делаем в Python (без N+1).
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT moment, doc_type, agent_name, description,
-                   expense_item_name, project_name, amount_kop
+                   COALESCE(NULLIF(expense_item_name, ''), 'Без статьи'),
+                   project_name, amount_kop
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
             {_proj_filter}
-            ORDER BY moment
+            ORDER BY amount_kop DESC
         """, (d_from, d_to) + _extra)
         out_docs = cur.fetchall()
 
-    lines.append(f"── 📋 Документы ({len(out_docs)}) ──")
-    for moment, doc_type, agent, desc, expense_item, project, amount in out_docs:
-        dt = (moment.strftime("%d.%m %H:%M")
-              if hasattr(moment, "strftime") else str(moment)[:16])
-        ch = "Касса" if doc_type == "cashout" else "Банк"
-        line = f"  {dt} [{ch}] {_rub(float(amount))} ₽"
-        if agent:
-            line += f"  → {agent}"
-        details = []
-        if expense_item:
-            details.append(f"Статья: {expense_item}")
-        if project:
-            details.append(f"Проект: {project}")
-        if desc:
-            details.append(desc)
-        if details:
-            line += "\n     " + " | ".join(details)
-        lines.append(line)
+    # Сгруппировать по статье, сохранив порядок «по убыванию суммы» внутри статьи
+    # (запрос уже отсортирован по amount DESC).
+    tree: dict[str, list] = {}
+    item_total: dict[str, float] = {}
+    for moment, doc_type, agent, desc, item, project, amount in out_docs:
+        tree.setdefault(item, []).append((moment, doc_type, agent, desc, project, amount))
+        item_total[item] = item_total.get(item, 0.0) + float(amount)
 
-    return "\n".join(lines)
+    lines.append("── 💸 По статьям (статья → документы) ──")
+    for item in sorted(item_total, key=lambda k: -item_total[k]):
+        docs = tree[item]
+        lines.append(f"▸ {item}: {_rub(item_total[item])} ₽ ({len(docs)} опер.)")
+        for moment, doc_type, agent, desc, project, amount in docs:
+            dt = (moment.strftime("%d.%m %H:%M")
+                  if hasattr(moment, "strftime") else str(moment)[:16])
+            ch = "Касса" if doc_type == "cashout" else "Банк"
+            line = f"   • {dt} [{ch}] {_rub(float(amount))} ₽"
+            if agent:
+                line += f" → {agent}"
+            tail = []
+            if project:
+                tail.append(f"склад: {project}")
+            if desc:
+                tail.append(desc)
+            if tail:
+                line += " · " + " | ".join(tail)
+            lines.append(line)
+        lines.append("")
+
+    return "\n".join(lines).rstrip()

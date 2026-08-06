@@ -50,8 +50,9 @@ def main_reply_keyboard() -> dict:
             [{"text": "📊 Продажи"},   {"text": "📦 Остатки"}],
             [{"text": "🚨 Залежалые"}, {"text": "🗑 Списания"}],
             [{"text": "🎯 Резервы"},   {"text": "💸 Расходы"}],
-            [{"text": "👥 Клиенты"},   {"text": "🔍 Изменения"}],
-            [{"text": "🛒 Прогноз"},   {"text": "📄 Отчёт PDF"}],
+            [{"text": "🔄 Перемещения"}, {"text": "👥 Клиенты"}],
+            [{"text": "🔍 Изменения"}, {"text": "🛒 Прогноз"}],
+            [{"text": "🏷 Цены"},      {"text": "📄 Отчёт PDF"}],
             [{"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,
@@ -183,12 +184,35 @@ def send_document(
 # ─── низкоуровневые утилиты ───────────────────────────────────────────────────
 
 def _split(text: str, limit: int) -> list[str]:
+    """Разбить текст на части ≤ limit по границам строк (не резать посреди строки).
+
+    Одиночную строку длиннее limit режем жёстко — иначе её не отправить.
+    """
     if len(text) <= limit:
         return [text]
-    parts = []
-    while text:
-        parts.append(text[:limit])
-        text = text[limit:]
+
+    parts: list[str] = []
+    buf = ""
+    for line in text.split("\n"):
+        # Строка сама по себе длиннее лимита — сбрасываем буфер и режем её жёстко.
+        if len(line) > limit:
+            if buf:
+                parts.append(buf)
+                buf = ""
+            while len(line) > limit:
+                parts.append(line[:limit])
+                line = line[limit:]
+            buf = line
+            continue
+        # Кандидат = буфер + перевод строки + текущая строка.
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) <= limit:
+            buf = candidate
+        else:
+            parts.append(buf)
+            buf = line
+    if buf:
+        parts.append(buf)
     return parts
 
 

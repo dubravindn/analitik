@@ -1,7 +1,14 @@
-"""Аудит изменений: удалённые и изменённые документы из МойСклад."""
+"""Аудит изменений: удалённые и изменённые документы из МойСклад.
+
+Владелец должен видеть, что за период кто-то удалил или переписал документ.
+Формат — плоский список: тип документа · дата · склад · сумма · кто.
+Склад: у части документов (списания, поставки, продажи) берётся из поля store,
+у расходных/платёжных — из project. Если ни того, ни другого нет — «(без склада)».
+«Кто» — ответственный сотрудник (owner) документа.
+"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from .moysklad import MoyskladClient
 
@@ -14,6 +21,47 @@ _DOC_TYPES = {
     "paymentout":   "Исходящие платежи",
 }
 
+_NO_STORE = "(без склада)"
+# updated считается «изменением», если он позже moment минимум на столько
+# (МойСклад ставит updated ≈ moment при создании; правки — позже на минуты).
+_EDIT_GAP = timedelta(minutes=2)
+
+
+def _location(doc: dict) -> str:
+    """Склад документа: store.name → project.name → «(без склада)»."""
+    store = doc.get("store")
+    if isinstance(store, dict) and store.get("name"):
+        return store["name"]
+    project = doc.get("project")
+    if isinstance(project, dict) and project.get("name"):
+        return project["name"]
+    return _NO_STORE
+
+
+def _owner(doc: dict) -> str:
+    owner = doc.get("owner")
+    if isinstance(owner, dict) and owner.get("name"):
+        return owner["name"]
+    return "—"
+
+
+def _rub(sum_kop) -> str:
+    try:
+        return f"{float(sum_kop) / 100:,.0f}".replace(",", " ") + " ₽"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _dt(s: str) -> datetime | None:
+    """Разобрать момент МойСклад «YYYY-MM-DD HH:MM:SS[.ms]» в datetime."""
+    if not s:
+        return None
+    s = s[:19].replace("T", " ")
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
 
 def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     period_str = (
@@ -22,76 +70,73 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     )
     lines = [f"🔍 Изменения документов за {period_str}", ""]
 
-    # ── Удалённые ──────────────────────────────────────────────────────────────
+    # ── Удалённые (deletedMoment в периоде) ─────────────────────────────────────
     del_flt = (
         f"deletedMoment>={d_from.isoformat()} 00:00:00;"
         f"deletedMoment<={d_to.isoformat()} 23:59:59"
     )
-    any_deleted = False
+    deleted: list[tuple] = []   # (day, label, loc, sum_kop, who)
     for doc_type, label in _DOC_TYPES.items():
         try:
             resp = client._get(f"/entity/{doc_type}/deleted", {
                 "filter": del_flt,
                 "limit": 100,
                 "order": "deletedMoment,asc",
+                "expand": "store,project,owner",
             })
             rows = resp.get("rows", [])
         except Exception:
             continue
-        if not rows:
-            continue
-        if not any_deleted:
-            lines.append("🗑 УДАЛЁННЫЕ ДОКУМЕНТЫ:")
-            any_deleted = True
-        lines.append(f"  {label}: {len(rows)} шт.")
         for r in rows:
-            moment = str(r.get("moment", ""))[:10]
-            name   = r.get("name") or r.get("id", "—")
-            lines.append(f"    • {moment}  {name}")
+            d_dt = _dt(str(r.get("deletedMoment") or r.get("moment", "")))
+            day = d_dt.strftime("%d.%m.%Y") if d_dt else "—"
+            sort_key = d_dt.isoformat() if d_dt else ""
+            deleted.append((sort_key, day, label, _location(r), r.get("sum"), _owner(r)))
 
-    if not any_deleted:
-        lines.append("✅ Удалённых документов за период не найдено.")
-    lines.append("")
-
-    # ── Изменённые (updated > moment + 1 мин) ─────────────────────────────────
+    # ── Изменённые (updated позже moment на _EDIT_GAP) ──────────────────────────
     doc_flt = (
         f"moment>={d_from.isoformat()} 00:00:00;"
         f"moment<={d_to.isoformat()} 23:59:59"
     )
-    any_modified = False
+    modified: list[tuple] = []   # (moment_day, updated_day, label, loc, sum_kop, who)
     for doc_type, label in _DOC_TYPES.items():
         try:
             resp = client._get(f"/entity/{doc_type}", {
                 "filter": doc_flt,
                 "limit": 100,
                 "order": "moment,asc",
+                "expand": "store,project,owner",
             })
             rows = resp.get("rows", [])
         except Exception:
             continue
-        modified = []
         for r in rows:
-            moment  = str(r.get("moment",  ""))[:19].replace("T", " ")
-            updated = str(r.get("updated", ""))[:19].replace("T", " ")
-            # Изменён если updated на 2+ минуты позже moment (автообновление ~0с)
-            if updated > moment[:16] + "1":
-                modified.append({
-                    "name":    r.get("name") or r.get("id", "—"),
-                    "moment":  moment[:10],
-                    "updated": updated[:10],
-                })
-        if not modified:
-            continue
-        if not any_modified:
-            lines.append("✏️ ИЗМЕНЁННЫЕ ДОКУМЕНТЫ:")
-            any_modified = True
-        lines.append(f"  {label}: {len(modified)} шт.")
-        for m in modified:
+            m_dt = _dt(str(r.get("moment", "")))
+            u_dt = _dt(str(r.get("updated", "")))
+            if m_dt and u_dt and (u_dt - m_dt) >= _EDIT_GAP:
+                modified.append((
+                    m_dt.strftime("%d.%m.%Y"), u_dt.strftime("%d.%m.%Y"),
+                    label, _location(r), r.get("sum"), _owner(r),
+                ))
+
+    if not deleted and not modified:
+        lines.append("✅ За период изменённых и удалённых документов нет.")
+        return "\n".join(lines)
+
+    if deleted:
+        deleted.sort(key=lambda x: x[0])
+        lines.append(f"🗑 УДАЛЁННЫЕ ({len(deleted)}):")
+        for _sort, day, label, loc, sum_kop, who in deleted:
+            lines.append(f"  • {label} · {day} · {loc} · {_rub(sum_kop)} · {who}")
+        lines.append("")
+
+    if modified:
+        modified.sort(key=lambda x: x[0])
+        lines.append(f"✏️ ИЗМЕНЁННЫЕ ({len(modified)}):")
+        for m_day, u_day, label, loc, sum_kop, who in modified:
             lines.append(
-                f"    • {m['moment']}  {m['name']}  (изм. {m['updated']})"
+                f"  • {label} · {m_day} · {loc} · {_rub(sum_kop)} · {who} "
+                f"(изм. {u_day})"
             )
 
-    if not any_modified:
-        lines.append("✅ Изменённых документов за период не найдено.")
-
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
