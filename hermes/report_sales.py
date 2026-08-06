@@ -1,9 +1,10 @@
 """Отчёт «Аналитик продаж»: лучшие позиции с разбивкой по складам."""
 from __future__ import annotations
 
-from datetime import date
+import statistics
+from datetime import date, timedelta
 
-from . import calc
+from . import calc, config
 
 
 def _rub(kop: float) -> str:
@@ -83,6 +84,44 @@ def _sales_purchase_data(conn, d_from: date, d_to: date, store_id: str | None = 
     return {"by_store": by_store, "by_product": by_product, "tot": tot}
 
 
+def _attention_block(conn, lines, d_from, d_to, retail_margins, mixed, stores, pc_fn):
+    """G5: чистую розницу сравниваем с медианой розницы; смешанные точки — со
+    своей историей (медиана маржи за 8 таких же прошлых периодов)."""
+    flags: list[str] = []
+
+    # 1. Чистые розничные точки против медианы розницы (разрыв в ₽).
+    if len(retail_margins) >= 2:
+        med = statistics.median(m for _, m, _ in retail_margins)
+        for sn, m, rev in retail_margins:
+            if med > 0 and m < med / 2:
+                gap = round(rev * (med - m) / 100)
+                flags.append(f"• {sn}: маржа {m:.0f}% против {med:.0f}% медианы розницы — "
+                             f"разрыв ≈{_rub(gap)} ₽")
+
+    # 2. Смешанные точки (опт+розница) — со своей историей.
+    n_days = (d_to - d_from).days + 1
+    for sid, sn, channel, rev, chk in stores:
+        if sn not in mixed or rev == 0:
+            continue
+        cur_m = (rev - pc_fn(sid)) / rev * 100
+        hist: list[float] = []
+        for k in range(1, 9):
+            d = _sales_purchase_data(conn, d_from - timedelta(days=n_days * k),
+                                     d_to - timedelta(days=n_days * k), sid)
+            r = d["tot"]["rev"]
+            if r > 0:
+                hist.append((r - d["tot"]["pc"]) / r * 100)
+        if len(hist) >= 3:
+            hm = statistics.median(hist)
+            if hm > 0 and cur_m < hm / 1.5:
+                flags.append(f"• {sn}: маржа {cur_m:.0f}% против обычных {hm:.0f}% — проверить")
+
+    if flags:
+        lines.append("⚠️ Требует внимания")
+        lines.extend("  " + f for f in flags)
+        lines.append("")
+
+
 # ─── Основной аналитический отчёт: лучшие позиции ────────────────────────────
 
 def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
@@ -132,6 +171,9 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     def _pc(sid):   # закупочная себестоимость склада (с фолбэком уже внутри by_store)
         return by_store.get(sid, {}).get("pc", 0)
 
+    mixed = set(config.MIXED_CHANNEL_STORES or [])
+    retail_margins: list[tuple[str, float, int]] = []   # (склад, маржа%, разрыв-база ₽) чистой розницы
+
     grand_rev = grand_cost = grand_chk = 0
     for channel in ("розница", "опт", "ресторан"):
         chan = [r for r in stores if r[2] == channel]
@@ -150,11 +192,14 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
             sp = rev - _pc(sid)
             sm = sp / rev * 100 if rev else 0
             sa = calc.avg_check(rev, chk)
+            note = "\n     ℹ️ опт+розница через одну кассу" if sn in mixed else ""
             lines.append(
                 f"  📍 {sn}\n"
                 f"     Выручка {_rub(rev)} ₽ · Прибыль {_rub(sp)} ₽ ({sm:.0f}%)\n"
-                f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽"
+                f"     Чеков {chk} · Ср.чек {_rub(sa)} ₽{note}"
             )
+            if channel == "розница" and sn not in mixed:
+                retail_margins.append((sn, sm, rev))
         lines.append(
             f"  Итого: {_rub(c_rev)} ₽ · {_rub(gp)} ₽ ({margin:.0f}%) · {c_chk} чек."
         )
@@ -182,6 +227,11 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         lines.append(f"  📅 {why}.")
         lines.append(f"     Для сравнения, по себест. МойСклад: {_rub(ms_profit)} ₽ ({ms_margin:.0f}%)")
     lines.append("")
+
+    # G5 (переработан): «Требует внимания». Чистые розничные точки сравниваем с
+    # медианой розницы; смешанные (опт+розница через одну кассу) — с их же историей.
+    if not store_name:
+        _attention_block(conn, lines, d_from, d_to, retail_margins, mixed, stores, _pc)
 
     # ── Топ товаров (прибыль по закупочным ценам, * = нет данных о приёмке) ──
     sf2 = "AND spd.store_id = %s" if store_id_f else ""

@@ -13,6 +13,16 @@ def kop_to_rub(kop: int) -> float:
     return kop / 100
 
 
+# Единый фильтр «только товар» (решение владельца): всё, что не под корнем
+# «Ассортимент/», — рабочие группы (лента, сборка букета, шары-услуги), не товар,
+# в отчёты не попадает. Используется во всех секциях, чтобы условие не расходилось.
+# %% — литеральный % для psycopg (запросы содержат %s-параметры).
+def assortment_filter(id_col: str = "product_id") -> str:
+    """SQL-фрагмент: product_id принадлежит группе «Ассортимент». Для f-string SQL."""
+    return (f"{id_col} IN (SELECT product_id FROM product_dim "
+            f"WHERE folder_path LIKE 'Ассортимент/%%')")
+
+
 def gross_profit(revenue_kop: int, cost_kop: int) -> int:
     """Грязная прибыль = Выручка − Себестоимость (в копейках)."""
     return revenue_kop - cost_kop

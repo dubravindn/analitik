@@ -155,7 +155,10 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
                    CURRENT_DATE - l.last_day AS days_since,
                    (CURRENT_DATE - l.last_day)::float / NULLIF(a.avg_gap_days, 0) AS overdue_ratio
             FROM avg_gap a JOIN last_seen l USING (agent_id)
+            -- Отток: просрочка ≥1.5× среднего интервала И прошло ≥7 дней —
+            -- второй порог убирает ложные тревоги на выходных (интервал 2 дн.).
             WHERE (CURRENT_DATE - l.last_day) > a.avg_gap_days * 1.5
+              AND (CURRENT_DATE - l.last_day) >= 7
             ORDER BY overdue_ratio DESC
             LIMIT 15
         """)

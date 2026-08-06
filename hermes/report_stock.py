@@ -84,7 +84,7 @@ def _render_stock_by_store(conn, lines, day, order):
             cur.execute(f"""
                 SELECT COUNT(*), SUM(stock_qty), SUM({_ST_VALUE})
                 FROM stock_snapshot {_ST_JOIN}
-                WHERE day = %s AND stock_qty > 0 AND stock_qty < 9999 AND store_name = %s
+                WHERE day = %s AND stock_qty > 0 AND store_name = %s
                   AND folder_path LIKE %s
             """, [day, sn, "Ассортимент/%"])
             r = cur.fetchone()
