@@ -35,6 +35,18 @@ _MV_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
 # Выручка-покрытие: total_kop только по покрытым приёмками позициям.
 _MV_COVERED = "CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 THEN i.total_kop ELSE 0 END"
 
+# I8: фильтр «Ассортимент» — в перемещениях учитываем только товар (не ленты,
+# упаковку, услуги). По product_id через product_dim, как в списаниях.
+_MV_ASSORT = ("i.product_id IN (SELECT product_id FROM product_dim "
+              "WHERE folder_path LIKE 'Ассортимент/%%')")
+
+
+def _two_price(cost_unit, nal_unit) -> str:
+    """«закуп X ₽ · нал Y ₽» (прочерк, если цены нет)."""
+    c = f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
+    n = f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
+    return f"{c} · {n}"
+
 
 def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None,
                       max_docs: int | None = 50) -> str:
@@ -69,7 +81,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
                    COALESCE(SUM({_MV_COVERED}), 0),
                    COALESCE(SUM(i.total_kop), 0)
             {_MV_JOIN}
-            WHERE d.day BETWEEN %s AND %s {store_cond}
+            WHERE d.day BETWEEN %s AND %s {store_cond} AND {_MV_ASSORT}
         """, base_params)
         cnt, total_qty, total_kop, covered_ms, all_ms = cur.fetchone()
 
@@ -91,7 +103,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
                        COALESCE(SUM(i.qty), 0),
                        COALESCE(SUM({_MV_TOTAL}), 0)
                 {_MV_JOIN}
-                WHERE d.day BETWEEN %s AND %s AND d.store_from_name = %s
+                WHERE d.day BETWEEN %s AND %s AND d.store_from_name = %s AND {_MV_ASSORT}
                 GROUP BY d.store_to_name
                 ORDER BY 4 DESC
             """, [d_from, d_to, store_name])
@@ -111,7 +123,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
                        COALESCE(SUM(i.qty), 0),
                        COALESCE(SUM({_MV_TOTAL}), 0)
                 {_MV_JOIN}
-                WHERE d.day BETWEEN %s AND %s AND d.store_to_name = %s
+                WHERE d.day BETWEEN %s AND %s AND d.store_to_name = %s AND {_MV_ASSORT}
                 GROUP BY d.store_from_name
                 ORDER BY 4 DESC
             """, [d_from, d_to, store_name])
@@ -131,7 +143,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
                        COALESCE(SUM(i.qty), 0),
                        COALESCE(SUM({_MV_TOTAL}), 0)
                 {_MV_JOIN}
-                WHERE d.day BETWEEN %s AND %s
+                WHERE d.day BETWEEN %s AND %s AND {_MV_ASSORT}
                 GROUP BY d.store_from_name, d.store_to_name
                 ORDER BY 5 DESC
             """, [d_from, d_to])
@@ -151,6 +163,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
             SELECT d.doc_id, d.moment, d.day, d.store_from_name, d.store_to_name, d.description
             FROM move_doc d
             WHERE d.day BETWEEN %s AND %s {store_cond}
+              AND EXISTS (SELECT 1 FROM move_item i WHERE i.doc_id = d.doc_id AND {_MV_ASSORT})
             ORDER BY d.moment
         """, base_params)
         docs = cur.fetchall()
@@ -171,32 +184,40 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
             header += f" · {description}"
         lines.append(header)
 
-        # Закупочная цена позиции на дату документа (фолбэк на cost_kop).
+        # I8: две цены позиции — закупочная (фолбэк cost_kop) и наличная, на дату;
+        # только товар «Ассортимент».
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT i.product_name, i.qty, i.cost_kop, i.total_kop, pp.price_kop
+            cur.execute(f"""
+                SELECT i.product_name, i.qty, i.cost_kop, i.total_kop,
+                       pp.price_kop, np.price_kop
                 FROM move_item i
                 LEFT JOIN LATERAL (
                     SELECT price_kop FROM purchase_price_asof p
                     WHERE p.product_id = i.product_id AND p.priced_from <= %s
                     ORDER BY p.priced_from DESC LIMIT 1
                 ) pp ON true
-                WHERE i.doc_id = %s
+                LEFT JOIN LATERAL (
+                    SELECT price_kop FROM nal_price_asof n
+                    WHERE n.product_id = i.product_id AND n.priced_from <= %s
+                    ORDER BY n.priced_from DESC LIMIT 1
+                ) np ON true
+                WHERE i.doc_id = %s AND {_MV_ASSORT}
                 ORDER BY i.total_kop DESC
-            """, [doc_day, doc_id])
+            """, [doc_day, doc_day, doc_id])
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, ms_cost, ms_total, purch_price in positions:
+        for pname, qty, ms_cost, ms_total, purch_price, nal in positions:
             covered = purch_price is not None and purch_price > 0
             unit = int(purch_price) if covered else int(ms_cost or 0)
             pos_total = round(float(qty) * unit) if covered else float(ms_total)
+            nal_unit = int(nal) if nal else 0
             doc_total += float(pos_total)
             star = "" if covered else " *"
             any_star = any_star or not covered
-            cost_str = f" × {_rub(unit)} ₽/ед." if unit else ""
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед.{cost_str} = {_rub(float(pos_total))} ₽{star}"
+                f"  • {pname}: {_qty(float(qty))} ед. · {_two_price(unit, nal_unit)} · "
+                f"{_rub(float(pos_total))} ₽{star}"
             )
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")
         lines.append("")
