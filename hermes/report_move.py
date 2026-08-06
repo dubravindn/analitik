@@ -142,23 +142,8 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
                 lines.append(f"  {from_name} → {to_name}: {dcnt} докум. · {_qty(float(sqty))} ед. · {_rub(float(skop))} ₽")
             lines.append("")
 
-    # Топ-10 перемещаемых товаров
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT i.product_name, SUM(i.qty), SUM({_MV_TOTAL})
-            {_MV_JOIN}
-            WHERE d.day BETWEEN %s AND %s {store_cond}
-            GROUP BY i.product_name
-            ORDER BY 3 DESC
-            LIMIT 10
-        """, base_params)
-        top = cur.fetchall()
-
-    if top:
-        lines.append("🏆 Топ-10 перемещаемых товаров:")
-        for i, (name, qty, kop) in enumerate(top, 1):
-            lines.append(f"  {i:2}. {name}: {_qty(float(qty))} ед. · {_rub(float(kop))} ₽")
-        lines.append("")
+    # J5: «Топ-10 перемещаемых товаров» удалён по решению владельца.
+    # Остаются: шапка, потоки «откуда → куда», документы с позициями.
 
     # Все документы с позициями
     with conn.cursor() as cur:
