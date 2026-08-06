@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date
 
+from . import config
+
 
 def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
@@ -44,27 +46,58 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     lines: list[str] = []
     lines.append(f"🗑 Списания {period_str}{store_label}")
     lines.append("Стоимость — по закупочным ценам из карточки товара.")
+    lines.append("")
 
     sf = "AND d.store_name = %s" if store_name else ""
     p  = [d_from, d_to] + ([store_name] if store_name else [])
+    adj = config.ADJUSTMENT_STORES or [""]
 
-    # Сводка
+    # Три категории (H2): порча (розница), корректировки учёта (База), возвраты.
+    def _loss_sum(cond, extra):
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(DISTINCT d.doc_id), COALESCE(SUM(i.qty), 0),
+                       COALESCE(SUM({_LS_TOTAL}), 0)
+                {_LS_JOIN}
+                WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf} {cond}
+            """, p + extra)
+            return cur.fetchone()
+
+    spoil_cnt, spoil_qty, spoil_kop = _loss_sum("AND NOT (d.store_name = ANY(%s))", [adj])
+    adj_cnt, adj_qty, adj_kop = _loss_sum("AND (d.store_name = ANY(%s))", [adj])
+
+    # Возвраты клиентам — из расходов (cashflow), статья «Возврат».
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COUNT(DISTINCT d.doc_id),
-                   COALESCE(SUM(i.qty), 0),
-                   COALESCE(SUM({_LS_TOTAL}), 0)
-            {_LS_JOIN}
-            WHERE d.day BETWEEN %s AND %s {sf}
-        """, p)
-        cnt, total_qty, total_kop = cur.fetchone()
+        cur.execute("""
+            SELECT COUNT(*), COALESCE(SUM(amount_kop), 0)
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'out'
+              AND expense_item_name ILIKE '%%возврат%%'
+        """, [d_from, d_to])
+        ret_cnt, ret_kop = cur.fetchone()
 
-    if not cnt:
+    if not spoil_cnt and not adj_cnt and not ret_kop:
         lines.append("Данных о списаниях за этот период нет.")
         return "\n".join(lines)
 
-    lines.append(f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. · Сумма: {_rub(float(total_kop))} ₽")
+    lines.append(f"🌸 Порча (розница): {_rub(float(spoil_kop))} ₽ · "
+                 f"{_qty(float(spoil_qty))} ед. · {spoil_cnt} докум.")
+    lines.append(f"📋 Корректировки инвентаризации (База): {_rub(float(adj_kop))} ₽ · "
+                 f"{adj_cnt} докум. — учёт, НЕ потери")
+    if ret_kop:
+        lines.append(f"💸 Возвраты клиентам: {_rub(float(ret_kop))} ₽ · {int(ret_cnt)} опер. "
+                     f"(те же операции в разделе «Расходы»)")
     lines.append("")
+
+    if not spoil_cnt:
+        lines.append("Порчи (списаний на рознице) за период нет.")
+        return "\n".join(lines)
+
+    # Детализация ниже — только ПОРЧА (розница); корректировки Базы не смешиваем.
+    lines.append("── 🌸 ПОРЧА (розница) ──")
+    sf = sf + " AND NOT (d.store_name = ANY(%s))"
+    p  = p + [adj]
+    cnt, total_qty, total_kop = spoil_cnt, spoil_qty, spoil_kop
 
     # Разбивка по складам
     with conn.cursor() as cur:
@@ -74,7 +107,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
                    COALESCE(SUM(i.qty), 0),
                    COALESCE(SUM({_LS_TOTAL}), 0)
             {_LS_JOIN}
-            WHERE d.day BETWEEN %s AND %s {sf}
+            WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
             GROUP BY d.store_name
             ORDER BY SUM({_LS_TOTAL}) DESC
         """, p)
@@ -84,6 +117,8 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         lines.append("── По складам ──")
         for sn, dcnt, sqty, skop in by_store:
             lines.append(f"  📍 {sn}: {dcnt} докум. · {_qty(float(sqty))} ед. · {_rub(float(skop))} ₽")
+        lines.append("  ⚠️ Это место списания, а не оценка работы точки: "
+                     "часть порчи перемещена с Базы и списана на рознице.")
         lines.append("")
 
     # Разбивка по проектам (если есть)
@@ -94,7 +129,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
                    COALESCE(SUM(i.qty), 0),
                    COALESCE(SUM({_LS_TOTAL}), 0)
             {_LS_JOIN}
-            WHERE d.day BETWEEN %s AND %s {sf}
+            WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
             GROUP BY 1
             ORDER BY 4 DESC
         """, p)
@@ -111,7 +146,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         cur.execute(f"""
             SELECT i.product_name, SUM(i.qty), SUM({_LS_TOTAL})
             {_LS_JOIN}
-            WHERE d.day BETWEEN %s AND %s {sf}
+            WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
             GROUP BY i.product_name
             ORDER BY SUM({_LS_TOTAL}) DESC
             LIMIT 10
@@ -130,6 +165,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
             SELECT d.doc_id, d.moment, d.day, d.store_name, d.description, d.project_name
             FROM loss_doc d
             WHERE d.day BETWEEN %s AND %s {sf}
+              AND EXISTS (SELECT 1 FROM loss_item i WHERE i.doc_id = d.doc_id AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%'))
             ORDER BY d.moment
         """, p)
         docs = cur.fetchall()
@@ -163,7 +199,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
                     WHERE p.product_id = i.product_id AND p.priced_from <= %s
                     ORDER BY p.priced_from DESC LIMIT 1
                 ) pp ON true
-                WHERE i.doc_id = %s
+                WHERE i.doc_id = %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%')
                 ORDER BY i.total_kop DESC
             """, [doc_day, doc_id])
             positions = cur.fetchall()
@@ -181,6 +217,6 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")
         lines.append("")
 
-    # total_qty/total_kop — из сводного запроса (не затирать переменной цикла!)
-    lines.append(f"═══ ИТОГО: {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
+    # Порча (розница) — из сводного запроса (не затирать переменной цикла!)
+    lines.append(f"═══ ИТОГО ПОРЧА (розница): {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
     return "\n".join(lines)
