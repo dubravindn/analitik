@@ -410,6 +410,13 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
     to_order.sort(key=lambda x: -x["final"])
 
     if to_order:
+        # N7: полный итог до обрезки по лимиту
+        tot_all_qty = sum(it["final"] for it in to_order)
+        if len(to_order) > _TOP_ORDER:
+            lines.append(
+                f"  Показаны топ-{_TOP_ORDER} по объёму. "
+                f"Итого по всем {len(to_order)} поз.: {_qty(tot_all_qty)} ед."
+            )
         for it in to_order[:_TOP_ORDER]:
             pk = f" ({it['packs']} упак.)" if it["packs"] else ""
             lines.append(
@@ -417,9 +424,13 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
                 f"{_qty(it['free'])} = {_qty(it['raw'])} → "
                 f"К ЗАКАЗУ {_qty(it['final'])} ед.{pk}"
             )
+        shown_qty = sum(it["final"] for it in to_order[:_TOP_ORDER])
         if len(to_order) > _TOP_ORDER:
-            lines.append(f"  … и ещё {len(to_order) - _TOP_ORDER} позиций "
-                         f"(полный список — в PDF)")
+            rest = len(to_order) - _TOP_ORDER
+            rest_qty = tot_all_qty - shown_qty
+            lines.append(f"  … и ещё {rest} поз. · {_qty(rest_qty)} ед. (полный список — в PDF)")
+        else:
+            lines.append(f"  Итого к заказу: {_qty(shown_qty)} ед.")
     else:
         lines.append("  Докупать нечего: спрос и заказы покрыты остатком.")
     lines.append("")

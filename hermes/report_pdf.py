@@ -19,23 +19,42 @@ _RE_STRIP = re.compile(
     flags=re.UNICODE,
 )
 
+_TOC_SECTIONS = [
+    ("1", "ПРОДАЖИ",      "выручка, прибыль от продаж, топ позиций"),
+    ("2", "ОСТАТКИ",      "СРЕЗКА без резерва на дату"),
+    ("3", "ЗАЛЕЖАЛЫЕ",    "СРЕЗКА без движения"),
+    ("4", "СПИСАНИЯ",     "документы с позициями"),
+    ("5", "РАСХОДЫ",      "движение денег по складам"),
+    ("6", "КЛИЕНТЫ",      "топ и возможный отток"),
+    ("7", "ПРОГНОЗ",      "заказы, спрос и что брать на фургон"),
+    ("8", "ПЕРЕМЕЩЕНИЯ",  "движение товара между складами"),
+    ("9", "ИЗМЕНЕНИЯ",    "удалённые и изменённые документы"),
+]
+
 
 def _clean(text: str) -> str:
     return _RE_STRIP.sub("", text)
 
 
 def _fmt_rub(kop: int) -> str:
-    """Форматирует копейки как '1 500 131 руб.' (пробел как разделитель тысяч)."""
+    """Форматирует копейки как '1 500 131 ₽' (пробел как разделитель тысяч)."""
     rub = abs(kop) // 100
     sign = "-" if kop < 0 else ""
-    return sign + f"{rub:,}".replace(",", " ") + " руб."
+    return sign + f"{rub:,}".replace(",", " ") + " ₽"
 
 
 def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict:
     """Сводка периода для титульной страницы PDF. Все суммы в копейках."""
+    from .report_stock import STALE_SREZKA_MIN_DAYS
+    from . import config as _cfg
+
+    adj = _cfg.ADJUSTMENT_STORES or ["__none__"]
+    own = getattr(_cfg, "OWNER_EXPENSE_ITEMS", []) or []
+
     sf_sd = "AND store_name = %s" if store_name else ""
     p_sd  = [d_from, d_to] + ([store_name] if store_name else [])
 
+    # 1. Выручка, себестоимость МойСклад (N1: методика зафиксирована явно), чеки
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(revenue_kop), 0),
@@ -44,76 +63,116 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s {sf_sd}
         """, p_sd)
-        r   = cur.fetchone() or (0, 0, 0)
+        r = cur.fetchone() or (0, 0, 0)
     rev    = int(r[0])
     cost   = int(r[1])
     checks = int(r[2])
-    profit = rev - cost
+    profit = rev - cost   # прибыль по себестоимости МойСклад
 
+    # 2. Расходы — N2: операционные (без изъятий) и изъятия собственника раздельно
     sf_cf = "AND project_name = %s" if store_name else ""
     p_cf  = [d_from, d_to] + ([store_name] if store_name else [])
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COALESCE(SUM(amount_kop), 0)
-            FROM cashflow_event
-            WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
-        """, p_cf)
-        expenses = int((cur.fetchone() or (0,))[0])
 
+    if own:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(SUM(amount_kop), 0)
+                FROM cashflow_event
+                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
+                  AND (expense_item_name IS NULL OR expense_item_name != ALL(%s))
+            """, p_cf + [own])
+            op_expenses = int((cur.fetchone() or (0,))[0])
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(SUM(amount_kop), 0)
+                FROM cashflow_event
+                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
+                  AND expense_item_name = ANY(%s)
+            """, p_cf + [own])
+            owner_kop = int((cur.fetchone() or (0,))[0])
+    else:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(SUM(amount_kop), 0)
+                FROM cashflow_event
+                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
+            """, p_cf)
+            op_expenses = int((cur.fetchone() or (0,))[0])
+        owner_kop = 0
+
+    # 3. Списания — N3: порча розницы vs корректировки учёта (ADJUSTMENT_STORES)
     sf_ls = "AND d.store_name = %s" if store_name else ""
     p_ls  = [d_from, d_to] + ([store_name] if store_name else [])
+
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(i.total_kop), 0)
-            FROM loss_doc d
-            JOIN loss_item i ON i.doc_id = d.doc_id
+            FROM loss_doc d JOIN loss_item i ON i.doc_id = d.doc_id
             WHERE d.day BETWEEN %s AND %s {sf_ls}
-        """, p_ls)
-        loss = int((cur.fetchone() or (0,))[0])
+              AND NOT (d.store_name = ANY(%s))
+        """, p_ls + [adj])
+        loss_spoil = int((cur.fetchone() or (0,))[0])
 
-    result    = profit - expenses - loss
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM(i.total_kop), 0)
+            FROM loss_doc d JOIN loss_item i ON i.doc_id = d.doc_id
+            WHERE d.day BETWEEN %s AND %s {sf_ls}
+              AND (d.store_name = ANY(%s))
+        """, p_ls + [adj])
+        loss_adj = int((cur.fetchone() or (0,))[0])
+
+    loss      = loss_spoil + loss_adj
+    result    = profit - op_expenses - loss
     avg_check = rev // checks if checks else 0
 
-    # ── «Требует внимания» ─────────────────────────────────────────────────────
+    # 4. «Требует внимания» ────────────────────────────────────────────────────
     attention: list[str] = []
+    stale_cnt, stale_kop = 0, 0
 
-    # 1. Залежалая СРЕЗКА на конец периода — товар в остатке без движения
+    # N4: залежалая СРЕЗКА — тот же фильтр, что раздел 3 (days_idle > threshold)
     sf_ss = "AND ss.store_name = %s" if store_name else ""
-    p_ss  = [d_to, d_from, d_to] + ([store_name] if store_name else [])
+    p_ss  = [d_to] + ([store_name] if store_name else []) + [d_to, STALE_SREZKA_MIN_DAYS]
     try:
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT COUNT(*), COALESCE(SUM(ss.stock_qty * ss.cost_price_kop), 0)
+                SELECT COUNT(*), COALESCE(SUM(
+                    ss.stock_qty * COALESCE(NULLIF(pp.price_kop, 0), ss.cost_price_kop)
+                ), 0)
                 FROM stock_snapshot ss
+                LEFT JOIN LATERAL (
+                    SELECT price_kop FROM purchase_price_asof p
+                    WHERE p.product_id = ss.product_id AND p.priced_from <= ss.day
+                    ORDER BY p.priced_from DESC LIMIT 1
+                ) pp ON true
                 WHERE ss.day = %s
                   AND ss.is_srezka
                   AND ss.stock_qty > 0
                   AND ss.reserve_qty = 0
                   {sf_ss}
-                  AND NOT EXISTS (
-                    SELECT 1 FROM sales_by_product_day spd
-                    WHERE spd.assortment_id = ss.product_id
-                      AND spd.day BETWEEN %s AND %s
-                      AND spd.sell_qty > 0
-                  )
+                  AND (%s - COALESCE(
+                    (SELECT MAX(spd.day) FROM sales_by_product_day spd
+                     WHERE spd.assortment_id = ss.product_id AND spd.sell_qty > 0),
+                    '2000-01-01'::date
+                  )) > %s
             """, p_ss)
             sr = cur.fetchone() or (0, 0)
         stale_cnt = int(sr[0] or 0)
         stale_kop = int(sr[1] or 0)
         if stale_cnt > 0:
             attention.append(
-                f"Залежалая СРЕЗКА: {_fmt_rub(stale_kop)} ({stale_cnt} поз.)"
+                f"Залежалая СРЕЗКА: {_fmt_rub(stale_kop)} ({stale_cnt} поз.)"
             )
     except Exception:
         conn.rollback()
 
-    # 2. Списания > 10% от выручки
-    if rev > 0 and loss > 0:
-        pct = loss / rev * 100
+    # Порча > 10% выручки
+    if rev > 0 and loss_spoil > 0:
+        pct = loss_spoil / rev * 100
         if pct > 10:
-            attention.append(f"Списания: {pct:.0f}% от выручки (порог 10%)")
+            attention.append(f"Порча: {pct:.0f}% от выручки (порог 10%)")
 
-    # 3. Позиции СРЕЗКИ без закупочной цены
+    # СРЕЗКА без закупочной цены
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -127,13 +186,16 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             """)
             no_price_cnt = int((cur.fetchone() or (0,))[0])
         if no_price_cnt > 0:
-            attention.append(f"Без закупочной цены: {no_price_cnt} поз.")
+            attention.append(f"Без закупочной цены: {no_price_cnt} поз.")
     except Exception:
         conn.rollback()
 
     return {
-        "rev": rev, "profit": profit, "expenses": expenses, "loss": loss,
+        "rev": rev, "profit": profit,
+        "op_expenses": op_expenses, "owner_kop": owner_kop,
+        "loss_spoil": loss_spoil, "loss_adj": loss_adj, "loss": loss,
         "result": result, "checks": checks, "avg_check": avg_check,
+        "stale_cnt": stale_cnt, "stale_kop": stale_kop,
         "attention": attention,
     }
 
@@ -153,7 +215,6 @@ def build_pdf(
     )
     store_label = store_name or "Все склады"
 
-    # Сводка периода (с защитой от любых ошибок)
     try:
         summary = _pdf_summary(conn, d_from, d_to, store_name)
     except Exception:
@@ -163,7 +224,6 @@ def build_pdf(
             pass
         summary = None
 
-    # Графики (lazy — вызываются потом, но импорт делаем здесь)
     try:
         from . import charts as _charts
         _charts_ok = True
@@ -200,38 +260,31 @@ def build_pdf(
     pdf.add_font("DejaVu_B", style="", fname=_FONT_BOLD)
     pdf.set_margins(_MARGIN, _MARGIN, _MARGIN)
 
-    eff_w  = 210 - _MARGIN - _MARGIN  # 186 мм
-    lbl_w  = 110                       # ширина колонки-подписи
-    val_w  = eff_w - lbl_w            # ширина колонки-значения
+    eff_w = 210 - _MARGIN - _MARGIN   # 186 мм
+    lbl_w = 118                        # ширина подписи
+    val_w = eff_w - lbl_w             # ширина значения
 
     # ── Титульная страница ──────────────────────────────────────────────────────
     pdf.add_page()
-    pdf.ln(12)
+    pdf.ln(10)
 
-    # Заголовок
+    # Заголовок — N12: период уже в колонтитуле, не дублируем в теле
     pdf.set_x(_MARGIN)
     pdf.set_font("DejaVu_B", size=16)
     pdf.cell(eff_w, 12, "ОТЧЁТ", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.set_x(_MARGIN)
-    pdf.cell(eff_w, 12, "Цветочная База Дубравиных", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    # Период и склад
-    pdf.set_font("DejaVu", size=11)
-    pdf.set_x(_MARGIN)
-    pdf.cell(eff_w, 8, f"Период: {period_str}   |   Склад: {store_label}",
+    pdf.cell(eff_w, 12, "Цветочная База Дубравиных",
              align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(6)
+    pdf.ln(8)
 
     if summary:
         s = summary
-        rev     = s["rev"]
-        profit  = s["profit"]
-        loss    = s["loss"]
-        result  = s["result"]
 
-        def _row(label: str, amount_kop: int, note: str = "", bold: bool = False) -> None:
+        def _row(label: str, amount_kop: int, note: str = "",
+                 bold: bool = False, red: bool = False) -> None:
             pdf.set_x(_MARGIN)
+            if red:
+                pdf.set_text_color(190, 40, 40)
             if bold:
                 pdf.set_font("DejaVu_B", size=11)
             else:
@@ -242,39 +295,54 @@ def build_pdf(
                 val_str += f"  ({note})"
             pdf.cell(val_w, 8, val_str, align="R", new_x="LMARGIN", new_y="NEXT")
             pdf.set_font("DejaVu", size=11)
+            if red:
+                pdf.set_text_color(0, 0, 0)
+
+        rev    = s["rev"]
+        profit = s["profit"]
 
         profit_pct = f"{profit / rev * 100:.0f}%" if rev else ""
-        loss_pct   = f"{loss   / rev * 100:.1f}% от выручки" if rev else ""
+        spoil_pct  = f"{s['loss_spoil'] / rev * 100:.1f}% от выручки" if rev else ""
 
-        _row("Выручка",             rev,              "")
-        _row("Прибыль от продаж",   profit,           profit_pct)
-        _row("Расходы",             s["expenses"],    "")
-        _row("Списания",            loss,             loss_pct)
+        # N1: явная подпись методики — «по себест. МойСклад»
+        _row("Выручка",                        rev,    "")
+        _row("Прибыль (по себест. МойСклад)",  profit, profit_pct)
+        pdf.ln(2)
+
+        # N2: операционные расходы и изъятия — раздельно
+        _row("Операционные расходы",           s["op_expenses"], "")
+        if s["owner_kop"] > 0:
+            _row("Изъятия собственника",       s["owner_kop"], "не в Результате")
+
+        # N3: списания с разбивкой по типу
+        _row("Порча (розничные точки)",        s["loss_spoil"], spoil_pct)
+        if s["loss_adj"] > 0:
+            _row("Корректировки учёта (База)", s["loss_adj"], "")
 
         # Горизонтальная черта
-        pdf.ln(1)
+        pdf.ln(2)
         y_hr = pdf.get_y()
         pdf.set_draw_color(100, 100, 100)
         pdf.set_line_width(0.4)
         pdf.line(_MARGIN, y_hr, 210 - _MARGIN, y_hr)
         pdf.set_draw_color(0, 0, 0)
         pdf.set_line_width(0.2)
-        pdf.ln(2)
+        pdf.ln(3)
 
-        _row("Результат", result, "", bold=True)
+        is_loss = s["result"] < 0
+        _row("Результат (без изъятий)", s["result"], "", bold=True, red=is_loss)
         pdf.ln(4)
 
-        # Чеки
+        # Чеки — avg_check вычислен один раз в _pdf_summary (N10)
         pdf.set_font("DejaVu", size=11)
         pdf.set_x(_MARGIN)
         checks_str = (
-            f"Чеков: {s['checks']:,}".replace(",", " ")
-            + f"   ·   Средний чек: {_fmt_rub(s['avg_check'])}"
+            f"Чеков: {s['checks']:,}".replace(",", " ")
+            + f"   .   Средний чек: {_fmt_rub(s['avg_check'])}"
             if s["checks"] else "Чеков: нет данных"
         )
         pdf.cell(eff_w, 8, checks_str, align="C", new_x="LMARGIN", new_y="NEXT")
 
-        # Блок «Требует внимания»
         if s["attention"]:
             pdf.ln(5)
             pdf.set_x(_MARGIN)
@@ -286,30 +354,26 @@ def build_pdf(
                 pdf.cell(eff_w - 4, 8, f"• {item}", align="L", new_x="LMARGIN", new_y="NEXT")
 
     else:
-        # Сводка недоступна — показываем заглушку
         pdf.set_font("DejaVu", size=11)
         pdf.set_x(_MARGIN)
         pdf.set_text_color(150, 150, 150)
         pdf.cell(eff_w, 8, "Сводка периода недоступна", align="C", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
 
-    # Оглавление секций
+    # N11: оглавление — грид (N | раздел | описание), левое выравнивание
     pdf.ln(8)
-    pdf.set_font("DejaVu", size=9)
     pdf.set_text_color(110, 110, 110)
-    for s in [
-        "1. Продажи     — выручка, прибыль от продаж, топ позиций",
-        "2. Остатки     — СРЕЗКА без резерва на дату",
-        "3. Залежалые   — СРЕЗКА без движения",
-        "4. Списания    — документы с позициями",
-        "5. Расходы     — движение денег по складам",
-        "6. Клиенты     — топ и возможный отток",
-        "7. Прогноз     — заказы, спрос и что брать на фургон",
-        "8. Перемещения — движение товара между складами",
-        "9. Изменения   — удалённые и изменённые документы",
-    ]:
+    n_col    = 7
+    name_col = 36
+    desc_col = eff_w - n_col - name_col
+    for num, name, desc in _TOC_SECTIONS:
         pdf.set_x(_MARGIN)
-        pdf.cell(eff_w, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("DejaVu", size=9)
+        pdf.cell(n_col, 7, num, align="R")
+        pdf.set_font("DejaVu_B", size=9)
+        pdf.cell(name_col, 7, name, align="L")
+        pdf.set_font("DejaVu", size=9)
+        pdf.cell(desc_col, 7, desc, align="L", new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
 
     # ── Вспомогательные функции ─────────────────────────────────────────────────
@@ -335,7 +399,7 @@ def build_pdf(
                 pdf.ln(2)
                 continue
             words = cline.split()
-            cline = " ".join(w if len(w) <= 60 else w[:60] + "…" for w in words)
+            cline = " ".join(w if len(w) <= 60 else w[:60] + "..." for w in words)
             pdf.set_x(_MARGIN)
             stripped = cline.lstrip()
             is_hdr   = stripped.startswith("--") or stripped.startswith("==")
@@ -356,14 +420,12 @@ def build_pdf(
                     pass
 
     def _image_page(title: str, png: bytes) -> None:
-        """Добавить страницу с PNG-графиком."""
         pdf.add_page()
         pdf.set_x(_MARGIN)
         pdf.set_font("DejaVu_B", size=11)
         pdf.cell(eff_w, 8, title, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
         img_buf = io.BytesIO(png)
-        # Высота пропорционально ширине: исходник 1080×720 → ratio 1.5
         img_h = round(eff_w / 1.5, 1)
         try:
             pdf.image(img_buf, x=_MARGIN, w=eff_w, h=img_h)
