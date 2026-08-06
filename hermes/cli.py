@@ -265,7 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "bot":
         from .bot import run as run_bot
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)   # схема применяется один раз при старте бота
+        try:
+            db.apply_schema(conn)   # схема применяется один раз при старте бота
+        except Exception as e:
+            log.warning("apply_schema при старте не удался (%s) — продолжаю, "
+                        "схема, вероятно, уже применена; при изменениях запусти migrate", e)
         run_bot(
             conn_factory=lambda: db.connect(config.DATABASE_URL()),
             client_factory=lambda: MoyskladClient(config.MOYSKLAD_TOKEN()),
@@ -279,7 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         yesterday = today - timedelta(days=1)
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)   # один раз в начале дневного прогона (синки — без)
+        # Схему НЕ применяем: бот делает это при старте, а CREATE OR REPLACE VIEW
+        # конфликтует с работающим ботом. Миграции — командой migrate (бот стоп).
 
         # 1. Сначала синкаем ВСЕ сущности за вчера (+ остатки на сегодня).
         # Каждый синк изолирован: падение одного не останавливает остальные —

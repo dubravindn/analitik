@@ -190,6 +190,20 @@ UNION ALL
         ORDER BY product_id, day ASC
     ) earliest;
 
+-- Оптовая цена продажи «Наличка» из карточки (блок I) — asof так же, как закупочная.
+CREATE OR REPLACE VIEW nal_price_asof AS
+    SELECT product_id, day AS priced_from, (sale_prices->>'Наличка')::bigint AS price_kop
+    FROM product_price
+    WHERE (sale_prices->>'Наличка') ~ '^[0-9]+$' AND (sale_prices->>'Наличка')::bigint > 0
+UNION ALL
+    SELECT product_id, DATE '2000-01-01' AS priced_from, price_kop
+    FROM (
+        SELECT DISTINCT ON (product_id) product_id, (sale_prices->>'Наличка')::bigint AS price_kop
+        FROM product_price
+        WHERE (sale_prices->>'Наличка') ~ '^[0-9]+$' AND (sale_prices->>'Наличка')::bigint > 0
+        ORDER BY product_id, day ASC
+    ) earliest;
+
 -- Документы отгрузки (demand) для клиентской аналитики
 CREATE TABLE IF NOT EXISTS sales_doc (
     doc_id       text        PRIMARY KEY,

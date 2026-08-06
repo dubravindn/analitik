@@ -26,6 +26,10 @@ def connect(database_url: str) -> psycopg.Connection:
 def apply_schema(conn: psycopg.Connection) -> None:
     sql = _SCHEMA.read_text(encoding="utf-8")
     with conn.cursor() as cur:
+        # CREATE OR REPLACE VIEW берёт ACCESS EXCLUSIVE и может ждать вечно, если
+        # бот в этот момент читает вью. Ограничиваем ожидание — лучше явная ошибка,
+        # чем зависание (migrate тогда запускать при остановленном боте).
+        cur.execute("SET lock_timeout = '15s'")
         cur.execute(sql)
     conn.commit()
     log.info("Схема применена (idempotent)")
