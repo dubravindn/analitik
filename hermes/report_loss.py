@@ -232,7 +232,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
             lines.append("")
     else:
         ent_cnt, ent_qty, ent_kop = _ent
-    if show_inventory and (adj_cnt or ent_cnt):
+    if show_inventory and (adj_cnt or ent_cnt) and _ent is not _ENTER_MISSING:
         _inventory_block(conn, lines, d_from, d_to, adj,
                          adj_qty, adj_kop, ent_cnt, ent_qty, ent_kop)
 
