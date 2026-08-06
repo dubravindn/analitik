@@ -659,6 +659,38 @@ def _build_and_send_pdf(conn_factory, client_factory, d_from, d_to, store_name, 
             + (f" | {store_name}" if store_name else "")
         )
         tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption)
+
+        # Графики как фото после PDF (пропускаем если matplotlib не установлен)
+        try:
+            from . import charts as _charts
+            if _charts._MPL_OK:
+                _chart_specs = [
+                    (
+                        _charts.chart_revenue_by_day,
+                        (conn, d_from, d_to, store_name),
+                        "График: выручка и прибыль от продаж по дням",
+                    ),
+                    (
+                        _charts.chart_stores_compare,
+                        (conn, d_from, d_to),
+                        "График: сравнение складов",
+                    ),
+                    (
+                        _charts.chart_losses_vs_revenue,
+                        (conn, d_from, d_to, store_name),
+                        "График: выручка и списания по дням",
+                    ),
+                ]
+                for _fn, _args, _cap in _chart_specs:
+                    try:
+                        _png = _fn(*_args)
+                        if _png:
+                            tg.send_photo(bot_token, chat_id, _png, _cap)
+                    except Exception as _ex:
+                        log.warning("Не удалось отправить график '%s': %s", _cap, _ex)
+        except Exception as _ex:
+            log.warning("Ошибка импорта charts: %s", _ex)
+
         tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
     except Exception as e:
         log.exception("Ошибка PDF: %s", e)

@@ -328,6 +328,7 @@ def build_stock_report(
     conn, day: date,
     store_name: str | None = None,
     folder_group: str | None = None,
+    max_items: int | None = None,
 ) -> str:
     """Залежалые позиции: СРЕЗКА ≥N дн., прочие ≥M дн., разбивка по складам."""
     store_label = f" · {store_name}" if store_name else " · Все склады"
@@ -378,9 +379,25 @@ def build_stock_report(
             _pfx = "⚠️ " if _pct < 90 else ""
             lines.append(f"{_pfx}Наличная цена известна для {nal_pos} из {total} поз. ({_pct:.0f}% суммы)")
         lines.append("")
+
+        # Топ-max_items по стоимости (все склады вместе)
+        if max_items is not None and total > max_items:
+            # Сортируем all_items по убыванию стоимости, берём топ
+            all_sorted   = sorted(all_items, key=lambda x: x["cost_total"], reverse=True)
+            shown_idx    = {id(e) for e in all_sorted[:max_items]}
+            hidden_n     = total - max_items
+            hidden_kop   = sum(e["cost_total"] for e in all_sorted[max_items:])
+            stale_shown  = {
+                sn: [e for e in items if id(e) in shown_idx]
+                for sn, items in stale_srezka.items()
+            }
+        else:
+            stale_shown  = dict(stale_srezka)
+            hidden_n, hidden_kop = 0, 0.0
+
         order = _STORE_ORDER if not store_name else [store_name]
         for sn in order:
-            items = sorted(stale_srezka.get(sn, []), key=lambda x: x["qty"], reverse=True)
+            items = sorted(stale_shown.get(sn, []), key=lambda x: x["qty"], reverse=True)
             if not items:
                 continue
             sc = sum(e["cost_total"] for e in items)
@@ -394,6 +411,9 @@ def build_stock_report(
                     f"{_two_price(e['cost_unit'], e['nal_unit'])} · {tail}"
                 )
             lines.append("")
+
+        if hidden_n:
+            lines.append(f"  … и ещё {hidden_n} поз. · {_rub(hidden_kop)} ₽ (полный список в PDF)")
 
     if not stale_srezka:
         lines.append("✅ Залежалой СРЕЗКИ нет.")

@@ -112,7 +112,11 @@ def build_cashflow_report(conn, d_from: date, d_to: date) -> str:
     return "\n".join(lines)
 
 
-def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
+def build_expenses_report(
+    conn, d_from: date, d_to: date,
+    store_name: str | None = None,
+    max_items: int | None = None,
+) -> str:
     """Расходы: только исходящие платежи (cashout + paymentout) со статьёй расходов."""
     period_str = (
         d_from.strftime("%d.%m.%Y") if d_from == d_to
@@ -199,11 +203,20 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
         tree.setdefault(item, []).append((moment, doc_type, agent, desc, project, amount))
         item_total[item] = item_total.get(item, 0.0) + float(amount)
 
+    sorted_items = sorted(item_total, key=lambda k: -item_total[k])
+
+    if max_items is not None and len(sorted_items) > max_items:
+        hidden_items = sorted_items[max_items:]
+        hidden_kop   = sum(item_total[k] for k in hidden_items)
+        sorted_items = sorted_items[:max_items]
+    else:
+        hidden_items, hidden_kop = [], 0.0
+
     lines.append("── 💸 По статьям (статья → документы) ──")
-    for item in sorted(item_total, key=lambda k: -item_total[k]):
-        docs = tree[item]
-        lines.append(f"▸ {item}: {_rub(item_total[item])} ₽ ({len(docs)} опер.)")
-        for moment, doc_type, agent, desc, project, amount in docs:
+    for item in sorted_items:
+        docs_item = tree[item]
+        lines.append(f"▸ {item}: {_rub(item_total[item])} ₽ ({len(docs_item)} опер.)")
+        for moment, doc_type, agent, desc, project, amount in docs_item:
             dt = (moment.strftime("%d.%m %H:%M")
                   if hasattr(moment, "strftime") else str(moment)[:16])
             ch = "Касса" if doc_type == "cashout" else "Банк"
@@ -219,5 +232,10 @@ def build_expenses_report(conn, d_from: date, d_to: date, store_name: str | None
                 line += " · " + " | ".join(tail)
             lines.append(line)
         lines.append("")
+
+    if hidden_items:
+        lines.append(
+            f"… и ещё {len(hidden_items)} статей · {_rub(hidden_kop)} ₽ (полный список в PDF)"
+        )
 
     return "\n".join(lines).rstrip()

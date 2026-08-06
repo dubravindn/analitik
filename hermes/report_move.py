@@ -200,9 +200,19 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
 
     total_docs = len(docs)
     if max_docs is not None and total_docs > max_docs:
-        docs = docs[-max_docs:]   # последние N (самые свежие)
-        lines.append(f"── Документы: показаны {max_docs} из {total_docs} "
-                     f"(полный список — в PDF) ──")
+        hidden_docs = docs[:total_docs - max_docs]
+        docs        = docs[total_docs - max_docs:]
+        hidden_ids  = [d[0] for d in hidden_docs]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(total_kop), 0) FROM move_item WHERE doc_id = ANY(%s)",
+                [hidden_ids],
+            )
+            hidden_kop = float(cur.fetchone()[0] or 0)
+        lines.append(
+            f"── Документы: показаны {max_docs} из {total_docs} "
+            f"(и ещё {total_docs - max_docs} докум. · {_rub(hidden_kop)} ₽ — полный список в PDF) ──"
+        )
     else:
         lines.append(f"── Все документы ({total_docs}) ──")
     lines.append("")

@@ -353,9 +353,20 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
 
     total_docs = len(docs)
     if max_docs is not None and total_docs > max_docs:
-        docs = docs[-max_docs:]   # последние N (самые свежие)
-        lines.append(f"── Документы: показаны {max_docs} из {total_docs} "
-                     f"(полный список — в PDF) ──")
+        hidden_docs = docs[:total_docs - max_docs]   # старые (скрываем)
+        docs        = docs[total_docs - max_docs:]   # последние N
+        # Быстрая оценка стоимости скрытых документов по total_kop (МойСклад-cost)
+        hidden_ids  = tuple(d[0] for d in hidden_docs)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(total_kop), 0) FROM loss_item WHERE doc_id = ANY(%s)",
+                [list(hidden_ids)],
+            )
+            hidden_kop = float(cur.fetchone()[0] or 0)
+        lines.append(
+            f"── Документы: показаны {max_docs} из {total_docs} "
+            f"(и ещё {total_docs - max_docs} докум. · {_rub(hidden_kop)} ₽ — полный список в PDF) ──"
+        )
     else:
         lines.append(f"── Все документы ({total_docs}) ──")
     lines.append("")

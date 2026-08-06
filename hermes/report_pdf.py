@@ -398,11 +398,11 @@ def build_pdf(
 
     # ── Секция 3: Залежалые ───────────────────────────────────────────────────
     from .report_stock import build_stock_report
-    _section("3. ЗАЛЕЖАЛЫЕ (СРЕЗКА)", build_stock_report(conn, d_to, store_name, "СРЕЗКА"))
+    _section("3. ЗАЛЕЖАЛЫЕ (СРЕЗКА)", build_stock_report(conn, d_to, store_name, "СРЕЗКА", max_items=20))
 
     # ── Секция 4: Списания ────────────────────────────────────────────────────
     from .report_loss import build_loss_report
-    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name, max_docs=None))
+    _section("4. СПИСАНИЯ", build_loss_report(conn, d_from, d_to, store_name, max_docs=15))
 
     if _charts_ok:
         try:
@@ -414,7 +414,7 @@ def build_pdf(
 
     # ── Секция 5: Расходы ─────────────────────────────────────────────────────
     from .report_cashflow import build_expenses_report
-    _section("5. РАСХОДЫ", build_expenses_report(conn, d_from, d_to, store_name))
+    _section("5. РАСХОДЫ", build_expenses_report(conn, d_from, d_to, store_name, max_items=20))
 
     # ── Секция 6: Клиенты ─────────────────────────────────────────────────────
     from .report_clients import build_clients_report
@@ -430,7 +430,7 @@ def build_pdf(
 
     # ── Секция 8: Перемещения ─────────────────────────────────────────────────
     from .report_move import build_move_report
-    _section("8. ПЕРЕМЕЩЕНИЯ", build_move_report(conn, d_from, d_to, store_name, max_docs=None))
+    _section("8. ПЕРЕМЕЩЕНИЯ", build_move_report(conn, d_from, d_to, store_name, max_docs=15))
 
     # ── Секция 9: Изменения ───────────────────────────────────────────────────
     from .report_audit import build_audit_report

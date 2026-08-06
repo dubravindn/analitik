@@ -128,6 +128,51 @@ def input_dates_keyboard() -> dict:
     }
 
 
+def send_photo(
+    bot_token: str,
+    chat_id: str,
+    data: bytes,
+    caption: str = "",
+) -> dict:
+    """Отправить PNG/JPEG как фото через sendPhoto (multipart/form-data)."""
+    import uuid
+    boundary = "----HermesBoundary" + uuid.uuid4().hex
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode("utf-8")
+
+    body_parts: list[bytes] = [_field("chat_id", str(chat_id))]
+    if caption:
+        body_parts.append(_field("caption", caption[:1024]))
+    body_parts.append((
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode("ascii"))
+    body_parts.append(data)
+    body_parts.append(f"\r\n--{boundary}--\r\n".encode("ascii"))
+
+    body = b"".join(body_parts)
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body_err = e.read().decode(errors="replace")
+        raise RuntimeError(f"Telegram sendPhoto HTTP {e.code}: {body_err}") from e
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram sendPhoto ошибка: {result}")
+    return result
+
+
 def send_document(
     bot_token: str,
     chat_id: str,
