@@ -276,7 +276,7 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         top_rev = cur.fetchall()
 
     if top_rev:
-        lines.append("🏆 Топ-20 по выручке:")
+        lines.append(f"🏆 Топ-{len(top_rev)} по выручке:")
         for i, (name, qty, rev, pcost, uncov) in enumerate(top_rev, 1):
             rev = int(rev or 0); profit = rev - int(pcost or 0)
             mg = profit / rev * 100 if rev else 0

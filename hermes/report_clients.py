@@ -87,7 +87,7 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
         top = cur.fetchall()
 
     if top:
-        lines.append("🏆 Топ-20 клиентов:")
+        lines.append(f"🏆 Топ-{len(top)} клиентов:")
         suspect = False
         for i, (name, orders, rev) in enumerate(top, 1):
             avg = float(rev) / orders if orders else 0

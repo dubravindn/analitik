@@ -239,6 +239,24 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         """, p)
         total_nal_kop = float(cur.fetchone()[0] or 0)
 
+    # I9: покрытие закупочными ценами из карточки (как в продажах/остатках/перемещениях).
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM(CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0
+                                     THEN round(i.qty * pp.price_kop) ELSE 0 END), 0),
+                   COALESCE(SUM({_LS_TOTAL}), 0)
+            {_LS_JOIN}
+            WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
+        """, p)
+        _cov_row = cur.fetchone()
+    _cov_kop = float(_cov_row[0] or 0) if _cov_row else 0.0
+    _all_kop = float(_cov_row[1] or 0) if _cov_row else 0.0
+    if _all_kop:
+        cov = _cov_kop / _all_kop * 100
+        lines.append(f"По закупочным ценам: {cov:.0f}% стоимости · "
+                     f"МойСклад: {100 - cov:.0f}% (нет закупочной в карточке)")
+        lines.append("")
+
     # Разбивка по складам
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -276,7 +294,7 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         top = cur.fetchall()
 
     if top:
-        lines.append("🏆 Топ-10 по сумме списания:")
+        lines.append(f"🏆 Топ-{len(top)} по сумме списания:")
         for i, (name, qty, kop) in enumerate(top, 1):
             lines.append(f"  {i:2}. {name}: {_qty(float(qty))} ед. · {_rub(float(kop))} ₽")
         lines.append("")
