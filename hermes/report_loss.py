@@ -68,16 +68,29 @@ _ASSORT = ("i.product_id IN (SELECT product_id FROM product_dim "
            "WHERE folder_path LIKE 'Ассортимент/%%')")
 
 
+_ENTER_MISSING = None  # sentinel: enter_doc не существует в БД
+
+
 def _enter_summary(conn, d_from, d_to, adj):
-    """Сводка оприходований Базы (Ассортимент), той же методикой цены."""
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COUNT(DISTINCT d.doc_id), COALESCE(SUM(i.qty), 0),
-                   COALESCE(SUM({_EN_TOTAL}), 0)
-            {_EN_JOIN}
-            WHERE d.day BETWEEN %s AND %s AND {_ASSORT} AND d.store_name = ANY(%s)
-        """, [d_from, d_to, adj])
-        return cur.fetchone()
+    """Сводка оприходований Базы (Ассортимент), той же методикой цены.
+
+    Возвращает (cnt, qty, kop) или _ENTER_MISSING, если таблица ещё не создана.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(DISTINCT d.doc_id), COALESCE(SUM(i.qty), 0),
+                       COALESCE(SUM({_EN_TOTAL}), 0)
+                {_EN_JOIN}
+                WHERE d.day BETWEEN %s AND %s AND {_ASSORT} AND d.store_name = ANY(%s)
+            """, [d_from, d_to, adj])
+            return cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return _ENTER_MISSING
 
 
 def _inventory_block(conn, lines, d_from, d_to, adj, adj_qty, adj_kop,
@@ -210,7 +223,15 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # J2: полный блок инвентаризации Базы (списания + оприходования в обе стороны).
     # Показываем, когда склад не выбран или выбрана сама База.
     show_inventory = (not store_name) or (store_name in adj)
-    ent_cnt, ent_qty, ent_kop = _enter_summary(conn, d_from, d_to, adj)
+    _ent = _enter_summary(conn, d_from, d_to, adj)
+    if _ent is _ENTER_MISSING:
+        ent_cnt, ent_qty, ent_kop = 0, 0, 0
+        if show_inventory:
+            lines.append("ℹ️ Оприходования: данные не загружены — запустите sync-enter "
+                         "(или python -m hermes migrate).")
+            lines.append("")
+    else:
+        ent_cnt, ent_qty, ent_kop = _ent
     if show_inventory and (adj_cnt or ent_cnt):
         _inventory_block(conn, lines, d_from, d_to, adj,
                          adj_qty, adj_kop, ent_cnt, ent_qty, ent_kop)
