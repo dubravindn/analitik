@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("whoami", help="Проверить доступ к МойСклад")
     sub.add_parser("init-db", help="Создать/обновить таблицы в БД")
+    sub.add_parser("migrate", help="Применить схему (индексы) — отдельно от синков")
 
     p_sync = sub.add_parser("sync", help="Выгрузить продажи за период")
     p_sync.add_argument("--from", dest="d_from", required=True, type=_parse_date)
@@ -145,16 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Доступ есть. Сотрудник: {me.get('name')} | accountId: {me.get('accountId')}")
         return 0
 
-    if args.cmd == "init-db":
+    if args.cmd in ("init-db", "migrate"):
         conn = db.connect(config.DATABASE_URL())
         db.apply_schema(conn)
-        print("Схема готова.")
+        print("Схема применена.")
         return 0
 
     if args.cmd == "sync":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         log.info("Старт выгрузки продаж %s..%s", args.d_from, args.d_to)
         run_sync(client, conn, args.d_from, args.d_to)
         print(f"Выгрузка завершена: {args.d_from}..{args.d_to}")
@@ -163,7 +163,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-stock":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         snap_date = args.d or config.msk_today()
         n = run_sync_stock(client, conn, snap_date)
         print(f"Снимок остатков на {snap_date}: {n} позиций")
@@ -192,7 +191,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-loss":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_loss(client, conn, args.d_from, args.d_to)
         print(f"Выгружено списаний: {n} документов за {args.d_from}..{args.d_to}")
         return 0
@@ -200,7 +198,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-supply":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_supply(client, conn, args.d_from, args.d_to)
         print(f"Выгружено поставок: {n} документов за {args.d_from}..{args.d_to}")
         return 0
@@ -208,7 +205,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-cashflow":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_cashflow(client, conn, args.d_from, args.d_to)
         print(f"Выгружено платежей: {n} событий за {args.d_from}..{args.d_to}")
         return 0
@@ -216,7 +212,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-clients":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_clients(client, conn, args.d_from, args.d_to)
         print(f"Выгружено отгрузок: {n} документов за {args.d_from}..{args.d_to}")
         return 0
@@ -224,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-prices":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_prices(client, conn, args.d or config.msk_today())
         print(f"Снимок цен: {n} товаров")
         return 0
@@ -232,7 +226,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync-move":
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         n = run_sync_move(client, conn, args.d_from, args.d_to)
         print(f"Выгружено перемещений: {n} документов за {args.d_from}..{args.d_to}")
         return 0
@@ -266,14 +259,13 @@ def main(argv: list[str] | None = None) -> int:
         from .report_forecast import build_forecast_report
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn   = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
         print(build_forecast_report(client, conn))
         return 0
 
     if args.cmd == "bot":
         from .bot import run as run_bot
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
+        db.apply_schema(conn)   # схема применяется один раз при старте бота
         run_bot(
             conn_factory=lambda: db.connect(config.DATABASE_URL()),
             client_factory=lambda: MoyskladClient(config.MOYSKLAD_TOKEN()),
@@ -287,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         yesterday = today - timedelta(days=1)
         client = MoyskladClient(config.MOYSKLAD_TOKEN())
         conn = db.connect(config.DATABASE_URL())
-        db.apply_schema(conn)
+        db.apply_schema(conn)   # один раз в начале дневного прогона (синки — без)
 
         # 1. Сначала синкаем ВСЕ сущности за вчера (+ остатки на сегодня).
         # Каждый синк изолирован: падение одного не останавливает остальные —

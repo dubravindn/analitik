@@ -184,6 +184,13 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
                         "📋 Меню восстановлено.", tg.main_reply_keyboard())
         return
 
+    # ── Снять залипший флаг выгрузки вручную ──
+    if norm in ("/unlock", "/разблокировать"):
+        synclock.clear()
+        tg.send_message(bot_token, chat_id,
+                        "🔓 Флаг выгрузки снят. Отчёты доступны.", tg.main_reply_keyboard())
+        return
+
     # ── Помощь ──
     if norm in ("❓ помощь", "/помощь", "/help", "помощь"):
         _clear_state(chat_id)
@@ -350,21 +357,25 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     store_name   = params.get("store_name")    # None = все склады
     folder_group = params.get("folder_group")  # None = все группы
 
-    # Идёт фоновая выгрузка? Предупреждаем (данные могут быть неполными). Для PDF
-    # (тяжёлая ленивая догрузка, контенция с синком) — не запускаем вовсе.
+    # Идёт фоновая выгрузка? Тяжёлые секции (PDF, прогноз — контенция с синком)
+    # не запускаем; лёгкие (продажи/остатки/клиенты — читают готовые таблицы)
+    # пускаем с пометкой о возможной неполноте.
     sc = synclock.active()
     if sc:
         name, mins = sc
+        if section in ("pdf", "forecast"):
+            tg.send_message(
+                bot_token, chat_id,
+                f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
+                f"«{section}» пока не собираю, чтобы не зависнуть — повтори чуть позже "
+                f"(или /unlock, если синк точно завершён).",
+                tg.main_reply_keyboard(),
+            )
+            return
         tg.send_message(
             bot_token, chat_id,
-            f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
-            f"Отчёт может быть неточным — попробуй через несколько минут.",
+            f"⚠️ Данные могут быть неполными — идёт обновление ({name}, ~{mins} мин).",
         )
-        if section == "pdf":
-            tg.send_message(bot_token, chat_id,
-                            "PDF пока не собираю, чтобы не зависнуть. Повтори чуть позже.",
-                            tg.main_reply_keyboard())
-            return
 
     # Для audit — нет фильтра по складу
     if section == "audit":
