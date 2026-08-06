@@ -107,6 +107,7 @@ def build_pdf(
         "6. Клиенты     — топ и возможный отток",
         "7. Прогноз     — ближайшая поставка и циклы",
         "8. Перемещения — движение товара между складами",
+        "9. Изменения   — удалённые и изменённые документы",
     ]:
         pdf.set_x(_MARGIN)
         pdf.cell(eff_w, 7, s, align="C", new_x="LMARGIN", new_y="NEXT")
@@ -203,5 +204,13 @@ def build_pdf(
     # ── Секция 8: Перемещения (полный список — max_docs=None) ──────────────────
     from .report_move import build_move_report
     _section("8. ПЕРЕМЕЩЕНИЯ", build_move_report(conn, d_from, d_to, store_name, max_docs=None))
+
+    # ── Секция 9: Изменения и удаления (live-данные из МойСклад) ───────────────
+    from .report_audit import build_audit_report
+    try:
+        audit_text = build_audit_report(client, d_from, d_to)
+    except Exception as e:
+        audit_text = f"Не удалось получить аудит изменений: {e}"
+    _section("9. ИЗМЕНЕНИЯ И УДАЛЕНИЯ", audit_text)
 
     return bytes(pdf.output())
