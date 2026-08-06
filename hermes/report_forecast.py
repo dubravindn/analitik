@@ -313,7 +313,9 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
         """, (win_from, win_to))
         sales = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
-        # Списания по product_id (не по имени!), без служебных sentinel-позиций.
+        # Списания = порча по product_id (не по имени!), без служебных sentinel и
+        # БЕЗ инвентаризационных корректировок Базы (ADJUSTMENT_STORES, H2) —
+        # иначе корректировки учёта раздувают «порчу» до 50-70%.
         cur.execute("""
             SELECT li.product_id, SUM(li.qty)
             FROM loss_item li
@@ -321,8 +323,9 @@ def build_sku_forecast(conn, orders_by_pid: dict, today: date, avg_cycle: int,
             WHERE ld.day BETWEEN %s AND %s
               AND li.product_id IS NOT NULL AND li.product_id != ''
               AND li.qty < %s
+              AND NOT (ld.store_name = ANY(%s))
             GROUP BY li.product_id
-        """, (win_from, win_to, _SENTINEL_QTY))
+        """, (win_from, win_to, _SENTINEL_QTY, config.ADJUSTMENT_STORES))
         loss = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
         cur.execute("""
