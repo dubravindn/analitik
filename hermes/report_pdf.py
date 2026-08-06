@@ -46,7 +46,7 @@ def _fmt_rub(kop: int) -> str:
 def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict:
     """Сводка периода для титульной страницы PDF. Все суммы в копейках."""
     from .report_stock import STALE_SREZKA_MIN_DAYS
-    from . import config as _cfg
+    from . import config as _cfg, calc
 
     adj = _cfg.ADJUSTMENT_STORES or ["__none__"]
     own = getattr(_cfg, "OWNER_EXPENSE_ITEMS", []) or []
@@ -124,7 +124,7 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
 
     loss      = loss_spoil + loss_adj
     result    = profit - op_expenses - loss
-    avg_check = rev // checks if checks else 0
+    avg_check = calc.avg_check(rev, checks)  # M1: единая формула round(), как в report_sales
 
     # 4. «Требует внимания» ────────────────────────────────────────────────────
     attention: list[str] = []
@@ -158,7 +158,7 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             """, p_ss)
             sr = cur.fetchone() or (0, 0)
         stale_cnt = int(sr[0] or 0)
-        stale_kop = int(sr[1] or 0)
+        stale_kop = round(sr[1] or 0)  # M2: round() как в _rub() report_stock
         if stale_cnt > 0:
             attention.append(
                 f"Залежалая СРЕЗКА: {_fmt_rub(stale_kop)} ({stale_cnt} поз.)"

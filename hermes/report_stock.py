@@ -256,6 +256,9 @@ def build_stock_by_qty(
             )
         lines.append("")
 
+    lines.append("─" * 33)
+    lines.append("Остатки по складам — весь ассортимент (не только СРЕЗКА, с учётом резерва)")
+    lines.append("")
     _render_stock_by_store(conn, lines, day, _STORE_ORDER)
 
     return "\n".join(lines)
