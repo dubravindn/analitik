@@ -70,6 +70,10 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     )
     lines = [f"🔍 Изменения документов за {period_str}", ""]
 
+    if client is None:
+        lines.append("⚠️ МойСклад недоступен — данные об изменениях не получены.")
+        return "\n".join(lines)
+
     # ── Удалённые (deletedMoment в периоде) ─────────────────────────────────────
     del_flt = (
         f"deletedMoment>={d_from.isoformat()} 00:00:00;"
@@ -101,13 +105,22 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     modified: list[tuple] = []   # (moment_day, updated_day, label, loc, sum_kop, who)
     for doc_type, label in _DOC_TYPES.items():
         try:
-            resp = client._get(f"/entity/{doc_type}", {
-                "filter": doc_flt,
-                "limit": 100,
-                "order": "moment,asc",
-                "expand": "store,project,owner",
-            })
-            rows = resp.get("rows", [])
+            rows: list[dict] = []
+            offset = 0
+            while True:
+                resp = client._get(f"/entity/{doc_type}", {
+                    "filter": doc_flt,
+                    "limit": 100,
+                    "offset": offset,
+                    "order": "moment,asc",
+                    "expand": "store,project,owner",
+                })
+                batch = resp.get("rows", [])
+                rows.extend(batch)
+                size = resp.get("meta", {}).get("size", 0)
+                offset += len(batch)
+                if not batch or offset >= size:
+                    break
         except Exception:
             continue
         for r in rows:

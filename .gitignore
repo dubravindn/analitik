@@ -15,3 +15,6 @@ venv/
 logs/
 *.log
 .DS_Store
+
+# Граф проекта (graphify) — пересобирается локально: graphify update .
+graphify-out/

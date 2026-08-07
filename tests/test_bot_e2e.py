@@ -51,16 +51,13 @@ _tg.send_document = _mock_send_document
 # ── 2. Основные импорты ───────────────────────────────────────────────────
 from hermes import config          # noqa: E402
 from hermes import bot             # noqa: E402
+from hermes import db as _db       # noqa: E402  # db.connect() ставит Europe/Moscow
 from hermes.moysklad import MoyskladClient  # noqa: E402
-
-try:
-    import psycopg as _pg          # noqa: E402  # сервер: psycopg v3
-except ImportError:
-    import psycopg2 as _pg         # noqa: E402  # local macOS fallback
 
 # ── 3. Фабрики ───────────────────────────────────────────────────────────
 def conn_factory():
-    return _pg.connect(config.DATABASE_URL())
+    # db.connect() устанавливает SET TIME ZONE 'Europe/Moscow' (R3: фикс таймзоны).
+    return _db.connect(config.DATABASE_URL())
 
 
 def client_factory():
@@ -88,6 +85,14 @@ def _upd(text: str) -> dict:
 def _h(text: str) -> None:
     bot._handle(_upd(text), conn_factory, client_factory, _BOT_TOKEN, _CHAT_ID)
 
+
+# ── 4b. Маркеры ошибок (контент-ассерты) ──────────────────────────────────
+_ERROR_MARKERS = (
+    "Не удалось построить",
+    "NoneType",
+    "Traceback",
+    "object has no attribute",
+)
 
 # ── 5. Список кнопок с шагами диалога ────────────────────────────────────
 # steps — порядок шагов; ответы ниже.
@@ -142,8 +147,44 @@ def run_button(label: str, section: str, steps: list[str]) -> dict:
 
         is_error = "⚠️ Ошибка" in last
 
+        # Контент-ассерты: смысловые ошибки без исключения ────────────────
+        error_reason = ""
+        if not is_error:
+            all_text = "\n".join(texts)
+            for marker in _ERROR_MARKERS:
+                if marker in all_text:
+                    is_error = True
+                    error_reason = f"маркер ошибки: «{marker}»"
+                    break
+
+        if not is_error and not error_reason:
+            if section == "forecast":
+                # Прогноз должен содержать минимум 3 из 5 блоков (═══)
+                block_count = all_text.count("═══")
+                if block_count < 6:  # каждый блок — 2 вхождения "═══"
+                    is_error = True
+                    error_reason = f"прогноз неполный ({block_count//2} блоков)"
+            elif section == "audit":
+                # Либо найдены документы, либо явное «нет»
+                audit_ok = (
+                    "ИЗМЕНЁННЫЕ" in all_text
+                    or "УДАЛЁННЫЕ" in all_text
+                    or "нет" in all_text.lower()
+                    or "недоступ" in all_text.lower()
+                )
+                if not audit_ok:
+                    is_error = True
+                    error_reason = "непонятный ответ (нет ни данных, ни «нет»)"
+            elif section == "pdf":
+                if not docs:
+                    is_error = True
+                    error_reason = "PDF не создан"
+                elif docs[0]["kb"] < 50:
+                    is_error = True
+                    error_reason = f"PDF слишком мал ({docs[0]['kb']} КБ < 50 КБ)"
+
         if is_error:
-            status = "❌ Ошибка"
+            status = "❌ Ошибка" + (f" ({error_reason})" if error_reason else "")
         elif docs:
             status = f"✅ OK (PDF {docs[0]['kb']} КБ, {elapsed:.0f}с)"
         elif photos:

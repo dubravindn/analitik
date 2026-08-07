@@ -55,6 +55,9 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
     p_sd  = [d_from, d_to] + ([store_name] if store_name else [])
 
     # 1. Выручка, себестоимость МойСклад (N1: методика зафиксирована явно), чеки
+    # M1: фильтр по channel совпадает с report_sales (только бизнес-каналы),
+    # иначе avg_check расходится на 1 ₽ если в БД есть строки с channel=NULL.
+    _known_channels = ["розница", "опт", "ресторан"]
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(revenue_kop), 0),
@@ -62,7 +65,8 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
                    COALESCE(SUM(checks), 0)
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s {sf_sd}
-        """, p_sd)
+              AND channel = ANY(%s)
+        """, p_sd + [_known_channels])
         r = cur.fetchone() or (0, 0, 0)
     rev    = int(r[0])
     cost   = int(r[1])
@@ -146,7 +150,8 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
                     ORDER BY p.priced_from DESC LIMIT 1
                 ) pp ON true
                 WHERE ss.day = %s
-                  AND ss.is_srezka
+                  AND ss.folder_path LIKE 'Ассортимент/%%'
+                  AND SPLIT_PART(ss.folder_path, '/', 2) = 'СРЕЗКА'
                   AND ss.stock_qty > 0
                   AND ss.reserve_qty = 0
                   {sf_ss}

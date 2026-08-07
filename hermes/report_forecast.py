@@ -305,15 +305,19 @@ def build_forecast_report(client: MoyskladClient, conn) -> str:
 
     _log_sentinel_positions(conn)
 
-    project_href = _find_project_href(client)
-    state_href   = _find_state_href(client)
     orders_by_pid: dict = {}
-    if project_href:
-        orders_by_pid = _orders_detail(client, project_href, state_href)
-    else:
-        lines.append(f"⚠️ Проект «{_PROJECT_KEYWORD}» в МойСклад не найден — "
-                     f"блоки заказов пустые.")
+    if client is None:
+        lines.append(f"⚠️ МойСклад недоступен — блоки заказов пустые.")
         lines.append("")
+    else:
+        project_href = _find_project_href(client)
+        state_href   = _find_state_href(client)
+        if project_href:
+            orders_by_pid = _orders_detail(client, project_href, state_href)
+        else:
+            lines.append(f"⚠️ Проект «{_PROJECT_KEYWORD}» в МойСклад не найден — "
+                         f"блоки заказов пустые.")
+            lines.append("")
 
     data = _gather(conn, today, orders_by_pid)
     items = data["items"]

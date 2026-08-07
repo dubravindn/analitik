@@ -78,7 +78,9 @@ def _render_stock_by_store(conn, lines, day, order):
     Единый sentinel-фильтр stock_qty < 9999 (тот же, что в прогнозе) — иначе
     служебные заглушки (лента 509 979, шары 9 999) искажают итог.
     """
-    lines.append("── ОСТАТКИ ПО СКЛАДАМ (товар «Ассортимент», закуп. цены) ──")
+    lines.append("")
+    lines.append("── ОСТАТКИ ПО СКЛАДАМ (Ассортимент, все группы) ──")
+    lines.append("(другой срез: весь Ассортимент без фильтра по группе и без исключения резервов)")
     with conn.cursor() as cur:
         for sn in order:
             cur.execute(f"""

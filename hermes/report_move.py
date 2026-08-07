@@ -76,6 +76,7 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     lines: list[str] = []
     lines.append(f"🔄 Перемещения {period_str}{store_label}")
     lines.append("Суммы в закупочных ценах из карточки товара.")
+    lines.append("* себестоимость МойСклад — нет закупочной цены в карточке")
 
     # Сводка (учитываем документ, если он касается выбранного склада как источник ИЛИ приёмник)
     store_cond = ""
