@@ -70,7 +70,7 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
                 FROM stock_snapshot {_ST_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
                   AND store_name = %s AND folder_path LIKE %s
-            """, _disc() + [day, sn, "Ассортимент/%"])
+            """, _disc() + [day, sn, "Ассортимент/СРЕЗКА/%"])
             r = cur.fetchone()
             if not r or not r[0]:
                 continue
@@ -81,25 +81,21 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
             grand_kop += kop
             store_rows.append([sn, str(pos), _qty(qty), _rub(kop) + " ₽"])
 
-    # 2. Топ-10 — только ассортимент, pids через ANY(%s) чтобы WHERE точно применился
-    a_pids = calc.assortment_product_ids(conn)
+    # 2. Топ-10 — только СРЕЗКА
     with conn.cursor() as cur:
-        if a_pids:
-            cur.execute(f"""
-                SELECT product_name,
-                       SUM(stock_qty)   AS total_qty,
-                       MAX({_stu})      AS cost_unit,
-                       SUM({_stv})      AS cost_total
-                FROM stock_snapshot {_ST_JOIN}
-                WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
-                  AND stock_snapshot.product_id = ANY(%s::text[])
-                GROUP BY product_name
-                ORDER BY cost_total DESC
-                LIMIT 10
-            """, _disc(2) + [day, a_pids])
-            top_rows = cur.fetchall()
-        else:
-            top_rows = []
+        cur.execute(f"""
+            SELECT product_name,
+                   SUM(stock_qty)   AS total_qty,
+                   MAX({_stu})      AS cost_unit,
+                   SUM({_stv})      AS cost_total
+            FROM stock_snapshot {_ST_JOIN}
+            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
+              AND folder_path LIKE %s
+            GROUP BY product_name
+            ORDER BY cost_total DESC
+            LIMIT 10
+        """, _disc(2) + [day, "Ассортимент/СРЕЗКА/%"])
+        top_rows = cur.fetchall()
 
     # 3. Залежалые СРЕЗКА > 14 дней — сортировка по сумме DESC внутри склада
     with conn.cursor() as cur:
@@ -116,9 +112,8 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
             FROM stock_snapshot {_ST_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
               AND folder_path LIKE %s
-              AND SPLIT_PART(folder_path, '/', 2) = 'СРЕЗКА'
             ORDER BY store_name, cost_total DESC
-        """, _disc(2) + [day, "Ассортимент/%"])
+        """, _disc(2) + [day, "Ассортимент/СРЕЗКА/%"])
         snap_rows = cur.fetchall()
 
     stale_by_store: dict[str, list] = {}
@@ -145,7 +140,7 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
     pk.cover(pdf, f"Остатки  ·  {day.strftime('%d.%m.%Y')}")
 
     # Таблица по складам
-    pk.section_header(pdf, "Остатки по складам  ·  Ассортимент, без резерва")
+    pk.section_header(pdf, "Остатки по складам  ·  СРЕЗКА, без резерва")
     pk.table(
         pdf,
         headers=["Склад", "Позиций", "Кол-во", "Сумма закуп."],
@@ -164,9 +159,7 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
     ])
 
     # Топ-10 — только ассортимент
-    pk.section_header(
-        pdf, "Топ-10 позиций по закупочной стоимости  ·  Ассортимент"
-    )
+    pk.section_header(pdf, "Топ-10 СРЕЗКИ по закупочной стоимости")
     pk.table(
         pdf,
         headers=["Название", "Кол-во", "Цена закуп.", "Сумма"],
