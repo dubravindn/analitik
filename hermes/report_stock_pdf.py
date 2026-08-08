@@ -11,6 +11,9 @@ from hermes.report_stock import (
 # Порог залежалости для PDF-отчёта (в тексте report_stock.py — 5 дней).
 _STALE_MIN_DAYS = 14
 
+# Розничные точки для залежалых (База — только хранение, не показываем).
+_RETAIL_STORES = frozenset(s for s in _STORE_ORDER if "База" not in s)
+
 
 def _rub(kop: float) -> str:
     return f"{int(kop) // 100:,}".replace(",", " ")
@@ -81,21 +84,36 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
             grand_kop += kop
             store_rows.append([sn, str(pos), _qty(qty), _rub(kop) + " ₽"])
 
-    # 2. Топ-10 — только СРЕЗКА
+    # 2. Топ-15 продаж СРЕЗКА — свой по каждому складу за период
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT product_name,
-                   SUM(stock_qty)   AS total_qty,
-                   MAX({_stu})      AS cost_unit,
-                   SUM({_stv})      AS cost_total
-            FROM stock_snapshot {_ST_JOIN}
-            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
-              AND folder_path LIKE %s
-            GROUP BY product_name
-            ORDER BY cost_total DESC
-            LIMIT 10
-        """, _disc(2) + [day, "Ассортимент/СРЕЗКА/%"])
-        top_rows = cur.fetchall()
+        cur.execute(
+            "SELECT DISTINCT store_name, store_id FROM sales_by_store_day"
+            " WHERE store_name = ANY(%s::text[])",
+            ([list(_STORE_ORDER)],)
+        )
+        _sid_map = {r[0]: r[1] for r in cur.fetchall()}
+
+    top_by_store: dict[str, list] = {}
+    for _sn in _STORE_ORDER:
+        _sid = _sid_map.get(_sn)
+        if not _sid:
+            continue
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT spd.product_name, SUM(spd.sell_qty) AS qty
+                FROM sales_by_product_day spd
+                JOIN product_dim pd ON pd.product_id = spd.assortment_id
+                WHERE spd.day BETWEEN %s AND %s
+                  AND spd.store_id = %s
+                  AND pd.folder_path LIKE %s
+                  AND spd.sell_qty > 0
+                GROUP BY spd.product_name
+                ORDER BY qty DESC
+                LIMIT 15
+            """, [date_from, date_to, _sid, "Ассортимент/СРЕЗКА/%"])
+            _rows = cur.fetchall()
+        if _rows:
+            top_by_store[_sn] = [(r[0], float(r[1])) for r in _rows]
 
     # 3. Залежалые СРЕЗКА > 14 дней — сортировка по сумме DESC внутри склада
     with conn.cursor() as cur:
@@ -119,6 +137,8 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
     stale_by_store: dict[str, list] = {}
     has_no_history = False
     for sname, pname, qty, _cu, cost_total in snap_rows:
+        if sname not in _RETAIL_STORES:
+            continue
         last      = last_sales.get(pname)
         days_idle = (day - last).days if last else 9999
         if days_idle <= _STALE_MIN_DAYS:
@@ -158,29 +178,26 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
         ("Заморожено",        _rub(stale_total_kop),    "₽"),
     ])
 
-    # Топ-10 — только ассортимент
-    pk.section_header(pdf, "Топ-10 СРЕЗКИ по закупочной стоимости")
-    pk.table(
-        pdf,
-        headers=["Название", "Кол-во", "Цена закуп.", "Сумма"],
-        rows=[
-            [
-                name,
-                _qty(float(qty or 0)),
-                (_rub(float(cu)) + " ₽") if cu else "—",
-                _rub(float(ct or 0)) + " ₽",
-            ]
-            for name, qty, cu, ct in top_rows
-        ],
-        col_widths=[90, 24, 30, 30],
-        aligns=["L", "R", "R", "R"],
-    )
+    # Топ-15 продаж СРЕЗКА — свой по каждому складу
+    for _sn in _STORE_ORDER:
+        _items = top_by_store.get(_sn)
+        if not _items:
+            continue
+        pk.section_header(pdf, f"Топ-15 продаж  ·  {_sn}")
+        pk.table(
+            pdf,
+            headers=["Название", "Продано, шт"],
+            rows=[[name, _qty(qty)] for name, qty in _items],
+            col_widths=[140, 34],
+            aligns=["L", "R"],
+            font_size=8.5,
+        )
 
     # ── Залежалые (новая страница) ─────────────────────────────────────────────
     pdf.add_page()
-    pk.cover(pdf, f"Залежалые  ·  без движения > {_STALE_MIN_DAYS} дней")
+    pk.cover(pdf, f"Залежалые  ·  розничные точки  ·  > {_STALE_MIN_DAYS} дней")
     pk.section_header(
-        pdf, f"СРЕЗКА без продаж более {_STALE_MIN_DAYS} дн.  ·  без резерва"
+        pdf, f"СРЕЗКА без продаж более {_STALE_MIN_DAYS} дн.  ·  розница, без резерва"
     )
 
     if not stale_by_store:
@@ -193,7 +210,7 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
 
         # Таблица с группировкой по складам (без колонки «Склад»)
         for sname in sorted(stale_by_store):
-            items = stale_by_store[sname]
+            items = stale_by_store[sname][:15]
             pk.section_header(pdf, sname)
             pk.table(
                 pdf,
