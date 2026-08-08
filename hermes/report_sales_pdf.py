@@ -304,6 +304,7 @@ def build_sales_pdf(
     grand_net   = grand_prof - exp["total"]
     grand_after = grand_net - losses_total
     grand_chk   = sum(r[4] for r in _biz)
+    grand_ac    = calc.avg_check(grand_rev, grand_chk)
 
     # -- Топ-20 по выручке -----------------------------------------------------
     sf2 = "AND spd.store_id = %s" if store_id_f else ""
