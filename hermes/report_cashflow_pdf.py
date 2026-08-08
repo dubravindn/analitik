@@ -31,31 +31,32 @@ def build_cashflow_pdf(conn, date_from: date, date_to: date) -> bytes:
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
               {excl_owner}
-            ORDER BY amount_kop DESC
+            ORDER BY day DESC, amount_kop DESC
         """, _op_params())
         op_rows = cur.fetchall()
 
     op_total = sum(int(r[4] or 0) for r in op_rows)
     unique_items = len({r[1] or "Без статьи" for r in op_rows})
 
-    # ── 2. Итог по статьям ───────────────────────────────────────────────────
+    # ── 2. Разбивка по складам и статьям ────────────────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT COALESCE(NULLIF(expense_item_name, ''), 'Без статьи'),
+            SELECT COALESCE(NULLIF(project_name, ''), 'Без склада'),
+                   COALESCE(NULLIF(expense_item_name, ''), 'Без статьи'),
                    SUM(amount_kop) AS kop
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
               {excl_owner}
-            GROUP BY 1
-            ORDER BY kop DESC
+            GROUP BY 1, 2
+            ORDER BY 1, kop DESC
         """, _op_params())
-        items_rows = cur.fetchall()
+        store_item_rows = cur.fetchall()
 
     # ── 3. Выводы собственникам ──────────────────────────────────────────────
     if owner_items:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT day, agent_name, amount_kop
+                SELECT day, expense_item_name, amount_kop
                 FROM cashflow_event
                 WHERE day BETWEEN %s AND %s AND direction = 'out'
                   AND expense_item_name = ANY(%s)
@@ -80,7 +81,58 @@ def build_cashflow_pdf(conn, date_from: date, date_to: date) -> bytes:
         ("Статей расходов", str(unique_items),  ""),
     ])
 
-    # Блок 1: операционные расходы
+    # Разбивка по складам и статьям
+    if store_item_rows:
+        pk.section_header(pdf, "По складам и статьям")
+        prev_store = None
+        table_rows = []
+        for store, item, kop in store_item_rows:
+            store_cell = store if store != prev_store else ""
+            if store != prev_store:
+                prev_store = store
+            table_rows.append([store_cell, item, _rub(float(kop or 0)) + " ₽"])
+        pk.table(
+            pdf,
+            headers=["Склад", "Статья", "Сумма"],
+            rows=table_rows,
+            col_widths=[70, 80, 24],
+            aligns=["L", "L", "R"],
+            font_size=8.5,
+        )
+
+    # Блок 2: выводы собственникам
+    pdf.add_page()
+    pk.cover(pdf, "Выводы собственникам")
+    pk.section_header(pdf, "Выводы собственникам")
+    if owner_rows:
+        pk.table(
+            pdf,
+            headers=["Дата", "Получатель", "Сумма"],
+            rows=[
+                [
+                    day.strftime("%d.%m") if hasattr(day, "strftime") else str(day),
+                    (item or "")[:58],
+                    _rub(float(kop or 0)) + " ₽",
+                ]
+                for day, item, kop in owner_rows
+            ],
+            col_widths=[18, 128, 28],
+            aligns=["L", "L", "R"],
+        )
+    else:
+        pk.callout(pdf, "Выводов собственникам за период нет.", kind="ok")
+
+    pk.callout(pdf, "Выводы собственникам — не операционные расходы", kind="warn")
+    pk.callout(
+        pdf,
+        f"Операционные {_rub(op_total)} ₽  +  Выводы {_rub(owner_total)} ₽"
+        f"  =  Итого {_rub(grand_total)} ₽",
+        kind="info",
+    )
+
+    # Блок 1: операционные расходы — детально (в конце)
+    pdf.add_page()
+    pk.cover(pdf, "Операционные расходы")
     pk.section_header(pdf, "Операционные расходы")
     if op_rows:
         pk.table(
@@ -102,48 +154,5 @@ def build_cashflow_pdf(conn, date_from: date, date_to: date) -> bytes:
         )
     else:
         pk.callout(pdf, "Операционных расходов за период нет.", kind="ok")
-
-    # Итог по статьям
-    if items_rows:
-        pdf.add_page()
-        pk.cover(pdf, "По статьям расходов")
-        pk.section_header(pdf, "Итог по статьям")
-        pk.table(
-            pdf,
-            headers=["Статья", "Сумма"],
-            rows=[[item, _rub(float(kop or 0)) + " ₽"] for item, kop in items_rows],
-            col_widths=[140, 34],
-            aligns=["L", "R"],
-        )
-
-    # Блок 2: выводы собственникам
-    pdf.add_page()
-    pk.cover(pdf, "Выводы собственникам")
-    pk.section_header(pdf, "Выводы собственникам")
-    if owner_rows:
-        pk.table(
-            pdf,
-            headers=["Дата", "Получатель", "Сумма"],
-            rows=[
-                [
-                    day.strftime("%d.%m") if hasattr(day, "strftime") else str(day),
-                    (agent or "Не указан")[:58],
-                    _rub(float(kop or 0)) + " ₽",
-                ]
-                for day, agent, kop in owner_rows
-            ],
-            col_widths=[18, 128, 28],
-            aligns=["L", "L", "R"],
-        )
-    else:
-        pk.callout(pdf, "Выводов собственникам за период нет.", kind="ok")
-
-    pk.callout(pdf, "Выводы собственникам — не операционные расходы", kind="warn")
-    pk.callout(
-        pdf,
-        f"Операционные {_rub(op_total)} ₽  +  Выводы {_rub(owner_total)} ₽"
-        f"  =  Итого {_rub(grand_total)} ₽",
-        kind="info",
-    )
 
     return bytes(pdf.output())
