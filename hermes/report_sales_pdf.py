@@ -492,25 +492,16 @@ def build_sales_pdf(
     if not store_name and balls_data:
         pk.section_header(pdf, "Шары (корневая группа ШАРЫ)")
         balls_total_rev = sum(rev for _, rev, _ in balls_data)
-        balls_total_qty = sum(qty for _, _, qty in balls_data)
         balls_tbl = []
-        for sn, rev, qty in balls_data:
-            balls_tbl.append([
-                _trunc(sn, 50),
-                _rub(rev) + " ₽",
-                str(int(qty)),
-            ])
-        balls_tbl.append([
-            "ИТОГО",
-            _rub(balls_total_rev) + " ₽",
-            str(int(balls_total_qty)),
-        ])
+        for sn, rev, _ in balls_data:
+            balls_tbl.append([_trunc(sn, 50), _rub(rev) + " ₽"])
+        balls_tbl.append(["ИТОГО", _rub(balls_total_rev) + " ₽"])
         pk.table(
             pdf,
-            headers=["Склад", "Выручка", "Штук"],
+            headers=["Склад", "Выручка"],
             rows=balls_tbl,
-            col_widths=[114, 40, 20],
-            aligns=["L", "R", "R"],
+            col_widths=[134, 40],
+            aligns=["L", "R"],
             font_size=8.5,
         )
         pdf.set_x(pk._MARGIN)
