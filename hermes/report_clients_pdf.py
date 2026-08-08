@@ -64,7 +64,7 @@ def build_clients_pdf(conn, date_from: date, date_to: date) -> bytes:
               AND NOT (agent_name = ANY(%s))
             GROUP BY agent_id
             ORDER BY SUM(sum_kop) DESC
-            LIMIT 30
+            LIMIT 35
         """, [date_from, date_to, excluded])
         top_rows = cur.fetchall()
 
@@ -83,7 +83,7 @@ def build_clients_pdf(conn, date_from: date, date_to: date) -> bytes:
             GROUP BY agent_id, agent_name
             HAVING MAX(day) < CURRENT_DATE - 10
             ORDER BY last_day DESC
-            LIMIT 35
+            LIMIT 40
         """, [excluded])
         churn_rows = cur.fetchall()
 
