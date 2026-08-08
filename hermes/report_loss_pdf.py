@@ -110,7 +110,7 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
               AND {asof}
             GROUP BY i.product_name
             ORDER BY pos_kop DESC
-            LIMIT 10
+            LIMIT 15
         """, _dp() + [date_from, date_to, excl])
         top_rows = cur.fetchall()
 
@@ -161,7 +161,7 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
     # ── Стр. 2: топ-10 позиций ───────────────────��───────────────────────────
     pdf.add_page()
     pk.cover(pdf, "Топ позиций по списаниям")
-    pk.section_header(pdf, "Топ-10 по сумме  ·  Ассортимент")
+    pk.section_header(pdf, "Топ-15 по сумме  ·  Ассортимент")
     if top_rows:
         pk.table(
             pdf,
