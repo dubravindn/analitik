@@ -1,6 +1,7 @@
 """PDF-отчёт «Прогноз закупки» — брендовый стиль ЦБД."""
 from __future__ import annotations
 
+import math
 from datetime import date
 
 from . import calc, pdf_kit as pk
@@ -48,12 +49,14 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
 
     stock_by_pid: dict[str, float] = {}
     cost_by_pid: dict[str, float] = {}
+    srezka_pids: set[str] = set()
     if snap_day:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT ss.product_id,
                        SUM(ss.available_qty) AS qty,
-                       MAX(ss.cost_price_kop) AS cost
+                       MAX(ss.cost_price_kop) AS cost,
+                       MAX(pd.folder_path) AS fpath
                 FROM stock_snapshot ss
                 JOIN product_dim pd ON pd.product_id = ss.product_id
                 WHERE ss.day = %s
@@ -61,25 +64,27 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
                   AND pd.folder_path LIKE %s
                 GROUP BY ss.product_id
             """, [snap_day, _SENTINEL_QTY, "Ассортимент/%"])
-            for pid, qty, cost in cur.fetchall():
+            for pid, qty, cost, fpath in cur.fetchall():
                 stock_by_pid[pid] = float(qty or 0)
                 cost_by_pid[pid] = float(cost or 0)
+                if fpath and "СРЕЗКА" in fpath:
+                    srezka_pids.add(pid)
 
     # ── 3. Рекомендации: продано × 1.1 − остаток ─────────────────────────────
     recs: list[tuple] = []
     for pid, (pname, sold) in sales_by_pid.items():
         stock = stock_by_pid.get(pid, 0.0)
-        rec = sold * 1.1 - stock
+        rec = math.ceil(sold * 1.1 - stock)
         if rec > 0:
             cost = cost_by_pid.get(pid, 0.0)
             recs.append((pname, sold, stock, rec, cost))
 
     recs.sort(key=lambda x: -x[3])
 
-    # ── 4. Позиции в избытке (остаток > продаж) ───────────────────────────────
+    # ── 4. Позиции в избытке (остаток > продаж) — только СРЕЗКА ─────────────
     overstock_count = sum(
         1 for pid, (_, sold) in sales_by_pid.items()
-        if stock_by_pid.get(pid, 0) > sold
+        if pid in srezka_pids and stock_by_pid.get(pid, 0) > sold
     )
 
     # ── KPI ──────────────────────────────────────────────────────────────────
@@ -128,7 +133,7 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
         over_rows = [
             (sales_by_pid[pid][0], sales_by_pid[pid][1], stock_by_pid.get(pid, 0))
             for pid in sales_by_pid
-            if stock_by_pid.get(pid, 0) > sales_by_pid[pid][1]
+            if pid in srezka_pids and stock_by_pid.get(pid, 0) > sales_by_pid[pid][1]
         ]
         over_rows.sort(key=lambda x: -(x[2] - x[1]))
         pk.table(
