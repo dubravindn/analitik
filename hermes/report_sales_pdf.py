@@ -158,11 +158,13 @@ def _render_income_split(
     pdf: pk.HermesPDF,
     grand_net: int,
     kola_balls_kop: int,
+    grand_prof: int = 0,
+    exp_total: int = 0,
 ) -> None:
     """Блок «Разделение дохода» — визуальный каскад по макету ЦБД.
 
     Шары Ленина + Воровского → Коля 100% (прибыль = выручка, учёт не ведётся).
-    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_after (после потерь).
+    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_net (чистая).
     """
     pk.section_header(pdf, "Разделение дохода  ·  Дима и Коля")
 
@@ -199,7 +201,14 @@ def _render_income_split(
         pdf.set_text_color(*pk.INK)
 
     # ── каскад ────────────────────────────────────────────────────────────────
-    _row("Прибыль после потерь", _v(grand_net), bold=True)
+    if grand_prof:
+        _row("Вал. прибыль (выручка − закупка)", _v(grand_prof))
+        _sep(pk.GRID, 0.2)
+        _row("  − Операционные расходы", "−" + _v(exp_total), color=pk.TERRA)
+        _sep()
+        pdf.ln(1)
+    _row("= Чистая прибыль", _v(grand_net), bold=True, bg=pk.SAGE_L, h=7.5)
+    pdf.ln(1)
     _sep()
     _row("  − Шары Коли (Ленина + Воровского)",
          "−" + _v(kola_balls_kop), color=pk.TERRA)
@@ -482,7 +491,13 @@ def build_sales_pdf(
 
     # -- Блок «Разделение дохода» (асимметричный дележ) ------------------------
     if not store_name:
-        _render_income_split(pdf, grand_net=grand_after, kola_balls_kop=kola_balls_kop)
+        _render_income_split(
+            pdf,
+            grand_net=grand_net,
+            kola_balls_kop=kola_balls_kop,
+            grand_prof=grand_prof,
+            exp_total=exp["total"],
+        )
 
     # -- Блок «ШАРЫ» (корневая группа, аналитический срез) --------------------
     if not store_name and balls_data:
