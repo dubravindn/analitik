@@ -9,7 +9,7 @@ from hermes.report_stock import (
 )
 
 # Порог залежалости для PDF-отчёта (в тексте report_stock.py — 5 дней).
-_STALE_MIN_DAYS = 14
+_STALE_MIN_DAYS = 5
 
 # Розничные точки для залежалых (База — только хранение, не показываем).
 _RETAIL_STORES = frozenset(s for s in _STORE_ORDER if "База" not in s)
