@@ -64,42 +64,27 @@ def build_clients_pdf(conn, date_from: date, date_to: date) -> bytes:
               AND NOT (agent_name = ANY(%s))
             GROUP BY agent_id
             ORDER BY SUM(sum_kop) DESC
-            LIMIT 10
+            LIMIT 30
         """, [date_from, date_to, excluded])
         top_rows = cur.fetchall()
 
-    # ── 3. Отток (оптовики, 180 дней, ≥3 покупки) ───────────────────────────
+    # ── 3. Клиенты без заказа более 10 дней (активные за 90 дн.) ────────────
     with conn.cursor() as cur:
         cur.execute("""
-            WITH intervals AS (
-                SELECT agent_id,
-                       day - LAG(day) OVER (PARTITION BY agent_id ORDER BY day) AS gap
-                FROM (
-                    SELECT DISTINCT agent_id, day
-                    FROM sales_doc
-                    WHERE channel = 'опт' AND doc_type = 'demand'
-                      AND day >= CURRENT_DATE - 180
-                ) d
-            ),
-            avg_gap AS (
-                SELECT agent_id, AVG(gap) AS avg_gap_days, COUNT(*) AS purchases
-                FROM intervals WHERE gap IS NOT NULL
-                GROUP BY agent_id HAVING COUNT(*) >= 3
-            ),
-            last_seen AS (
-                SELECT agent_id, agent_name, MAX(day) AS last_day
-                FROM sales_doc WHERE channel = 'опт' AND doc_type = 'demand'
-                GROUP BY agent_id, agent_name
-            )
-            SELECT l.agent_id, a.avg_gap_days, l.last_day,
-                   CURRENT_DATE - l.last_day AS days_since,
-                   (CURRENT_DATE - l.last_day)::float / NULLIF(a.avg_gap_days, 0) AS ratio
-            FROM avg_gap a JOIN last_seen l USING (agent_id)
-            WHERE (CURRENT_DATE - l.last_day) > a.avg_gap_days * 1.5
-              AND (CURRENT_DATE - l.last_day) >= 7
-            ORDER BY ratio DESC
-            LIMIT 15
-        """)
+            SELECT agent_id, agent_name,
+                   MAX(day) AS last_day,
+                   CURRENT_DATE - MAX(day) AS days_since,
+                   COUNT(*) AS orders
+            FROM sales_doc
+            WHERE doc_type = 'demand'
+              AND agent_id IS NOT NULL AND agent_id != ''
+              AND NOT (agent_name = ANY(%s))
+              AND day >= CURRENT_DATE - 90
+            GROUP BY agent_id, agent_name
+            HAVING MAX(day) < CURRENT_DATE - 10
+            ORDER BY last_day DESC
+            LIMIT 35
+        """, [excluded])
         churn_rows = cur.fetchall()
 
     # ── рендеринг ─────────────────────────────────────────────────────────────
@@ -114,7 +99,7 @@ def build_clients_pdf(conn, date_from: date, date_to: date) -> bytes:
         ("Возвращаемость",      f"{return_pct:.0f}",             "%"),
     ])
 
-    pk.section_header(pdf, "Топ-10 клиентов по выручке")
+    pk.section_header(pdf, "Топ клиентов по выручке")
     if top_rows:
         pk.table(
             pdf,
@@ -136,29 +121,27 @@ def build_clients_pdf(conn, date_from: date, date_to: date) -> bytes:
 
     # ── Стр. 2: отток ─────────────────────────────────────────────────────────
     pdf.add_page()
-    pk.cover(pdf, "Возможный отток  ·  оптовики")
-    pk.section_header(pdf, "Оптовики без заказа дольше обычного  ·  180 дней")
+    pk.cover(pdf, "Клиенты без заказа  ·  > 10 дней")
+    pk.section_header(pdf, "Без заказа более 10 дней  ·  активные за 90 дн.")
 
     if churn_rows:
         pk.table(
             pdf,
-            headers=["Клиент", "Посл. заказ", "Дней назад", "Обычно дн.", "Просрочка"],
+            headers=["Клиент", "Посл. заказ", "Дней без заказа", "Заказов"],
             rows=[
                 [
                     f"Клиент #{i}",
                     last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day),
                     str(int(days_since or 0)),
-                    f"{float(avg_gap or 0):.0f}",
-                    f"×{float(ratio or 0):.1f}",
+                    str(int(orders or 0)),
                 ]
-                for i, (_aid, avg_gap, last_day, days_since, ratio) in enumerate(churn_rows, 1)
+                for i, (_aid, _name, last_day, days_since, orders) in enumerate(churn_rows, 1)
             ],
-            col_widths=[52, 30, 26, 26, 26],
-            aligns=["L", "L", "R", "R", "R"],
+            col_widths=[60, 36, 44, 34],
+            aligns=["L", "L", "R", "R"],
             font_size=8.5,
         )
-        pk.callout(pdf, "Отток — скользящие 180 дней, независимо от выбранного периода.", kind="warn")
     else:
-        pk.callout(pdf, "Отставших оптовиков не обнаружено.", kind="ok")
+        pk.callout(pdf, "Клиентов без заказа более 10 дней не обнаружено.", kind="ok")
 
     return bytes(pdf.output())
