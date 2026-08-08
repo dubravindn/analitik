@@ -159,58 +159,84 @@ def _render_income_split(
     grand_net: int,
     kola_balls_kop: int,
 ) -> None:
-    """Блок «Разделение дохода» — асимметричный дележ.
+    """Блок «Разделение дохода» — визуальный каскад по макету ЦБД.
 
-    Шары Ленина + Воровского идут Коле 100% (учёт закупки не ведётся,
-    прибыль = выручка). Остаток делится 50/50 Дима и Коля.
-    Инвариант: ИТОГО Диме + ИТОГО Коле = grand_net.
+    Шары Ленина + Воровского → Коля 100% (прибыль = выручка, учёт не ведётся).
+    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_net.
     """
-    pk.section_header(pdf, "Разделение дохода (Дима и Коля)")
+    pk.section_header(pdf, "Разделение дохода  ·  Дима и Коля")
 
     joint      = grand_net - kola_balls_kop
     dima_share = joint // 2
     kola_joint = joint - dima_share
     kola_total = kola_joint + kola_balls_kop
 
-    def _row(label: str, val_str: str, bold: bool = False, indent: int = 0,
-             color: tuple = pk.INK) -> None:
-        h = 6.5 if bold else 5.5
-        lw = 110.0
-        vw = float(pk._INNER_W) - lw
-        pdf.set_font("DejaVu_B" if bold else "DejaVu", size=9.5 if bold else 8.5)
+    LW = 115.0
+    VW = float(pk._INNER_W) - LW
+
+    def _v(kop: int) -> str:
+        return f"{abs(kop) // 100:,}".replace(",", " ") + " ₽"
+
+    def _sep(color: tuple = pk.GRID, w: float = 0.35) -> None:
+        pdf.set_draw_color(*color)
+        pdf.set_line_width(w)
+        pdf.line(float(pk._MARGIN), pdf.get_y(),
+                 float(pk._MARGIN) + float(pk._INNER_W), pdf.get_y())
+
+    def _row(label: str, val: str, bold: bool = False,
+             color: tuple = pk.INK, bg: tuple | None = None,
+             h: float = 6.0) -> None:
+        if bg:
+            pdf.set_fill_color(*bg)
+            pdf.rect(float(pk._MARGIN), pdf.get_y(),
+                     float(pk._INNER_W), h, style="F")
+        pdf.set_font("DejaVu_B" if bold else "DejaVu",
+                     size=10.0 if bold else 9.0)
         pdf.set_text_color(*color)
         pdf.set_x(pk._MARGIN)
-        pdf.cell(lw, h, "  " * indent + label)
-        pdf.cell(vw, h, val_str, align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(LW, h, label)
+        pdf.cell(VW, h, val, align="R", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(*pk.INK)
 
-    def _sub(text: str) -> None:
-        pdf.set_font("DejaVu", size=7.5)
-        pdf.set_text_color(*pk.SAGE)
-        pdf.set_x(pk._MARGIN + 4)
-        pdf.cell(pk._INNER_W - 4, 4, text, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(*pk.INK)
-
-    _row("Общая чистая прибыль", _rub(grand_net) + " ₽", bold=True)
-    _row("- Шары Коли (Ленина + Воровского)", _rub(kola_balls_kop) + " ₽",
-         indent=1, color=pk.TERRA)
-    _row("= Совместное", _rub(joint) + " ₽", bold=True)
-    _row("  -> Дима (50%)", _rub(dima_share) + " ₽", indent=2, color=pk.SAGE)
-    _row("  -> Коля (50%)", _rub(kola_joint) + " ₽", indent=2, color=pk.SAGE)
-    _row("Шары Коли (100%)", "+ " + _rub(kola_balls_kop) + " ₽",
-         indent=2, color=pk.SAGE)
-    pdf.set_draw_color(*pk.SAGE)
-    pdf.set_line_width(0.3)
-    pdf.line(pk._MARGIN, pdf.get_y(), pk._MARGIN + pk._INNER_W, pdf.get_y())
+    # ── каскад ────────────────────────────────────────────────────────────────
+    _row("Общая чистая прибыль", _v(grand_net), bold=True)
+    _sep()
+    _row("  − Шары Коли (Ленина + Воровского)",
+         "−" + _v(kola_balls_kop), color=pk.TERRA)
+    _sep()
     pdf.ln(1.5)
-    _row("ИТОГО Диме", _rub(dima_share) + " ₽", bold=True)
-    _row("ИТОГО Коле", _rub(kola_total) + " ₽", bold=True)
+    _row("= Совместное", _v(joint), bold=True, bg=pk.SAGE_L, h=7.5)
+    pdf.ln(0.5)
+    _row("     → Дима (50%)",   _v(dima_share), color=pk.SAGE)
+    _row("     → Коля (50%)",   _v(kola_joint), color=pk.SAGE)
+    _row("  + Шары Коли (100%, по выручке)", "+" + _v(kola_balls_kop),
+         color=pk.SAGE)
+    pdf.ln(3)
+
+    # ── ИТОГО плашки ──────────────────────────────────────────────────────────
+    _row("  ИТОГО Диме", _v(dima_share), bold=True, bg=pk.SAGE_L, h=8.5)
+    pdf.ln(1.5)
+    _row("  ИТОГО Коле", _v(kola_total), bold=True, bg=pk.SAGE_L, h=8.5)
+    pdf.ln(3)
+
+    # ── проверка и сноска ─────────────────────────────────────────────────────
     ok = (dima_share + kola_total == grand_net)
-    _sub(
-        (f"Проверка: Дима {_rub(dima_share)} + Коля {_rub(kola_total)}"
-         f" = {_rub(grand_net)} руб. (сходится)") if ok else
-        f"РАСХОЖДЕНИЕ: {_rub(dima_share + kola_total)} != {_rub(grand_net)}"
-    )
+    pdf.set_font("DejaVu", size=7.5)
+    pdf.set_text_color(*(pk.SAGE if ok else pk.TERRA))
+    pdf.set_x(pk._MARGIN)
+    if ok:
+        chk = (f"Проверка: {_rub(dima_share)} + {_rub(kola_total)}"
+               f" = {_rub(grand_net)} ₽ ✓")
+    else:
+        chk = (f"⚠ РАСХОЖДЕНИЕ: {_rub(dima_share + kola_total)}"
+               f" ≠ {_rub(grand_net)} ₽")
+    pdf.cell(pk._INNER_W, 4.5, chk, align="L", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*pk.SAGE)
+    pdf.set_x(pk._MARGIN)
+    pdf.cell(pk._INNER_W, 4,
+             "Шары Коли — по выручке (учёт не ведётся). Совместное делится 50/50.",
+             align="L", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*pk.INK)
     pdf.ln(4)
 
 
