@@ -83,17 +83,15 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
         """, [date_from, date_to, excl])
         grand_items = int(cur.fetchone()[0] or 0)
 
-    # ── 3. Докум��нты (дата DESC) ─────────────────────────────────────────────
+    # ── 3. Позиции документов (дата DESC) ────────────────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT d.day, d.store_name,
-                   COALESCE(SUM({_TOTAL}), 0) AS doc_kop,
-                   d.description
+            SELECT d.day, d.store_name, i.product_name, i.qty,
+                   COALESCE({_TOTAL}, 0) AS item_kop
             {_JOIN}
             WHERE d.day BETWEEN %s AND %s
               AND NOT (d.store_name = ANY(%s))
-            GROUP BY d.doc_id, d.day, d.store_name, d.description, d.moment
-            ORDER BY d.moment DESC
+            ORDER BY d.moment DESC, d.doc_id, i.product_name
         """, _dp() + [date_from, date_to, excl])
         doc_rows = cur.fetchall()
 
@@ -139,22 +137,23 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
     )
     pk.callout(pdf, f"Итого: {_rub(grand_kop)} ₽", kind="info")
 
-    # Документы
-    pk.section_header(pdf, "Документы  ·  дата DESC")
+    # Документы: все позиции
+    pk.section_header(pdf, "Позиции списаний  ·  дата DESC")
     pk.table(
         pdf,
-        headers=["Дата", "Склад", "Сумма", "Причина"],
+        headers=["Дата", "Склад", "Название", "Кол-во", "Сумма"],
         rows=[
             [
                 doc_day.strftime("%d.%m") if hasattr(doc_day, "strftime") else str(doc_day),
                 sn,
-                _rub(int(kop or 0)) + " ₽",
-                (desc or "")[:40],
+                (pname or "")[:44],
+                _qty(float(qty or 0)),
+                _rub(float(kop or 0)) + " ₽",
             ]
-            for doc_day, sn, kop, desc in doc_rows
+            for doc_day, sn, pname, qty, kop in doc_rows
         ],
-        col_widths=[18, 74, 30, 52],
-        aligns=["L", "L", "R", "L"],
+        col_widths=[18, 52, 62, 18, 24],
+        aligns=["L", "L", "L", "R", "R"],
         font_size=8.5,
     )
 
