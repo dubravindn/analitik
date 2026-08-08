@@ -40,24 +40,6 @@ _MV_COVERED = "CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 THEN i.to
 _MV_ASSORT = ("i.product_id IN (SELECT product_id FROM product_dim "
               "WHERE folder_path LIKE 'Ассортимент/%%')")
 
-# K2: JOIN для наличной цены «Наличка» на дату документа.
-_MV_NAL_JOIN = """
-    FROM move_doc d
-    JOIN move_item i ON i.doc_id = d.doc_id
-    LEFT JOIN LATERAL (
-        SELECT price_kop FROM nal_price_asof n
-        WHERE n.product_id = i.product_id AND n.priced_from <= d.day
-        ORDER BY n.priced_from DESC LIMIT 1
-    ) np ON true
-"""
-
-
-def _two_price(cost_unit, nal_unit) -> str:
-    """«закуп X ₽ · нал Y ₽» (прочерк, если цены нет)."""
-    c = f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
-    n = f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
-    return f"{c} · {n}"
-
 
 def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None,
                       max_docs: int | None = 50) -> str:
@@ -103,25 +85,6 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
 
     coverage = (float(covered_ms) / float(all_ms) * 100) if all_ms else 0.0
     lines.append(f"По закупочным ценам: {coverage:.0f}% стоимости · МойСклад: {100 - coverage:.0f}% (нет закупочной в карточке)")
-    # K2: строка покрытия «Наличка»
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COUNT(*) FILTER (WHERE np.price_kop IS NOT NULL AND np.price_kop > 0),
-                   COUNT(*),
-                   COALESCE(SUM(CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0
-                                    THEN i.total_kop ELSE 0 END), 0),
-                   COALESCE(SUM(i.total_kop), 0)
-            {_MV_NAL_JOIN}
-            WHERE d.day BETWEEN %s AND %s {store_cond} AND {_MV_ASSORT}
-        """, base_params)
-        _nal_r = cur.fetchone() or (0, 0, 0, 0)
-    _nal_pos = int(_nal_r[0] or 0)
-    _nal_kop = float(_nal_r[2] or 0)
-    _nal_all = float(_nal_r[3] or 0)
-    if int(_nal_r[1] or 0):
-        _pct = _nal_kop / _nal_all * 100 if _nal_all else 0
-        _pfx = "⚠️ " if _pct < 90 else ""
-        lines.append(f"{_pfx}Наличная цена известна для {_nal_pos} из {int(_nal_r[1])} поз. ({_pct:.0f}% суммы)")
     lines.append(f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. · Сумма: {_rub(float(total_kop))} ₽")
     lines.append("")
 
@@ -225,39 +188,33 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
             header += f" · {description}"
         lines.append(header)
 
-        # I8: две цены позиции — закупочная (фолбэк cost_kop) и наличная, на дату;
-        # только товар «Ассортимент».
+        # I8: закупочная цена позиции на дату; только товар «Ассортимент».
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT i.product_name, i.qty, i.cost_kop, i.total_kop,
-                       pp.price_kop, np.price_kop
+                       pp.price_kop
                 FROM move_item i
                 LEFT JOIN LATERAL (
                     SELECT price_kop FROM purchase_price_asof p
                     WHERE p.product_id = i.product_id AND p.priced_from <= %s
                     ORDER BY p.priced_from DESC LIMIT 1
                 ) pp ON true
-                LEFT JOIN LATERAL (
-                    SELECT price_kop FROM nal_price_asof n
-                    WHERE n.product_id = i.product_id AND n.priced_from <= %s
-                    ORDER BY n.priced_from DESC LIMIT 1
-                ) np ON true
                 WHERE i.doc_id = %s AND {_MV_ASSORT}
                 ORDER BY i.total_kop DESC
-            """, [doc_day, doc_day, doc_id])
+            """, [doc_day, doc_id])
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, ms_cost, ms_total, purch_price, nal in positions:
+        for pname, qty, ms_cost, ms_total, purch_price in positions:
             covered = purch_price is not None and purch_price > 0
             unit = int(purch_price) if covered else int(ms_cost or 0)
             pos_total = round(float(qty) * unit) if covered else float(ms_total)
-            nal_unit = int(nal) if nal else 0
             doc_total += float(pos_total)
             star = "" if covered else " *"
             any_star = any_star or not covered
+            price_str = f"закуп {_rub(unit)} ₽" if unit else "закуп —"
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед. · {_two_price(unit, nal_unit)} · "
+                f"  • {pname}: {_qty(float(qty))} ед. · {price_str} · "
                 f"{_rub(float(pos_total))} ₽{star}"
             )
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")

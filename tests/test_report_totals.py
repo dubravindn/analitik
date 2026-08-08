@@ -68,8 +68,8 @@ def test_loss_header_equals_total():
             return [("Роза", 500, 4_940_000)]
         if "d.doc_id, d.moment" in sql:                     # документы (6 колонок)
             return [("doc1", None, date(2026, 8, 1), "Склад", "", "")]
-        if "i.cost_kop, i.total_kop" in sql:                # позиции +pp+np (6 колонок)
-            return [("Лента", 5, 1900, 9500, 1900, 2000)]
+        if "i.cost_kop, i.total_kop" in sql:                # позиции +pp (5 колонок)
+            return [("Лента", 5, 1900, 9500, 1900)]
         return []
     text = report_loss.build_loss_report(_Conn(script), date(2026, 8, 1), date(2026, 8, 5))
     header = next(l for l in text.split("\n") if l.startswith("🌸 Порча"))
@@ -91,8 +91,8 @@ def test_move_header_equals_total():
             return [("Роза", 2000, 25_000_000)]
         if "d.doc_id, d.moment" in sql:               # +d.day (6 колонок)
             return [("doc1", None, date(2026, 8, 1), "A", "B", "")]
-        if "i.cost_kop, i.total_kop" in sql:          # позиции +pp+np (6 колонок)
-            return [("Роза", 2, 9500, 19000, 9500, 15000)]
+        if "i.cost_kop, i.total_kop" in sql:          # позиции +pp (5 колонок)
+            return [("Роза", 2, 9500, 19000, 9500)]
         return []
     text = report_move.build_move_report(_Conn(script), date(2026, 8, 1), date(2026, 8, 5))
     h, t = _header_and_total(text)

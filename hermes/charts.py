@@ -1,7 +1,10 @@
-"""Графики через matplotlib — PNG bytes (1080×720 px, шрифт ≥14pt, суммы в ₽).
+"""Графики через matplotlib — PNG bytes в брендовом стиле ЦБД.
 
 Каждая функция возвращает bytes (PNG) или None если matplotlib не установлен
 или данных нет.
+
+Палитра: SAGE=#8A9A7B (прибыль/акцент), INK=#1A1A1A (выручка),
+         TERRA=#C77B58 (списания), CREAM=#FDFBF7 (фон), GRID=#E3E1DA (сетка).
 """
 from __future__ import annotations
 
@@ -13,59 +16,83 @@ try:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    from matplotlib.ticker import FuncFormatter
     _MPL_OK = True
 except ImportError:
     _MPL_OK = False
 
-_W_IN = 1080 / 96   # 11.25 дюйма
-_H_IN = 720  / 96   # 7.5 дюйма
-_DPI  = 96
-_FS   = 14           # базовый размер шрифта
+# ── Палитра ЦБД ──────────────────────────────────────────────────────────────
+_SAGE   = "#8A9A7B"
+_SAGE_L = "#BDC6B3"
+_INK    = "#1A1A1A"
+_CREAM  = "#FDFBF7"
+_TERRA  = "#C77B58"
+_GRID   = "#E3E1DA"
 
-_COL_REV  = "#4A7BCC"
-_COL_PROF = "#5CB85C"
-_COL_LOSS = "#E05252"
-_GRID_CLR = "#EBEBEB"
+_W_IN = 11.0     # ширина фигуры (дюймы)
+_H_IN = 5.2      # высота фигуры (дюймы) — соотношение из make_charts.py
+_DPI  = 150
 
 
 def _rub(kop) -> float:
     return (kop or 0) / 100
 
 
-def _fmt_rub(v: float, _pos=None) -> str:
-    """Форматтер оси Y: '1 500 000 ₽'."""
-    return f"{int(v):,}".replace(",", " ") + " ₽"
+def _rub_fmt(v: float, _=None) -> str:
+    """Форматтер оси: '1 500k' / '500'."""
+    if abs(v) >= 1_000:
+        return f"{int(v / 1000)}k"
+    return str(int(v))
+
+
+def _base_rcparams() -> dict:
+    return {
+        "font.family": "DejaVu Sans",
+        "font.size": 11,
+        "axes.edgecolor": _GRID,
+        "axes.linewidth": 1,
+        "figure.facecolor": _CREAM,
+        "axes.facecolor": _CREAM,
+        "axes.grid": True,
+        "grid.color": _GRID,
+        "grid.linewidth": 0.8,
+    }
 
 
 def _new_fig():
-    fig, ax = plt.subplots(figsize=(_W_IN, _H_IN), dpi=_DPI)
-    ax.grid(axis="y", color=_GRID_CLR, linewidth=0.8, zorder=0)
+    """Фигура с одной осью Y (CREAM-фон, GRID-сетка)."""
+    with plt.rc_context(_base_rcparams()):
+        fig, ax = plt.subplots(figsize=(_W_IN, _H_IN), dpi=_DPI)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(labelsize=_FS - 2)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(_fmt_rub))
+    ax.yaxis.set_major_formatter(FuncFormatter(_rub_fmt))
+    ax.tick_params(labelsize=10)
     return fig, ax
 
 
 def _new_fig_twin():
-    """Фигура с двумя осями Y: левая — выручка, правая — прибыль."""
-    fig, ax = plt.subplots(figsize=(_W_IN, _H_IN), dpi=_DPI)
-    ax.grid(axis="y", color=_GRID_CLR, linewidth=0.8, zorder=0)
+    """Фигура с двумя осями Y: левая — выручка (INK), правая — прибыль (SAGE)."""
+    with plt.rc_context(_base_rcparams()):
+        fig, ax = plt.subplots(figsize=(_W_IN, _H_IN), dpi=_DPI)
     ax.spines["top"].set_visible(False)
-    ax.tick_params(labelsize=_FS - 2)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(_fmt_rub))
+    ax.yaxis.set_major_formatter(FuncFormatter(_rub_fmt))
+    ax.tick_params(labelsize=10)
+
     ax2 = ax.twinx()
     ax2.spines["top"].set_visible(False)
-    ax2.tick_params(labelsize=_FS - 2, colors=_COL_PROF)
-    ax2.yaxis.set_major_formatter(plt.FuncFormatter(_fmt_rub))
-    ax2.set_ylabel("Прибыль (прав. ось)", fontsize=_FS - 1, color=_COL_PROF)
+    ax2.set_facecolor(_CREAM)
+    ax2.yaxis.set_major_formatter(FuncFormatter(_rub_fmt))
+    ax2.tick_params(labelsize=10, colors=_SAGE)
+    ax2.set_ylabel("Прибыль", fontsize=11, color=_SAGE)
+    ax2.grid(False)
     return fig, ax, ax2
 
 
 def _save(fig) -> bytes:
     buf = io.BytesIO()
     fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=_DPI, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=_DPI, bbox_inches="tight",
+                facecolor=_CREAM)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -74,122 +101,181 @@ def _save(fig) -> bytes:
 def chart_revenue_by_day(
     conn, d_from: date, d_to: date, store_name: str | None = None
 ) -> bytes | None:
-    """Линейный: выручка (лев. ось) + прибыль (прав. ось) по дням.
+    """Выручка — столбцами INK, прибыль — линией SAGE (двойная ось).
 
-    N8: двойная ось Y — прибыль не прижата к нулю на фоне выручки.
-    Точки с отрицательной прибылью подсвечены красным маркером.
+    Над каждым столбцом — сумма, над каждой точкой прибыли — маржа %.
+    Последний день помечается как неполный, если продаж заметно меньше.
     """
     if not _MPL_OK:
         return None
-    sf = "AND store_name = %s" if store_name else ""
-    p  = [d_from, d_to] + ([store_name] if store_name else [])
+    sf    = "AND store_name = %s" if store_name else ""
+    sf_p  = "AND ssd.store_name = %s" if store_name else ""
+    p_ssd = [d_from, d_to] + ([store_name] if store_name else [])
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT day,
-                   COALESCE(SUM(revenue_kop), 0),
-                   COALESCE(SUM(revenue_kop - cost_kop), 0)
+            SELECT day, COALESCE(SUM(revenue_kop), 0)
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s {sf}
             GROUP BY day ORDER BY day
-        """, p)
-        rows = cur.fetchall()
-    if not rows:
+        """, p_ssd)
+        rev_rows = cur.fetchall()
+    if not rev_rows:
         return None
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT spd.day, COALESCE(SUM(
+                CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0
+                THEN round(spd.sell_qty * pp.price_kop)
+                ELSE round(spd.revenue_kop * 0.6) END
+            ), 0)
+            FROM sales_by_product_day spd
+            JOIN sales_by_store_day ssd
+                 ON ssd.store_id = spd.store_id AND ssd.day = spd.day
+            LEFT JOIN LATERAL (
+                SELECT price_kop FROM purchase_price_asof p
+                WHERE p.product_id = spd.assortment_id AND p.priced_from <= spd.day
+                ORDER BY p.priced_from DESC LIMIT 1
+            ) pp ON true
+            WHERE spd.day BETWEEN %s AND %s {sf_p}
+            GROUP BY spd.day
+        """, p_ssd)
+        cost_map = {{r[0]: int(r[1]) for r in cur.fetchall()}}
+    rows = [(day, rev, rev - cost_map.get(day, round(rev * 0.6)))
+            for day, rev in rev_rows]
 
     days   = [r[0] for r in rows]
     rev    = [_rub(r[1]) for r in rows]
     profit = [_rub(r[2]) for r in rows]
+    x      = range(len(days))
+    xlbls  = [d.strftime("%d.%m") for d in days]
 
     fig, ax, ax2 = _new_fig_twin()
-    ax.plot(days, rev, marker="o", ms=4, lw=2.5, color=_COL_REV,
-            label="Выручка", zorder=3)
-    ax2.plot(days, profit, marker="s", ms=4, lw=2, color=_COL_PROF,
-             linestyle="--", label="Прибыль", zorder=3)
 
-    # Подсветить дни с отрицательной прибылью
-    neg_days   = [d for d, p in zip(days, profit) if p < 0]
-    neg_profit = [p for p in profit if p < 0]
-    if neg_days:
-        ax2.scatter(neg_days, neg_profit, color=_COL_LOSS, s=60, zorder=4,
-                    label="Убыточный день")
+    # Выручка — столбцы (INK)
+    bars = ax.bar(x, rev, color=_INK, width=0.55, label="Выручка", zorder=3)
+    ax.set_ylabel("Выручка", color=_INK, fontsize=11)
 
-    ax.set_title("Выручка и прибыль от продаж по дням", fontsize=_FS + 2, pad=10)
-    ax.set_xlabel("Дата", fontsize=_FS)
-    ax.set_ylabel("Выручка (лев. ось)", fontsize=_FS)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    fig.autofmt_xdate(rotation=40)
+    # Прибыль — линия (SAGE)
+    ax2.plot(x, profit, color=_SAGE, lw=3, marker="o", ms=7,
+             label="Прибыль", zorder=4)
+
+    # Маржа % над точками прибыли
+    for i, (r, p) in enumerate(zip(rev, profit)):
+        if r > 0:
+            mg = round(p / r * 100)
+            ax2.annotate(
+                f"{mg}%", (i, p),
+                textcoords="offset points", xytext=(0, 10),
+                ha="center", fontsize=8, color=_SAGE, fontweight="bold",
+            )
+
+    # Пометить «неполный день» если последний день заметно меньше
+    if len(rev) >= 2:
+        avg_prev = sum(rev[:-1]) / len(rev[:-1]) if sum(rev[:-1]) else 1
+        if rev[-1] < avg_prev * 0.5:
+            ax.annotate(
+                "неполный день", (len(rev) - 1, rev[-1]),
+                textcoords="offset points", xytext=(0, 20),
+                ha="center", fontsize=8, color=_TERRA, style="italic",
+            )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(xlbls, fontsize=9)
+    ax.set_title("Выручка и маржа по дням", fontsize=14, fontweight="bold",
+                 color=_INK, pad=14)
 
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=_FS - 1, loc="upper left")
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right",
+              framealpha=0.95, facecolor=_CREAM, edgecolor=_GRID)
+
     return _save(fig)
 
 
 def chart_stores_compare(
     conn, d_from: date, d_to: date
 ) -> bytes | None:
-    """Столбчатый: выручка и прибыль по каждому складу за период.
-
-    N9: склады с долей выручки <1% скрыты (шум). Подписи значений над столбцами.
-    """
+    """Выручка (INK) и прибыль (SAGE) по складам, маржа % над прибылью."""
     if not _MPL_OK:
         return None
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT store_name,
-                   COALESCE(SUM(revenue_kop), 0),
-                   COALESCE(SUM(revenue_kop - cost_kop), 0)
+            SELECT store_name, COALESCE(SUM(revenue_kop), 0)
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s
             GROUP BY store_name
             ORDER BY SUM(revenue_kop) DESC
         """, [d_from, d_to])
-        rows = cur.fetchall()
-    if not rows:
+        rev_rows = cur.fetchall()
+    if not rev_rows:
         return None
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ssd.store_name, COALESCE(SUM(
+                CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0
+                THEN round(spd.sell_qty * pp.price_kop)
+                ELSE round(spd.revenue_kop * 0.6) END
+            ), 0)
+            FROM sales_by_product_day spd
+            JOIN sales_by_store_day ssd
+                 ON ssd.store_id = spd.store_id AND ssd.day = spd.day
+            LEFT JOIN LATERAL (
+                SELECT price_kop FROM purchase_price_asof p
+                WHERE p.product_id = spd.assortment_id AND p.priced_from <= spd.day
+                ORDER BY p.priced_from DESC LIMIT 1
+            ) pp ON true
+            WHERE spd.day BETWEEN %s AND %s
+            GROUP BY ssd.store_name
+        """, [d_from, d_to])
+        cost_map = {r[0]: int(r[1]) for r in cur.fetchall()}
+    rows = [(store, rev, rev - cost_map.get(store, round(rev * 0.6)))
+            for store, rev in rev_rows]
 
     total_rev = sum(r[1] for r in rows) or 1
-    # Отсекаем склады с долей < 1%
     rows = [r for r in rows if r[1] / total_rev >= 0.01]
     if not rows:
         return None
 
-    stores = [r[0] for r in rows]
+    stores = [r[0].replace(" ", "\n") for r in rows]
     rev    = [_rub(r[1]) for r in rows]
     profit = [_rub(r[2]) for r in rows]
-
     x = list(range(len(stores)))
     w = 0.38
+
     fig, ax = _new_fig()
-    bars_r = ax.bar([i - w / 2 for i in x], rev,    width=w, color=_COL_REV,  label="Выручка", zorder=2)
-    bars_p = ax.bar([i + w / 2 for i in x], profit, width=w, color=_COL_PROF, label="Прибыль", zorder=2)
+    bars_r = ax.bar([i - w / 2 for i in x], rev,    width=w, color=_INK,  label="Выручка", zorder=3)
+    bars_p = ax.bar([i + w / 2 for i in x], profit, width=w, color=_SAGE, label="Прибыль", zorder=3)
 
-    # Подписи значений над столбцами (N9)
-    def _label_bars(bars):
-        for bar in bars:
-            h = bar.get_height()
-            if abs(h) < 1:
-                continue
-            label = f"{int(h / 1000):,}k".replace(",", " ") if abs(h) >= 1000 else str(int(h))
-            ax.text(bar.get_x() + bar.get_width() / 2, max(h, 0) + ax.get_ylim()[1] * 0.01,
-                    label, ha="center", va="bottom", fontsize=_FS - 4, rotation=0)
-
-    _label_bars(bars_r)
-    _label_bars(bars_p)
+    for i, (r, p) in enumerate(zip(rev, profit)):
+        if r > 0:
+            rv_k = f"{int(r / 1000)}k" if r >= 1000 else str(int(r))
+            ax.annotate(rv_k, (i - w / 2, r), textcoords="offset points",
+                        xytext=(0, 4), ha="center", fontsize=8, color=_INK)
+        if r > 0 and p >= 0:
+            mg = round(p / r * 100)
+            pk = f"{int(p / 1000)}k" if p >= 1000 else str(int(p))
+            ax.annotate(pk, (i + w / 2, p), textcoords="offset points",
+                        xytext=(0, 14), ha="center", fontsize=8, color=_SAGE)
+            ax.annotate(f"{mg}%", (i + w / 2, p), textcoords="offset points",
+                        xytext=(0, 4), ha="center", fontsize=9,
+                        color=_SAGE, fontweight="bold")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(stores, fontsize=_FS - 2, rotation=30, ha="right")
-    ax.set_title("Выручка и прибыль по складам", fontsize=_FS + 2, pad=10)
-    ax.set_ylabel("Рублей", fontsize=_FS)
-    ax.legend(fontsize=_FS - 1)
+    ax.set_xticklabels(stores, fontsize=9)
+    ax.set_title("Выручка, прибыль и маржа по складам", fontsize=14,
+                 fontweight="bold", color=_INK, pad=14)
+    ax.set_ylabel("Рублей", fontsize=11)
+    ax.legend(loc="upper right", framealpha=0.95, facecolor=_CREAM, edgecolor=_GRID)
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+
     return _save(fig)
 
 
 def chart_losses_vs_revenue(
     conn, d_from: date, d_to: date, store_name: str | None = None
 ) -> bytes | None:
-    """Комбо: выручка (линия) + списания (столбцы) по дням."""
+    """Выручка (линия INK) + списания (столбцы TERRA) на двойной оси; % от выручки."""
     if not _MPL_OK:
         return None
     sf = "AND store_name = %s" if store_name else ""
@@ -220,15 +306,46 @@ def chart_losses_vs_revenue(
         return None
     rev_vals  = [rev_map.get(d, 0)  for d in all_days]
     loss_vals = [loss_map.get(d, 0) for d in all_days]
+    x         = range(len(all_days))
+    xlbls     = [d.strftime("%d.%m") for d in all_days]
 
     fig, ax = _new_fig()
-    ax.bar(all_days, loss_vals, color=_COL_LOSS, alpha=0.75, label="Списания", zorder=2)
-    ax.plot(all_days, rev_vals, marker="o", ms=3, lw=2, color=_COL_REV, label="Выручка", zorder=3)
-    ax.set_title("Выручка и списания по дням", fontsize=_FS + 2, pad=10)
-    ax.set_xlabel("Дата", fontsize=_FS)
-    ax.set_ylabel("Рублей", fontsize=_FS)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    fig.autofmt_xdate(rotation=40)
-    ax.legend(fontsize=_FS - 1)
+    ax2 = ax.twinx()
+    ax2.spines["top"].set_visible(False)
+    ax2.yaxis.set_major_formatter(FuncFormatter(_rub_fmt))
+    ax2.tick_params(labelsize=10, colors=_TERRA)
+    ax2.set_ylabel("Списания", fontsize=11, color=_TERRA)
+    ax2.grid(False)
+
+    # Выручка — линия слева (INK)
+    ax.plot(x, rev_vals, color=_INK, lw=3, marker="o", ms=6,
+            label="Выручка", zorder=4)
+    ax.set_ylabel("Выручка", color=_INK, fontsize=11)
+
+    # Списания — столбцы справа (TERRA)
+    ax2.bar(x, loss_vals, color=_TERRA, width=0.5, alpha=0.85,
+            label="Списания", zorder=3)
+    max_l = max(loss_vals) if any(v > 0 for v in loss_vals) else 1
+    ax2.set_ylim(0, max_l * 2.2)
+
+    # % от выручки над столбцами списаний
+    for i, (r, lv) in enumerate(zip(rev_vals, loss_vals)):
+        if r > 0 and lv > 0:
+            pct = lv / r * 100
+            ax2.annotate(
+                f"{pct:.1f}%", (i, lv),
+                textcoords="offset points", xytext=(0, 6),
+                ha="center", fontsize=8, color=_TERRA, fontweight="bold",
+            )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(xlbls, fontsize=9)
+    ax.set_title("Выручка и списания по дням (% от выручки)", fontsize=14,
+                 fontweight="bold", color=_INK, pad=14)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right",
+              framealpha=0.95, facecolor=_CREAM, edgecolor=_GRID)
+
     return _save(fig)

@@ -5,6 +5,7 @@ import statistics
 from datetime import date, timedelta
 
 from . import calc, config
+from .costs import unit_cost
 
 
 def _rub(kop: float) -> str:
@@ -40,18 +41,18 @@ def _store_id_for(conn, store_name: str | None) -> str | None:
 
 
 def _sales_purchase_data(conn, d_from: date, d_to: date, store_id: str | None = None) -> dict:
-    """Продажи за период с закупочной ценой из приёмок на дату продажи.
+    """Продажи за период с закупочной ценой по единому правилу.
 
-    Себестоимость = sell_qty × purchase_price_at(product, day); для непокрытых
-    приёмками строк — фолбэк на cost_kop МойСклад. Один запрос (LATERAL), без N+1.
-    Возвращает агрегаты: по складам, по товарам, всего + покрытие.
+    Закуп: карточка товара → цена продажи × 0.6.
+    Категории «нет цены» нет — каждый товар получает cost.
+    Возвращает агрегаты: by_store, by_product, tot + разбивку покрытия.
     """
     sf = "AND spd.store_id = %s" if store_id else ""
     params = [d_from, d_to] + ([store_id] if store_id else [])
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT spd.store_id, spd.product_name, spd.sell_qty,
-                   spd.revenue_kop, spd.cost_kop, pp.price_kop
+                   spd.revenue_kop, pp.price_kop
             FROM sales_by_product_day spd
             LEFT JOIN LATERAL (
                 SELECT price_kop FROM purchase_price_asof p
@@ -64,23 +65,32 @@ def _sales_purchase_data(conn, d_from: date, d_to: date, store_id: str | None = 
 
     by_store: dict[str, dict] = {}
     by_product: dict[str, dict] = {}
-    tot = {"rev": 0, "pc": 0, "ms": 0, "cov": 0}
-    for sid, name, q, rk, ck, pp in rows:
-        q = float(q); rk = int(rk or 0); ck = int(ck or 0)
-        covered = pp is not None and pp > 0
-        cost = round(q * int(pp)) if covered else ck
-        st = by_store.setdefault(sid, {"rev": 0, "pc": 0, "ms": 0, "cov": 0})
-        st["rev"] += rk; st["pc"] += cost; st["ms"] += ck
-        if covered:
-            st["cov"] += rk
-        pr = by_product.setdefault(name, {"qty": 0.0, "rev": 0, "pc": 0, "ms": 0, "uncov": False})
-        pr["qty"] += q; pr["rev"] += rk; pr["pc"] += cost; pr["ms"] += ck
-        if not covered:
-            pr["uncov"] = True
-        tot["rev"] += rk; tot["pc"] += cost; tot["ms"] += ck
-        if covered:
-            tot["cov"] += rk
-    tot["coverage"] = (tot["cov"] / tot["rev"] * 100) if tot["rev"] else 0.0
+    _z = {"rev": 0, "pc": 0, "card": 0, "estimate": 0}
+    tot = {**_z}
+    for sid, name, q, rk, card_kop in rows:
+        q = float(q); rk = int(rk or 0)
+        if card_kop and int(card_kop) > 0:
+            cost = round(q * int(card_kop))
+            source = "card"
+        else:
+            cost = round(rk * 0.6)   # revenue × 0.6 = фолбэк «продажа − 40%»
+            source = "estimate"
+
+        st = by_store.setdefault(sid, {**_z})
+        st["rev"] += rk; st["pc"] += cost; st[source] = st.get(source, 0) + rk
+
+        pr = by_product.setdefault(name, {"qty": 0.0, "rev": 0, "pc": 0, "source": "card"})
+        pr["qty"] += q; pr["rev"] += rk; pr["pc"] += cost
+        if source != "card":
+            pr["source"] = source
+
+        tot["rev"] += rk; tot["pc"] += cost; tot[source] = tot.get(source, 0) + rk
+
+    r = tot["rev"] or 1
+    tot["cov_card"]     = tot["card"]     / r * 100
+    tot["cov_estimate"] = tot["estimate"] / r * 100
+    tot["cov_missing"]  = 0.0            # обратная совместимость (всегда 0)
+    tot["coverage"]     = tot["cov_card"] + tot["cov_estimate"]  # = 100
     return {"by_store": by_store, "by_product": by_product, "tot": tot}
 
 
@@ -141,18 +151,16 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     pdata = _sales_purchase_data(conn, d_from, d_to, store_id_f)
     by_store, by_product, tot = pdata["by_store"], pdata["by_product"], pdata["tot"]
 
-    # J1.1: методику в шапке — полными словами, каждая мысль отдельной строкой,
-    # без сокращений (владельцу были непонятны «себест.», «закуп.»).
-    cov = tot["coverage"]
+    # J1.1: методику в шапке — полными словами, каждая мысль отдельной строкой.
+    cov_card = tot["cov_card"]
+    card_pct = round(cov_card)
+    est_pct  = 100 - card_pct
     lines.append("Как считается прибыль: выручка минус закупочная стоимость товара.")
-    lines.append("Закупочная цена берётся из карточки товара в МойСклад.")
     lines.append("Расходы и списания в этой прибыли не учтены — они в своих разделах.")
     lines.append(
-        f"У {cov:.0f}% выручки есть закупочная цена в карточке; остальные "
-        f"{100 - cov:.0f}% посчитаны"
+        f"Прибыль посчитана точно у {card_pct}% продаж (закупка из карточки). "
+        f"У остальных {est_pct}% закупка оценена как цена продажи − 40%."
     )
-    lines.append("по себестоимости МойСклад (закупочная цена в карточке не заполнена).")
-    lines.append("* — закупочная цена неизвестна, использована себестоимость МойСклад")
     if store_name == "СОБРАНИЕ":
         lines.append("ℹ️ СОБРАНИЕ работает через перемещения — прибыль считается "
                      "по отгрузкам, поступление товара см. в «🔄 Перемещения».")
@@ -230,17 +238,6 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
         f"  Чеков: {grand_chk} · Ср.чек: {_rub(ac_t)} ₽"
     )
 
-    # E1.4: вторая цифра по себест. МойСклад — только когда говорит о чём-то:
-    # расхождение методик > 2% выручки ИЛИ в окне праздник (цены партий расходятся).
-    grand_ms = sum(by_store.get(r[0], {}).get("ms", 0) for r in stores)
-    ms_profit = grand_rev - grand_ms
-    holiday = _active_holiday(conn, d_from, d_to)
-    if grand_rev and (abs(gp_t - ms_profit) / grand_rev > 0.02 or holiday):
-        ms_margin = ms_profit / grand_rev * 100
-        why = (f"«{holiday}» в окне — цены партий сильно расходятся"
-               if holiday else "расхождение методик существенное")
-        lines.append(f"  📅 {why}.")
-        lines.append(f"     Для сравнения, по себест. МойСклад: {_rub(ms_profit)} ₽ ({ms_margin:.0f}%)")
     lines.append("")
 
     # G5 (переработан): «Требует внимания». Чистые розничные точки сравниваем с
@@ -258,8 +255,12 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
             ORDER BY p.priced_from DESC LIMIT 1
         ) pp ON true
     """
-    _pcost = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
-              "THEN round(spd.sell_qty * pp.price_kop) ELSE spd.cost_kop END")
+    _pcost = (
+        "CASE "
+        "WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
+        "THEN round(spd.sell_qty * pp.price_kop) "
+        "ELSE round(spd.revenue_kop * 0.6) END"
+    )
     _srez = ("spd.assortment_id IN (SELECT DISTINCT product_id FROM stock_snapshot "
              "WHERE folder_path LIKE %s)")
     any_star = False
@@ -309,13 +310,13 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     nocost = [r for r in rows if int(r[3] or 0) == 0 and int(r[1] or 0) > 0]
 
     if nocost:
-        lines.append("⚠️ Нет себестоимости (ошибка данных — заполнить закупочную цену в карточке):")
+        lines.append("⚠️ Нет закупочной цены в карточке — себестоимость оценена (цена × 0.6):")
         for name, rev, _profit, _pc, _uncov in nocost[:10]:
             lines.append(f"  • {name}: выручка {_rub(int(rev or 0))} ₽")
         lines.append("")
 
     if any_star:
-        lines.append("* закупочная цена не из карточки (фолбэк на себест. МойСклад)")
+        lines.append("* нет закупочной цены в карточке — использована оценка (цена продажи × 0.6)")
 
     return "\n".join(lines)
 

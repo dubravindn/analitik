@@ -399,17 +399,18 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                         f"Период: {_fmt_period(d_from, d_to)}\n"
                         f"Склад: {store_name or 'Все склады'}")
 
-    # PDF — отдельный путь: handler сам отправляет файл и клавиатуру
+    # PDF-секции — handler сам отправляет файл и клавиатуру
     if section == "pdf":
         _run_pdf(conn_factory, client_factory, d_from, d_to, store_name,
                  bot_token, chat_id)
         return
+    if section == "sales":
+        _run_sales(conn_factory, client_factory, d_from, d_to, store_name,
+                   bot_token, chat_id)
+        return
 
     try:
-        if section == "sales":
-            text = _run_sales(conn_factory, client_factory, d_from, d_to, store_name,
-                              bot_token, chat_id)
-        elif section == "stock":
+        if section == "stock":
             text = _run_stock(conn_factory, client_factory, d_from, store_name,
                               folder_group, bot_token, chat_id)
         elif section == "stale":
@@ -449,7 +450,7 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
 
 def _run_sales(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
     from .etl_sales import run as etl_sales
-    from .report_sales import build_sales_analytics
+    from .report_sales_pdf import build_sales_pdf
     conn   = conn_factory()
     client = client_factory()
     missing = _missing_days(conn, d_from, d_to)
@@ -457,7 +458,19 @@ def _run_sales(conn_factory, client_factory, d_from, d_to, store_name, bot_token
         tg.send_message(bot_token, chat_id,
                         f"⏳ Подгружаю {len(missing)} дн. из МойСклад…")
         etl_sales(client, conn, min(missing), max(missing))
-    return build_sales_analytics(conn, d_from, d_to, store_name)
+    try:
+        pdf_bytes = build_sales_pdf(conn, d_from, d_to, store_name)
+        period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
+        filename = f"hermes_sales_{period_safe}.pdf"
+        caption  = "Продажи " + _fmt_period(d_from, d_to)
+        if store_name:
+            caption += f" | {store_name}"
+        tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption)
+        tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
+    except Exception as e:
+        log.exception("Ошибка PDF продаж: %s", e)
+        tg.send_message(bot_token, chat_id,
+                        f"⚠️ Ошибка при генерации PDF: {e}", tg.main_reply_keyboard())
 
 
 def _run_stock(conn_factory, client_factory, snap_date, store_name, folder_group,

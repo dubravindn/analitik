@@ -239,3 +239,51 @@ def build_expenses_report(
         )
 
     return "\n".join(lines).rstrip()
+
+
+def get_owner_withdrawals(conn, d_from: date, d_to: date) -> int:
+    """Изъятия собственника за период (копейки). Не входят ни в расходы, ни в прибыль."""
+    from . import config
+    owner = list(config.OWNER_EXPENSE_ITEMS or [])
+    if not owner:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COALESCE(SUM(amount_kop), 0)
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'out'
+              AND expense_item_name = ANY(%s)
+        """, (d_from, d_to, owner))
+        return int(cur.fetchone()[0] or 0)
+
+
+def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
+    """Операционные расходы за период без изъятий собственника.
+
+    Returns {"total": int (копейки), "by_project": {"склад": int, "__general__": int}}
+    '__general__' — расходы без проекта (None / пустая строка).
+    """
+    from . import config
+    owner = list(config.OWNER_EXPENSE_ITEMS or [])
+    excl = ("AND (expense_item_name IS NULL OR NOT (expense_item_name = ANY(%s)))"
+            if owner else "")
+    params = (d_from, d_to) + ((owner,) if owner else ())
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(project_name, ''), '__general__'),
+                   SUM(amount_kop)
+            FROM cashflow_event
+            WHERE day BETWEEN %s AND %s AND direction = 'out'
+              {excl}
+            GROUP BY 1
+        """, params)
+        rows = cur.fetchall()
+
+    by_project: dict[str, int] = {}
+    total = 0
+    for proj, kop in rows:
+        v = int(kop or 0)
+        by_project[proj] = v
+        total += v
+    return {"total": total, "by_project": by_project}

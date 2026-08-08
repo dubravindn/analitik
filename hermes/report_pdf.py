@@ -54,24 +54,43 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
     sf_sd = "AND store_name = %s" if store_name else ""
     p_sd  = [d_from, d_to] + ([store_name] if store_name else [])
 
-    # 1. Выручка, себестоимость МойСклад (N1: методика зафиксирована явно), чеки
-    # M1: фильтр по channel совпадает с report_sales (только бизнес-каналы),
-    # иначе avg_check расходится на 1 ₽ если в БД есть строки с channel=NULL.
+    # 1. Выручка и чеки — из sales_by_store_day (только бизнес-каналы).
+    # M1: фильтр по channel совпадает с report_sales, иначе avg_check расходится.
     _known_channels = ["розница", "опт", "ресторан"]
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(revenue_kop), 0),
-                   COALESCE(SUM(cost_kop), 0),
                    COALESCE(SUM(checks), 0)
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s {sf_sd}
               AND channel = ANY(%s)
         """, p_sd + [_known_channels])
-        r = cur.fetchone() or (0, 0, 0)
+        r = cur.fetchone() or (0, 0)
     rev    = int(r[0])
-    cost   = int(r[1])
-    checks = int(r[2])
-    profit = rev - cost   # прибыль по себестоимости МойСклад
+    checks = int(r[1])
+    # Себестоимость — unit_cost(): карточка товара / цена продажи × 0.6 (фолбэк).
+    sf_prod = "AND ssd.store_name = %s" if store_name else ""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM(
+                CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0
+                THEN round(spd.sell_qty * pp.price_kop)
+                ELSE round(spd.revenue_kop * 0.6) END
+            ), 0)
+            FROM sales_by_product_day spd
+            JOIN sales_by_store_day ssd
+                 ON ssd.store_id = spd.store_id AND ssd.day = spd.day
+            LEFT JOIN LATERAL (
+                SELECT price_kop FROM purchase_price_asof p
+                WHERE p.product_id = spd.assortment_id AND p.priced_from <= spd.day
+                ORDER BY p.priced_from DESC LIMIT 1
+            ) pp ON true
+            WHERE spd.day BETWEEN %s AND %s
+              AND ssd.channel = ANY(%s)
+              {sf_prod}
+        """, [d_from, d_to, _known_channels] + ([store_name] if store_name else []))
+        cost = int((cur.fetchone() or (0,))[0])
+    profit = rev - cost
 
     # 2. Расходы — N2: операционные (без изъятий) и изъятия собственника раздельно
     sf_cf = "AND project_name = %s" if store_name else ""
