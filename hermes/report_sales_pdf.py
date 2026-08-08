@@ -162,7 +162,7 @@ def _render_income_split(
     """Блок «Разделение дохода» — визуальный каскад по макету ЦБД.
 
     Шары Ленина + Воровского → Коля 100% (прибыль = выручка, учёт не ведётся).
-    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_net.
+    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_after (после потерь).
     """
     pk.section_header(pdf, "Разделение дохода  ·  Дима и Коля")
 
@@ -199,7 +199,7 @@ def _render_income_split(
         pdf.set_text_color(*pk.INK)
 
     # ── каскад ────────────────────────────────────────────────────────────────
-    _row("Общая чистая прибыль", _v(grand_net), bold=True)
+    _row("Прибыль после потерь", _v(grand_net), bold=True)
     _sep()
     _row("  − Шары Коли (Ленина + Воровского)",
          "−" + _v(kola_balls_kop), color=pk.TERRA)
@@ -482,7 +482,7 @@ def build_sales_pdf(
 
     # -- Блок «Разделение дохода» (асимметричный дележ) ------------------------
     if not store_name:
-        _render_income_split(pdf, grand_net=grand_net, kola_balls_kop=kola_balls_kop)
+        _render_income_split(pdf, grand_net=grand_after, kola_balls_kop=kola_balls_kop)
 
     # -- Блок «ШАРЫ» (корневая группа, аналитический срез) --------------------
     if not store_name and balls_data:
