@@ -81,22 +81,25 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
             grand_kop += kop
             store_rows.append([sn, str(pos), _qty(qty), _rub(kop) + " ₽"])
 
-    # 2. Топ-10 — только ассортимент через product_dim (без упаковки и расходников)
-    asof = calc.assortment_filter("stock_snapshot.product_id")
+    # 2. Топ-10 — только ассортимент, pids через ANY(%s) чтобы WHERE точно применился
+    a_pids = calc.assortment_product_ids(conn)
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT product_name,
-                   SUM(stock_qty)   AS total_qty,
-                   MAX({_stu})      AS cost_unit,
-                   SUM({_stv})      AS cost_total
-            FROM stock_snapshot {_ST_JOIN}
-            WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
-              AND {asof}
-            GROUP BY product_name
-            ORDER BY cost_total DESC
-            LIMIT 10
-        """, _disc(2) + [day])
-        top_rows = cur.fetchall()
+        if a_pids:
+            cur.execute(f"""
+                SELECT product_name,
+                       SUM(stock_qty)   AS total_qty,
+                       MAX({_stu})      AS cost_unit,
+                       SUM({_stv})      AS cost_total
+                FROM stock_snapshot {_ST_JOIN}
+                WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
+                  AND stock_snapshot.product_id = ANY(%s::text[])
+                GROUP BY product_name
+                ORDER BY cost_total DESC
+                LIMIT 10
+            """, _disc(2) + [day, a_pids])
+            top_rows = cur.fetchall()
+        else:
+            top_rows = []
 
     # 3. Залежалые СРЕЗКА > 14 дней — сортировка по сумме DESC внутри склада
     with conn.cursor() as cur:

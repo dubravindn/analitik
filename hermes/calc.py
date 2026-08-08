@@ -117,6 +117,16 @@ def purchase_prices_asof(conn, day: "date", product_ids=None) -> "dict[str, int]
         return {r[0]: int(r[1]) for r in cur.fetchall()}
 
 
+def assortment_product_ids(conn) -> list[str]:
+    """Product IDs группы «Ассортимент» — для параметрического ANY(%s::text[]) в SQL."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT product_id FROM product_dim WHERE folder_path LIKE %s",
+            ('Ассортимент/%',)
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
 def discount_product_ids(conn) -> frozenset[str]:
     """Product IDs, поставлявшихся от дисконтного поставщика (ООО «Поставщик»).
 
