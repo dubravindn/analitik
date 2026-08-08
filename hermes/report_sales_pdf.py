@@ -647,7 +647,7 @@ def build_sales_pdf(
     # -- Callout: аномально низкая валовая маржа --------------------------------
     import statistics
     retail_margins = [
-        (sn, _gross(sid) / rev_s * 100, rev_s)
+        (sn, _gross(sid, rev_s) / rev_s * 100, rev_s)
         for sid, sn, ch, rev_s, _ in stores
         if ch == "розница" and sn not in mixed and rev_s > 0
     ]
