@@ -117,6 +117,24 @@ def purchase_prices_asof(conn, day: "date", product_ids=None) -> "dict[str, int]
         return {r[0]: int(r[1]) for r in cur.fetchall()}
 
 
+def discount_product_ids(conn) -> frozenset[str]:
+    """Product IDs, поставлявшихся от дисконтного поставщика (ООО «Поставщик»).
+
+    Идентификация по agent_name — supply_doc не содержит agent_id.
+    Возвращает пустое множество, если поставок не было.
+    """
+    from . import config
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT si.product_id
+            FROM supply_item si
+            JOIN supply_doc sd ON sd.doc_id = si.doc_id
+            WHERE sd.agent_name = %s
+              AND si.product_id IS NOT NULL AND si.product_id != ''
+        """, (config.DISCOUNT_SUPPLIER_NAME,))
+        return frozenset(r[0] for r in cur.fetchall())
+
+
 def weekday_baseline(conn, day: "date", weeks: int = 8) -> "tuple[int, int] | None":
     """Средняя выручка по тому же дню недели за прошлые N недель.
 

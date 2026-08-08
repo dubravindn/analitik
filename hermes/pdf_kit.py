@@ -296,16 +296,19 @@ def pl_cascade(pdf: HermesPDF, rows: list[tuple]) -> None:
         elif style == "note":
             pdf.set_font("DejaVu", size=8.5)
             pdf.set_text_color(*SAGE)
+        elif style == "credit":
+            pdf.set_font("DejaVu", size=9)
+            pdf.set_text_color(*SAGE)
         else:  # income
             pdf.set_font("DejaVu_B", size=9)
             pdf.set_text_color(*INK)
 
-        indent = "  " if style in ("deduct", "note") else ""
+        indent = "  " if style in ("deduct", "note", "credit") else ""
         pdf.set_x(_MARGIN)
         pdf.cell(L_W, h, indent + label)
 
         abs_kop = abs(int(value_kop))
-        sign = "−" if style in ("deduct", "note") else ""
+        sign = "−" if style in ("deduct", "note") else ("+" if style == "credit" else "")
         val_str = f"{sign}{abs_kop // 100:,}".replace(",", " ") + " ₽"
         if pct_str:
             val_str += f"  ({pct_str})"

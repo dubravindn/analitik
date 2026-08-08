@@ -40,19 +40,25 @@ def _store_id_for(conn, store_name: str | None) -> str | None:
     return r[0] if r else None
 
 
-def _sales_purchase_data(conn, d_from: date, d_to: date, store_id: str | None = None) -> dict:
+def _sales_purchase_data(
+    conn, d_from: date, d_to: date,
+    store_id: str | None = None,
+    discount_pids: frozenset | None = None,
+) -> dict:
     """Продажи за период с закупочной ценой по единому правилу.
 
-    Закуп: карточка товара → цена продажи × 0.6.
-    Категории «нет цены» нет — каждый товар получает cost.
+    Закуп: карточка товара → цена продажи × 0.6 (фолбэк).
+    Если discount_pids передан — к этим товарам применяется скидка 7% (× 0.93).
     Возвращает агрегаты: by_store, by_product, tot + разбивку покрытия.
+    by_store[sid]: "pc" = эффективный закуп, "pc_raw" = до скидки, "discount" = сумма скидки.
     """
+    from . import config
     sf = "AND spd.store_id = %s" if store_id else ""
     params = [d_from, d_to] + ([store_id] if store_id else [])
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT spd.store_id, spd.product_name, spd.sell_qty,
-                   spd.revenue_kop, pp.price_kop
+            SELECT spd.store_id, spd.product_name, spd.assortment_id,
+                   spd.sell_qty, spd.revenue_kop, pp.price_kop
             FROM sales_by_product_day spd
             LEFT JOIN LATERAL (
                 SELECT price_kop FROM purchase_price_asof p
@@ -65,26 +71,39 @@ def _sales_purchase_data(conn, d_from: date, d_to: date, store_id: str | None = 
 
     by_store: dict[str, dict] = {}
     by_product: dict[str, dict] = {}
-    _z = {"rev": 0, "pc": 0, "card": 0, "estimate": 0}
+    _z = {"rev": 0, "pc": 0, "pc_raw": 0, "discount": 0, "card": 0, "estimate": 0}
     tot = {**_z}
-    for sid, name, q, rk, card_kop in rows:
+
+    disc = discount_pids or frozenset()
+    mult = config.SUPPLIER_DISCOUNT_MULTIPLIER
+
+    for sid, name, assort_id, q, rk, card_kop in rows:
         q = float(q); rk = int(rk or 0)
         if card_kop and int(card_kop) > 0:
-            cost = round(q * int(card_kop))
+            raw = round(q * int(card_kop))
+            if assort_id and assort_id in disc:
+                discount = round(raw * config.SUPPLIER_DISCOUNT_RATE)
+            else:
+                discount = 0
+            cost = raw - discount
             source = "card"
         else:
-            cost = round(rk * 0.6)   # revenue × 0.6 = фолбэк «продажа − 40%»
+            raw = round(rk * 0.6)   # revenue × 0.6 = фолбэк «продажа − 40%»
+            discount = 0
+            cost = raw
             source = "estimate"
 
         st = by_store.setdefault(sid, {**_z})
-        st["rev"] += rk; st["pc"] += cost; st[source] = st.get(source, 0) + rk
+        st["rev"] += rk; st["pc"] += cost; st["pc_raw"] += raw
+        st["discount"] += discount; st[source] = st.get(source, 0) + rk
 
         pr = by_product.setdefault(name, {"qty": 0.0, "rev": 0, "pc": 0, "source": "card"})
         pr["qty"] += q; pr["rev"] += rk; pr["pc"] += cost
         if source != "card":
             pr["source"] = source
 
-        tot["rev"] += rk; tot["pc"] += cost; tot[source] = tot.get(source, 0) + rk
+        tot["rev"] += rk; tot["pc"] += cost; tot["pc_raw"] += raw
+        tot["discount"] += discount; tot[source] = tot.get(source, 0) + rk
 
     r = tot["rev"] or 1
     tot["cov_card"]     = tot["card"]     / r * 100

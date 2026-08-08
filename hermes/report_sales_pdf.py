@@ -119,16 +119,34 @@ def _get_svoi_purchases(conn, d_from: date, d_to: date) -> dict:
     return result
 
 
-def _get_losses_by_store(conn, d_from: date, d_to: date) -> dict[str, int]:
-    """Списания по закупочной стоимости (исключая ADJUSTMENT_STORES)."""
+def _get_losses_by_store(
+    conn, d_from: date, d_to: date,
+    discount_pids: frozenset | None = None,
+) -> dict[str, int]:
+    """Списания по закупочной стоимости (исключая ADJUSTMENT_STORES).
+
+    Для товаров ООО «Поставщик» применяет скидку 7% к цене из purchase_price_asof.
+    Стоимость i.total_kop (если product_id неизвестен) оставляем без изменений —
+    нет информации о поставщике.
+    """
     excl = list(config.ADJUSTMENT_STORES or [])
+    disc_list = sorted(discount_pids) if discount_pids else []
+    has_disc = bool(disc_list)
+
+    disc_case = (
+        " * CASE WHEN i.product_id = ANY(%s::text[]) "
+        "THEN 0.93::numeric ELSE 1.0 END"
+        if has_disc else ""
+    )
+    params: list = ([disc_list] if has_disc else []) + [d_from, d_to, excl]
+
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT d.store_name,
                    SUM(CASE
                        WHEN i.product_id IS NOT NULL
                             AND pp.price_kop IS NOT NULL AND pp.price_kop > 0
-                           THEN round(i.qty * pp.price_kop)
+                           THEN round(i.qty * pp.price_kop{disc_case})
                        ELSE i.total_kop END) AS loss_kop
             FROM loss_doc d
             JOIN loss_item i ON i.doc_id = d.doc_id
@@ -141,7 +159,7 @@ def _get_losses_by_store(conn, d_from: date, d_to: date) -> dict[str, int]:
             WHERE d.day BETWEEN %s AND %s
               AND NOT (d.store_name = ANY(%s))
             GROUP BY d.store_name
-        """, (d_from, d_to, excl))
+        """, params)
         rows = cur.fetchall()
 
     result: dict[str, int] = {}
@@ -156,22 +174,25 @@ def _get_losses_by_store(conn, d_from: date, d_to: date) -> dict[str, int]:
 
 def _render_income_split(
     pdf: pk.HermesPDF,
-    grand_net: int,
+    grand_prof: int,
+    exp_total: int,
+    losses_total: int,
     kola_balls_kop: int,
-    grand_prof: int = 0,
-    exp_total: int = 0,
 ) -> None:
-    """Блок «Разделение дохода» — визуальный каскад по макету ЦБД.
+    """Блок «Разделение прибыли» — каскад от вал.прибыли до ИТОГО Диме/Коле.
 
-    Шары Ленина + Воровского → Коля 100% (прибыль = выручка, учёт не ведётся).
-    Остаток → 50/50. Инвариант: ИТОГО Диме + ИТОГО Коле = grand_net (чистая).
+    Вал.прибыль → −Расходы → =До списаний → −Списания →
+    =Чистая после списаний → −Шары Коли → =Совместная → Дима/Коля.
+    Инвариант: ИТОГО Диме + ИТОГО Коле == grand_after.
     """
-    pk.section_header(pdf, "Разделение дохода  ·  Дима и Коля")
+    pk.section_header(pdf, "Разделение прибыли  ·  Дима и Коля")
 
-    joint      = grand_net - kola_balls_kop
-    dima_share = joint // 2
-    kola_joint = joint - dima_share
-    kola_total = kola_joint + kola_balls_kop
+    grand_net   = grand_prof - exp_total
+    grand_after = grand_net - losses_total
+    joint       = grand_after - kola_balls_kop
+    dima_share  = joint // 2
+    kola_joint  = joint - dima_share
+    kola_total  = kola_joint + kola_balls_kop
 
     LW = 115.0
     VW = float(pk._INNER_W) - LW
@@ -201,20 +222,26 @@ def _render_income_split(
         pdf.set_text_color(*pk.INK)
 
     # ── каскад ────────────────────────────────────────────────────────────────
-    if grand_prof:
-        _row("Вал. прибыль (выручка − закупка)", _v(grand_prof))
-        _sep(pk.GRID, 0.2)
-        _row("  − Операционные расходы", "−" + _v(exp_total), color=pk.TERRA)
-        _sep()
-        pdf.ln(1)
-    _row("= Чистая прибыль", _v(grand_net), bold=True, bg=pk.SAGE_L, h=7.5)
+    _row("Валовая прибыль", _v(grand_prof), bold=True)
+    _sep(pk.GRID, 0.2)
+    _row("  − Операционные расходы", "−" + _v(exp_total), color=pk.TERRA)
+    _sep()
+    pdf.ln(1)
+    _row("= Прибыль до списаний", _v(grand_net), bold=True, bg=pk.SAGE_L, h=7.5)
+    pdf.ln(1)
+    _sep(pk.GRID, 0.2)
+    _row("  − Списания (порча)", "−" + _v(losses_total), color=pk.TERRA)
+    _sep()
+    pdf.ln(1)
+    _row("= Чистая прибыль после списаний", _v(grand_after),
+         bold=True, bg=pk.SAGE_L, h=7.5)
     pdf.ln(1)
     _sep()
     _row("  − Шары Коли (Ленина + Воровского)",
          "−" + _v(kola_balls_kop), color=pk.TERRA)
     _sep()
     pdf.ln(1.5)
-    _row("= Совместное", _v(joint), bold=True, bg=pk.SAGE_L, h=7.5)
+    _row("= Совместная прибыль", _v(joint), bold=True, bg=pk.SAGE_L, h=7.5)
     pdf.ln(0.5)
     _row("     → Дима (50%)",   _v(dima_share), color=pk.SAGE)
     _row("     → Коля (50%)",   _v(kola_joint), color=pk.SAGE)
@@ -229,16 +256,16 @@ def _render_income_split(
     pdf.ln(3)
 
     # ── проверка и сноска ─────────────────────────────────────────────────────
-    ok = (dima_share + kola_total == grand_net)
+    ok = (dima_share + kola_total == grand_after)
     pdf.set_font("DejaVu", size=7.5)
     pdf.set_text_color(*(pk.SAGE if ok else pk.TERRA))
     pdf.set_x(pk._MARGIN)
     if ok:
         chk = (f"Проверка: {_rub(dima_share)} + {_rub(kola_total)}"
-               f" = {_rub(grand_net)} ₽ ✓")
+               f" = {_rub(grand_after)} ₽ ✓")
     else:
         chk = (f"⚠ РАСХОЖДЕНИЕ: {_rub(dima_share + kola_total)}"
-               f" ≠ {_rub(grand_net)} ₽")
+               f" ≠ {_rub(grand_after)} ₽")
     pdf.cell(pk._INNER_W, 4.5, chk, align="L", new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(*pk.SAGE)
     pdf.set_x(pk._MARGIN)
@@ -261,8 +288,10 @@ def build_sales_pdf(
     store_label = store_name or "Все склады"
 
     # -- Данные ----------------------------------------------------------------
+    discount_pids = calc.discount_product_ids(conn)
     store_id_f = _store_id_for(conn, store_name)
-    pdata = _sales_purchase_data(conn, d_from, d_to, store_id_f)
+    pdata = _sales_purchase_data(conn, d_from, d_to, store_id_f,
+                                 discount_pids=discount_pids)
     by_store, tot = pdata["by_store"], pdata["tot"]
 
     sf = "AND store_name = %s" if store_name else ""
@@ -282,7 +311,7 @@ def build_sales_pdf(
     # -- Расходы, изъятия, потери, шары, свои ----------------------------------
     exp = get_operational_expenses(conn, d_from, d_to)
     owner_kop = get_owner_withdrawals(conn, d_from, d_to)
-    losses = _get_losses_by_store(conn, d_from, d_to)
+    losses = _get_losses_by_store(conn, d_from, d_to, discount_pids=discount_pids)
     losses_total = losses.get("__total__", 0)
     balls_data = _get_balls_by_store(conn, d_from, d_to)
     svoi = _get_svoi_purchases(conn, d_from, d_to)
@@ -307,13 +336,13 @@ def build_sales_pdf(
         return _gross(sid, rev_s) - direct - share
 
     _biz = [r for r in stores if r[2] in ("розница", "опт", "ресторан")]
-    grand_rev   = sum(r[3] for r in _biz)
-    grand_cost  = sum(by_store.get(r[0], {}).get("pc", 0) for r in _biz)
-    grand_prof  = grand_rev - grand_cost
-    grand_net   = grand_prof - exp["total"]
-    grand_after = grand_net - losses_total
-    grand_chk   = sum(r[4] for r in _biz)
-    grand_ac    = calc.avg_check(grand_rev, grand_chk)
+    grand_rev      = sum(r[3] for r in _biz)
+    grand_cost_raw = sum(by_store.get(r[0], {}).get("pc_raw", 0) for r in _biz)
+    discount_total = sum(by_store.get(r[0], {}).get("discount", 0) for r in _biz)
+    grand_cost     = sum(by_store.get(r[0], {}).get("pc", 0) for r in _biz)
+    grand_prof     = grand_rev - grand_cost
+    grand_net      = grand_prof - exp["total"]
+    grand_after    = grand_net - losses_total
 
     # -- Топ-20 по выручке -----------------------------------------------------
     sf2 = "AND spd.store_id = %s" if store_id_f else ""
@@ -344,28 +373,35 @@ def build_sales_pdf(
 
     pk.cover(pdf, f"Продажи ({days} дн.)")
 
-    # KPI: 5 плашек — выручка / вал.прибыль(%) / чистая(%) / после потерь(%) / ср.чек
+    # KPI: 4 плашки — выручка / вал.прибыль / до списаний / чистая после списаний
     pk.kpi_row(pdf, [
-        ("Выручка",      _rub(grand_rev),   "₽"),
-        ("Вал.прибыль",  _rub(grand_prof),  "₽", _pct(grand_prof, grand_rev) + "%"),
-        ("Чист.прибыль", _rub(grand_net),   "₽", _pct(grand_net, grand_rev)  + "%"),
-        ("После потерь", _rub(grand_after), "₽", _pct(grand_after, grand_rev) + "%"),
-        ("Ср. чек",      _rub(grand_ac),    "₽"),
+        ("Выручка",        _rub(grand_rev),   "₽"),
+        ("Вал.прибыль",    _rub(grand_prof),  "₽", _pct(grand_prof, grand_rev) + "%"),
+        ("До списаний",    _rub(grand_net),   "₽", _pct(grand_net, grand_rev)  + "%"),
+        ("Чист. / спис.",  _rub(grand_after), "₽", _pct(grand_after, grand_rev) + "%"),
     ])
 
     # -- Каскад P&L ------------------------------------------------------------
     pk.section_header(pdf, "Отчёт о прибылях и убытках")
-    cascade_rows = [
+    cascade_rows: list = [
         ("Выручка", grand_rev, "income"),
-        ("Закупочная стоимость", grand_cost, "deduct"),
+        ("Закупочная стоимость до скидки", grand_cost_raw, "deduct"),
+    ]
+    if discount_total > 0:
+        cascade_rows.append(
+            ("Скидка ООО «Поставщик» 7%", discount_total, "credit")
+        )
+    cascade_rows += [
         (None, None, None),
-        ("= ВАЛОВАЯ ПРИБЫЛЬ", grand_prof, "subtotal", _pct(grand_prof, grand_rev) + "%"),
+        ("= ВАЛОВАЯ ПРИБЫЛЬ", grand_prof, "subtotal",
+         _pct(grand_prof, grand_rev) + "%"),
         ("Операционные расходы", exp["total"], "deduct"),
         (None, None, None),
-        ("= ЧИСТАЯ ПРИБЫЛЬ", grand_net, "subtotal", _pct(grand_net, grand_rev) + "%"),
+        ("= ПРИБЫЛЬ ДО СПИСАНИЙ", grand_net, "subtotal",
+         _pct(grand_net, grand_rev) + "%"),
         ("Списания (порча)", losses_total, "deduct"),
         (None, None, None),
-        ("= ПРИБЫЛЬ ПОСЛЕ ПОТЕРЬ", grand_after, "subtotal",
+        ("= ЧИСТАЯ ПРИБЫЛЬ ПОСЛЕ СПИСАНИЙ", grand_after, "subtotal",
          _pct(grand_after, grand_rev) + "%"),
     ]
     if owner_kop > 0:
@@ -384,9 +420,13 @@ def build_sales_pdf(
     est_pct  = 100 - card_pct
     cov_note = (
         f"Прибыль посчитана точно у {card_pct}% продаж (закупка из карточки). "
-        f"У остальных {est_pct}% закупка оценена как цена продажи − 40%. "
-        "Чистая = валовая − операционные расходы (без изъятий собственника)."
+        f"У остальных {est_pct}% закупка = выручка × 0.6. "
+        "До списаний = валовая − операционные расходы."
     )
+    if discount_total > 0:
+        cov_note += (
+            f" Скидка ООО «Поставщик» 7% учтена в закупке (−{_rub(discount_total)} ₽)."
+        )
     pdf.multi_cell(pk._INNER_W, 4, cov_note, align="L")
     pdf.set_text_color(*pk.INK)
     pdf.ln(3)
@@ -408,10 +448,10 @@ def build_sales_pdf(
     # -- Таблица: каналы и склады (6 колонок, % inline) ------------------------
     pk.section_header(pdf, "Итоги по каналам и складам")
 
-    # [Склад, Выручка, Вал.приб.·%, Чист.приб.·%, Чек] = 174мм
-    hdrs = ["Склад / Канал", "Выручка", "Вал.приб. · %", "Чист.приб. · %", "Чек"]
-    cws  = [56, 27, 42, 33, 16]
-    alns = ["L", "R", "R", "R", "R"]
+    # [Склад, Выручка, Вал.прибыль·%, До списаний·%] = 174мм
+    hdrs = ["Склад / Канал", "Выручка", "Вал.прибыль · %", "До списаний · %"]
+    cws  = [60, 30, 42, 42]
+    alns = ["L", "R", "R", "R"]
 
     mixed = set(config.MIXED_CHANNEL_STORES or [])
     chan_rows: list[list[str]] = []
@@ -425,9 +465,8 @@ def build_sales_pdf(
             continue
         c_gross = sum(_gross(r[0], r[3]) for r in chan)
         c_net   = sum(_net(r[0], r[1], r[3]) for r in chan)
-        c_chk   = sum(r[4] for r in chan)
 
-        for sid, sn, _, rev_s, chk_s in chan:
+        for sid, sn, _, rev_s, _chk in chan:
             if rev_s == 0:
                 continue
             gp  = _gross(sid, rev_s)
@@ -441,7 +480,6 @@ def build_sales_pdf(
                 _rub(rev_s) + " ₽",
                 _rub_pct(gp, rev_s),
                 _rub_pct(np_, rev_s),
-                str(chk_s),
             ])
             chan_styles.append(None)
             ball_rev = balls_by_store.get(sn, 0)
@@ -449,8 +487,7 @@ def build_sales_pdf(
                 ball_lbl = ("в т.ч. шары (Коля)"
                             if sn in _KOLA_BALL_STORES
                             else "в т.ч. шары (совместное)")
-                chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽",
-                                  "", "", ""])
+                chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽", "", ""])
                 chan_styles.append("detail")
 
         chan_rows.append([
@@ -458,7 +495,6 @@ def build_sales_pdf(
             _rub(c_rev)   + " ₽",
             _rub_pct(c_gross, c_rev),
             _rub_pct(c_net, c_rev),
-            str(c_chk),
         ])
         chan_styles.append(None)
 
@@ -467,7 +503,6 @@ def build_sales_pdf(
         _rub(grand_rev)  + " ₽",
         _rub_pct(grand_prof, grand_rev),
         _rub_pct(grand_net, grand_rev),
-        str(grand_chk),
     ])
     chan_styles.append(None)
 
@@ -479,7 +514,7 @@ def build_sales_pdf(
     pdf.set_font("DejaVu", size=7.5)
     pdf.set_text_color(*pk.SAGE)
     footnotes = [
-        "Чистая прибыль: прямые расходы склада + доля общих расходов пропорционально выручке — оценка.",
+        "«До списаний»: прямые расходы склада + доля общих расходов пропорционально выручке — оценка.",
     ]
     if mixed_in_table:
         footnotes.append("† Смешанная касса — точка обслуживает несколько каналов.")
@@ -493,10 +528,10 @@ def build_sales_pdf(
     if not store_name:
         _render_income_split(
             pdf,
-            grand_net=grand_net,
-            kola_balls_kop=kola_balls_kop,
             grand_prof=grand_prof,
             exp_total=exp["total"],
+            losses_total=losses_total,
+            kola_balls_kop=kola_balls_kop,
         )
 
     # -- Блок «ШАРЫ» (корневая группа, аналитический срез) --------------------
@@ -582,7 +617,7 @@ def build_sales_pdf(
     # -- Списания по складам ---------------------------------------------------
     store_losses = {k: v for k, v in losses.items() if k != "__total__"}
     if store_losses:
-        pk.section_header(pdf, "Списания и прибыль после потерь по складам")
+        pk.section_header(pdf, "Списания и чистая прибыль по складам")
         loss_tbl_rows = []
         sum_net = 0; sum_after = 0
         for sid, sn, ch, rev_s, _ in stores:
@@ -606,7 +641,7 @@ def build_sales_pdf(
         ])
         pk.table(
             pdf,
-            headers=["Склад", "Списания", "Чист.прибыль", "После потерь"],
+            headers=["Склад", "Списания", "До списаний", "Чистая после спис."],
             rows=loss_tbl_rows,
             col_widths=[86, 28, 30, 30],
             aligns=["L", "R", "R", "R"],

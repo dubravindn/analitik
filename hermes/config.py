@@ -102,6 +102,11 @@ STORE_CHANNELS: dict[str, str] = {
 # Заполнить после того, как посмотришь в supply_doc: SELECT DISTINCT agent_name FROM supply_doc
 MOSCOW_SUPPLIERS: list[str] = ['ООО "Поставщик"']
 
+# Скидка от дисконтного поставщика — применяется к закупочным ценам из карточки.
+SUPPLIER_DISCOUNT_RATE: float = 0.07
+SUPPLIER_DISCOUNT_MULTIPLIER: float = 0.93
+DISCOUNT_SUPPLIER_NAME: str = MOSCOW_SUPPLIERS[0]
+
 # Служебные контрагенты-заглушки розницы: розничные продажи проводятся на них
 # документами demand (не на реального покупателя). В «Топ клиентов» они не
 # показываются как клиенты — их сумма выводится одной строкой «Розничные продажи

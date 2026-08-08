@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from hermes import pdf_kit as pk
+from hermes import calc, pdf_kit as pk
 from hermes.report_stock import (
     _ST_JOIN, _ST_UNIT, _ST_VALUE, _STORE_ORDER, STALE_SREZKA_MIN_DAYS,
 )
@@ -26,6 +26,31 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
     day    = date_to
     period = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}"
 
+    # Товары ООО «Поставщик» — применяем скидку 7% к закупочной стоимости
+    discount_pids = calc.discount_product_ids(conn)
+    disc_list = sorted(discount_pids)
+    has_disc  = bool(disc_list)
+
+    if has_disc:
+        _stv = (
+            "stock_qty"
+            " * COALESCE(NULLIF(pp.price_kop, 0), stock_snapshot.cost_price_kop)"
+            " * CASE WHEN stock_snapshot.product_id = ANY(%s::text[])"
+            "   THEN 0.93::numeric ELSE 1.0 END"
+        )
+        _stu = (
+            "COALESCE(NULLIF(pp.price_kop, 0), stock_snapshot.cost_price_kop)"
+            " * CASE WHEN stock_snapshot.product_id = ANY(%s::text[])"
+            "   THEN 0.93::numeric ELSE 1.0 END"
+        )
+    else:
+        _stv = _ST_VALUE
+        _stu = _ST_UNIT
+
+    def _disc(n: int = 1) -> list:
+        """Параметры скидки (disc_list × n) для подстановки в SELECT до WHERE."""
+        return [disc_list] * n if has_disc else []
+
     pdf = pk.HermesPDF(section_title="Остатки", period=period)
     pdf.add_page()
     pk.cover(pdf, f"Остатки  ·  {day.strftime('%d.%m.%Y')}")
@@ -42,11 +67,11 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
             cur.execute(f"""
                 SELECT COUNT(*),
                        COALESCE(SUM(stock_qty), 0),
-                       COALESCE(SUM({_ST_VALUE}), 0)
+                       COALESCE(SUM({_stv}), 0)
                 FROM stock_snapshot {_ST_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
                   AND store_name = %s AND folder_path LIKE %s
-            """, [day, sn, "Ассортимент/%"])
+            """, _disc() + [day, sn, "Ассортимент/%"])
             r = cur.fetchone()
             if not r or not r[0]:
                 continue
@@ -78,15 +103,15 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
         cur.execute(f"""
             SELECT product_name,
                    SUM(stock_qty)   AS total_qty,
-                   MAX({_ST_UNIT})  AS cost_unit,
-                   SUM({_ST_VALUE}) AS cost_total
+                   MAX({_stu})      AS cost_unit,
+                   SUM({_stv})      AS cost_total
             FROM stock_snapshot {_ST_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
               AND folder_path LIKE %s
             GROUP BY product_name
             ORDER BY cost_total DESC
             LIMIT 10
-        """, [day, "Ассортимент/%"])
+        """, _disc(2) + [day, "Ассортимент/%"])
         top_rows = cur.fetchall()
 
     pk.table(
@@ -119,14 +144,14 @@ def build_stock_pdf(conn, date_from: date, date_to: date) -> bytes:
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT store_name, product_name, stock_qty,
-                   {_ST_UNIT} AS cost_unit,
-                   {_ST_VALUE} AS cost_total
+                   {_stu} AS cost_unit,
+                   {_stv} AS cost_total
             FROM stock_snapshot {_ST_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0
               AND folder_path LIKE %s
               AND SPLIT_PART(folder_path, '/', 2) = 'СРЕЗКА'
             ORDER BY store_name, stock_qty DESC
-        """, [day, "Ассортимент/%"])
+        """, _disc(2) + [day, "Ассортимент/%"])
         snap_rows = cur.fetchall()
 
     stale = []
