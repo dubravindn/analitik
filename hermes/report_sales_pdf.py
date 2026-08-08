@@ -286,24 +286,24 @@ def build_sales_pdf(
     general_exp = exp["by_project"].get("__general__", 0)
     total_rev_for_alloc = sum(r[3] for r in stores if r[3] > 0) or 1
 
-    def _gross(sid):
-        s = by_store.get(sid, {})
-        return s.get("rev", 0) - s.get("pc", 0)
+    def _gross(sid, rev_s):
+        cost = by_store.get(sid, {}).get("pc", 0)
+        return rev_s - cost
 
     def _net(sid, sn, rev_s):
         if rev_s == 0:
             return 0
         direct = exp["by_project"].get(sn, 0)
         share  = round(general_exp * rev_s / total_rev_for_alloc)
-        return _gross(sid) - direct - share
+        return _gross(sid, rev_s) - direct - share
 
-    grand_rev   = tot["rev"]
-    grand_cost  = tot["pc"]
+    _biz = [r for r in stores if r[2] in ("розница", "опт", "ресторан")]
+    grand_rev   = sum(r[3] for r in _biz)
+    grand_cost  = sum(by_store.get(r[0], {}).get("pc", 0) for r in _biz)
     grand_prof  = grand_rev - grand_cost
     grand_net   = grand_prof - exp["total"]
     grand_after = grand_net - losses_total
-    grand_chk   = sum(r[4] for r in stores if r[2] in ("розница", "опт", "ресторан"))
-    grand_ac    = calc.avg_check(grand_rev, grand_chk)
+    grand_chk   = sum(r[4] for r in _biz)
 
     # -- Топ-20 по выручке -----------------------------------------------------
     sf2 = "AND spd.store_id = %s" if store_id_f else ""
@@ -398,10 +398,10 @@ def build_sales_pdf(
     # -- Таблица: каналы и склады (6 колонок, % inline) ------------------------
     pk.section_header(pdf, "Итоги по каналам и складам")
 
-    # [Склад, Выручка, Вал.приб.·%, Чист.приб.·%, Чеков, Ср.чек] = 174мм
-    hdrs = ["Склад / Канал", "Выручка", "Вал.приб. · %", "Чист.приб. · %", "Чек", "Ср.чек"]
-    cws  = [56, 24, 36, 30, 16, 12]
-    alns = ["L", "R", "R", "R", "R", "R"]
+    # [Склад, Выручка, Вал.приб.·%, Чист.приб.·%, Чек] = 174мм
+    hdrs = ["Склад / Канал", "Выручка", "Вал.приб. · %", "Чист.приб. · %", "Чек"]
+    cws  = [56, 27, 42, 33, 16]
+    alns = ["L", "R", "R", "R", "R"]
 
     mixed = set(config.MIXED_CHANNEL_STORES or [])
     chan_rows: list[list[str]] = []
@@ -413,16 +413,15 @@ def build_sales_pdf(
         c_rev = sum(r[3] for r in chan)
         if c_rev == 0:
             continue
-        c_gross = sum(_gross(r[0]) for r in chan)
+        c_gross = sum(_gross(r[0], r[3]) for r in chan)
         c_net   = sum(_net(r[0], r[1], r[3]) for r in chan)
         c_chk   = sum(r[4] for r in chan)
 
         for sid, sn, _, rev_s, chk_s in chan:
             if rev_s == 0:
                 continue
-            gp  = _gross(sid)
+            gp  = _gross(sid, rev_s)
             np_ = _net(sid, sn, rev_s)
-            ac  = calc.avg_check(rev_s, chk_s)
             marker = " †" if sn in mixed else ""
             if sn in mixed:
                 mixed_in_table.append(sn)
@@ -433,17 +432,15 @@ def build_sales_pdf(
                 _rub_pct(gp, rev_s),
                 _rub_pct(np_, rev_s),
                 str(chk_s),
-                _rub(ac) + " ₽",
             ])
             chan_styles.append(None)
-            # Подстрока шаров по складу (если были продажи группы ШАРЫ)
             ball_rev = balls_by_store.get(sn, 0)
             if ball_rev > 0 and not store_name:
                 ball_lbl = ("в т.ч. шары (Коля)"
                             if sn in _KOLA_BALL_STORES
                             else "в т.ч. шары (совместное)")
                 chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽",
-                                  "", "", "", ""])
+                                  "", "", ""])
                 chan_styles.append("detail")
 
         chan_rows.append([
@@ -452,7 +449,6 @@ def build_sales_pdf(
             _rub_pct(c_gross, c_rev),
             _rub_pct(c_net, c_rev),
             str(c_chk),
-            "",
         ])
         chan_styles.append(None)
 
@@ -462,7 +458,6 @@ def build_sales_pdf(
         _rub_pct(grand_prof, grand_rev),
         _rub_pct(grand_net, grand_rev),
         str(grand_chk),
-        _rub(grand_ac) + " ₽",
     ])
     chan_styles.append(None)
 
