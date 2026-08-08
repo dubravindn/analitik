@@ -399,8 +399,8 @@ def build_sales_pdf(
     pk.section_header(pdf, "Итоги по каналам и складам")
 
     # [Склад, Выручка, Вал.приб.·%, Чист.приб.·%, Чеков, Ср.чек] = 174мм
-    hdrs = ["Склад / Канал", "Выручка", "Вал.приб. · %", "Чист.приб. · %", "Чеков", "Ср.чек"]
-    cws  = [56, 24, 36, 32, 14, 12]
+    hdrs = ["Склад / Канал", "Выручка", "Вал.приб. · %", "Чист.приб. · %", "Чек", "Ср.чек"]
+    cws  = [56, 24, 36, 30, 16, 12]
     alns = ["L", "R", "R", "R", "R", "R"]
 
     mixed = set(config.MIXED_CHANNEL_STORES or [])
@@ -522,8 +522,8 @@ def build_sales_pdf(
                                 if sn not in _KOLA_BALL_STORES))
         pdf.cell(
             pk._INNER_W, 4,
-            (f"Шары Ленина/Воровского ({kola_b_note} руб.) — доход Коли 100%. "
-             f"Шары прочих складов ({joint_b_note} руб.) — в совместном."),
+            (f"Шары Ленина/Воровского ({kola_b_note} ₽) — доход Коли 100%. "
+             f"Шары прочих складов ({joint_b_note} ₽) — в совместном."),
             align="L", new_x="LMARGIN", new_y="NEXT",
         )
         pdf.set_text_color(*pk.INK)
@@ -548,19 +548,19 @@ def build_sales_pdf(
         any_svoi = False
         for person, data in svoi.items():
             if data["total"] == 0 and data["docs"] == 0:
-                _svoi_row(person, "0 руб. за период")
+                _svoi_row(person, "0 ₽ за период")
                 continue
             any_svoi = True
             _svoi_row(
                 person,
-                f"{_rub(data['total'])} руб.  ·  {data['docs']} "
+                f"{_rub(data['total'])} ₽  ·  {data['docs']} "
                 + ("документ" if data["docs"] == 1 else "документов"),
                 bold=True,
             )
             for day_s, sn, kop in data["rows"]:
                 _svoi_row(
                     f"  {day_s}  ·  {_trunc(sn, 30)}",
-                    _rub(kop) + " руб.",
+                    _rub(kop) + " ₽",
                     indent=0,
                     color=pk.SAGE,
                 )
@@ -672,7 +672,7 @@ def build_sales_pdf(
                 gap = round(rev_s * (med - m) / 100)
                 flags.append(
                     f"• {sn}: маржа {m:.0f}% против {med:.0f}% медианы розницы "
-                    f"(разрыв ~{_rub(gap)} руб.)"
+                    f"(разрыв ~{_rub(gap)} ₽)"
                 )
     if flags:
         pk.callout(pdf, "Требует внимания:\n" + "\n".join(flags), kind="warn")
