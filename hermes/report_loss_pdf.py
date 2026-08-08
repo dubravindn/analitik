@@ -137,29 +137,7 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
     )
     pk.callout(pdf, f"Итого: {_rub(grand_kop)} ₽", kind="info")
 
-    # Документы: все позиции
-    pk.section_header(pdf, "Позиции списаний  ·  дата DESC")
-    pk.table(
-        pdf,
-        headers=["Дата", "Склад", "Название", "Кол-во", "Сумма"],
-        rows=[
-            [
-                doc_day.strftime("%d.%m") if hasattr(doc_day, "strftime") else str(doc_day),
-                sn,
-                (pname or "")[:44],
-                _qty(float(qty or 0)),
-                _rub(float(kop or 0)) + " ₽",
-            ]
-            for doc_day, sn, pname, qty, kop in doc_rows
-        ],
-        col_widths=[18, 52, 62, 18, 24],
-        aligns=["L", "L", "L", "R", "R"],
-        font_size=8.5,
-    )
-
-    # ── Стр. 2: топ-10 позиций ───────────────────��───────────────────────────
-    pdf.add_page()
-    pk.cover(pdf, "Топ позиций по списаниям")
+    # Топ-15 (сразу после сводки)
     pk.section_header(pdf, "Топ-15 по сумме  ·  Ассортимент")
     if top_rows:
         pk.table(
@@ -174,5 +152,27 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
         )
     else:
         pk.callout(pdf, "Нет данных по позициям за период.", kind="info")
+
+    # Позиции документов
+    pdf.add_page()
+    pk.cover(pdf, "Позиции списаний")
+    pk.section_header(pdf, "Позиции по документам")
+    pk.table(
+        pdf,
+        headers=["Дата", "Склад", "Название", "Кол-во", "Сумма"],
+        rows=[
+            [
+                doc_day.strftime("%d.%m") if hasattr(doc_day, "strftime") else str(doc_day),
+                sn[:22],
+                (pname or "")[:34],
+                _qty(float(qty or 0)),
+                _rub(float(kop or 0)) + " ₽",
+            ]
+            for doc_day, sn, pname, qty, kop in doc_rows
+        ],
+        col_widths=[18, 44, 70, 22, 20],
+        aligns=["L", "L", "L", "R", "R"],
+        font_size=8.5,
+    )
 
     return bytes(pdf.output())
