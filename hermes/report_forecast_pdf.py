@@ -5,10 +5,15 @@ import math
 from datetime import date, timedelta
 
 from . import calc, pdf_kit as pk
+from .pdf_kit import (
+    _MARGIN, INK, SAGE, SAGE_L, CREAM, TERRA, GRID,
+)
 
+_WHITE        = (255, 255, 255)
 _SENTINEL_QTY = 9999
+_YOY_STORE    = "Воровского"   # часть названия склада для фильтра год назад
 
-# Праздники, важные для цветочного магазина (месяц, день, название)
+# Праздники, важные для цветочного магазина
 _HOLIDAYS = [
     (1,  1,  "Новый год"),
     (1,  7,  "Рождество"),
@@ -27,9 +32,7 @@ _HOLIDAYS = [
 
 
 def _holidays_near(d_from: date, d_to: date, margin: int = 3) -> list[tuple[date, str]]:
-    """Праздники в окне [d_from - margin .. d_to + margin]."""
-    lo = d_from - timedelta(days=margin)
-    hi = d_to   + timedelta(days=margin)
+    lo, hi = d_from - timedelta(days=margin), d_to + timedelta(days=margin)
     found: list[tuple[date, str]] = []
     for m, d, name in _HOLIDAYS:
         for year in {lo.year, hi.year}:
@@ -41,6 +44,10 @@ def _holidays_near(d_from: date, d_to: date, margin: int = 3) -> list[tuple[date
                 found.append((hday, name))
     found.sort()
     return found
+
+
+def _holiday_text(holidays: list) -> str:
+    return "  ·  ".join(f"{hd.strftime('%d.%m')} — {name}" for hd, name in holidays)
 
 
 def _rub(kop: float) -> str:
@@ -57,29 +64,74 @@ def _qty(q: float) -> str:
     )
 
 
-def _pct(a: float, b: float) -> str:
-    if b == 0:
-        return "—"
-    sign = "+" if a >= b else ""
-    return f"{sign}{(a - b) / b * 100:.0f}%"
+def _over(sold: float, stock: float) -> str:
+    """Избыток: остаток − продажи/приёмка, если > 0."""
+    v = stock - sold
+    return _qty(v) if v > 0 else "—"
+
+
+def _stock_on(conn, snap_to: date, store_filter: str | None = None) -> dict[str, float]:
+    """Остатки из stock_snapshot на ближайшую дату ≤ snap_to."""
+    store_cond = "AND ss.store_name ILIKE %s" if store_filter else ""
+    params_day: list = [snap_to]
+    if store_filter:
+        params_day.append(f"%{store_filter}%")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT MAX(day) FROM stock_snapshot WHERE day <= %s {store_cond}",
+            params_day,
+        )
+        snap_day = cur.fetchone()[0]
+    if not snap_day:
+        return {}
+    params: list = [snap_day, _SENTINEL_QTY]
+    if store_filter:
+        params.append(f"%{store_filter}%")
+    store_cond2 = "AND ss.store_name ILIKE %s" if store_filter else ""
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT ss.product_id, SUM(ss.available_qty)
+            FROM stock_snapshot ss
+            JOIN product_dim pd ON pd.product_id = ss.product_id
+            WHERE ss.day = %s
+              AND ss.available_qty > 0 AND ss.available_qty < %s
+              AND pd.folder_path LIKE 'Ассортимент/%%'
+              {store_cond2}
+            GROUP BY ss.product_id
+        """, params)
+        return {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+
+def _group_header_row(
+    pdf: pk.HermesPDF,
+    groups: list[tuple[str, float, tuple, tuple]],
+) -> None:
+    """Строка групповых заголовков: [(label, width, fill_rgb, text_rgb), ...]."""
+    pdf.set_x(_MARGIN)
+    pdf.set_font("DejaVu_B", size=7.5)
+    for label, w, fill, text_color in groups:
+        pdf.set_fill_color(*fill)
+        pdf.set_text_color(*text_color)
+        pdf.cell(w, 5.0, label, border=1, align="C", fill=True)
+    pdf.ln()
+    pdf.set_text_color(*INK)
 
 
 def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
-    """PDF «Прогноз закупки»: рекомендации + контекст год назад."""
+    """PDF «Прогноз закупки»: блок заказа (стр. 1) + аналитика (стр. 2)."""
     period = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}"
     days   = max((date_to - date_from).days + 1, 1)
 
     asf_spd = calc.assortment_filter("spd.assortment_id")
     asf_si  = calc.assortment_filter("si.product_id")
-    asf_ss  = calc.assortment_filter("ss.product_id")
 
-    delta    = timedelta(days=days)
+    delta     = timedelta(days=days)
     prev_from = date_from - delta
     prev_to   = date_to   - delta
     yoy_from  = date_from - timedelta(days=365)
     yoy_to    = date_to   - timedelta(days=365)
 
-    # ── продажи текущего периода ──────────────────────────────────────────────
+    # ── эта неделя: продажи ───────────────────────────────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT spd.assortment_id, spd.product_name, SUM(spd.sell_qty)
@@ -89,9 +141,11 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
               AND {asf_spd}
             GROUP BY spd.assortment_id, spd.product_name
         """, [date_from, date_to])
-        sales_by_pid = {r[0]: (r[1], float(r[2] or 0)) for r in cur.fetchall()}
+        curr_sales: dict[str, tuple[str, float]] = {
+            r[0]: (r[1], float(r[2] or 0)) for r in cur.fetchall()
+        }
 
-    # ── продажи прошлой недели ────────────────────────────────────────────────
+    # ── прошлая неделя: продажи ───────────────────────────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT spd.assortment_id, SUM(spd.sell_qty)
@@ -101,193 +155,181 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
               AND {asf_spd}
             GROUP BY spd.assortment_id
         """, [prev_from, prev_to])
-        prev_by_pid = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+        prev_sales: dict[str, float] = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
-    # ── текущий остаток ───────────────────────────────────────────────────────
-    with conn.cursor() as cur:
-        cur.execute("SELECT MAX(day) FROM stock_snapshot")
-        snap_day = cur.fetchone()[0]
-
-    stock_by_pid: dict[str, float] = {}
-    cost_by_pid:  dict[str, float] = {}
-    srezka_pids:  set[str]         = set()
-
-    if snap_day:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT ss.product_id,
-                       SUM(ss.available_qty),
-                       MAX(ss.cost_price_kop),
-                       MAX(pd.folder_path)
-                FROM stock_snapshot ss
-                JOIN product_dim pd ON pd.product_id = ss.product_id
-                WHERE ss.day = %s
-                  AND ss.available_qty > 0 AND ss.available_qty < %s
-                  AND pd.folder_path LIKE 'Ассортимент/%%'
-                GROUP BY ss.product_id
-            """, [snap_day, _SENTINEL_QTY])
-            for pid, qty, cost, fpath in cur.fetchall():
-                stock_by_pid[pid] = float(qty or 0)
-                cost_by_pid[pid]  = float(cost or 0)
-                if fpath and "СРЕЗКА" in fpath:
-                    srezka_pids.add(pid)
-
-    # ── приёмка год назад (supply_item) ──────────────────────────────────────
+    # ── год назад: приёмка (склад Воровского) ────────────────────────────────
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT si.product_id, si.product_name, SUM(si.qty)
             FROM supply_item si
             JOIN supply_doc sd ON sd.doc_id = si.doc_id
             WHERE sd.day BETWEEN %s AND %s
+              AND sd.store_name ILIKE %s
               AND {asf_si}
             GROUP BY si.product_id, si.product_name
-        """, [yoy_from, yoy_to])
+        """, [yoy_from, yoy_to, f"%{_YOY_STORE}%"])
         yoy_supply: dict[str, tuple[str, float]] = {
             r[0]: (r[1], float(r[2] or 0)) for r in cur.fetchall()
         }
 
-    # ── остаток год назад (ближайший снимок) ─────────────────────────────────
+    # ── остатки трёх периодов ─────────────────────────────────────────────────
+    curr_stock = _stock_on(conn, date_to,  store_filter=None)
+    prev_stock = _stock_on(conn, prev_to,  store_filter=None)
+    yoy_stock  = _stock_on(conn, yoy_to,   store_filter=_YOY_STORE)
+
+    # ── себестоимость для KPI «на сумму» ──────────────────────────────────────
+    cost_by_pid: dict[str, float] = {}
     with conn.cursor() as cur:
-        cur.execute("SELECT MAX(day) FROM stock_snapshot WHERE day <= %s", [yoy_to])
-        yoy_snap_day = cur.fetchone()[0]
+        cur.execute("""
+            SELECT product_id, MAX(cost_price_kop)
+            FROM stock_snapshot
+            WHERE day = (SELECT MAX(day) FROM stock_snapshot)
+              AND available_qty < %s
+            GROUP BY product_id
+        """, [_SENTINEL_QTY])
+        for pid, cost in cur.fetchall():
+            cost_by_pid[pid] = float(cost or 0)
 
-    yoy_stock_by_pid: dict[str, float] = {}
-    if yoy_snap_day:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT ss.product_id, SUM(ss.available_qty)
-                FROM stock_snapshot ss
-                JOIN product_dim pd ON pd.product_id = ss.product_id
-                WHERE ss.day = %s
-                  AND ss.available_qty > 0 AND ss.available_qty < %s
-                  AND pd.folder_path LIKE 'Ассортимент/%%'
-                GROUP BY ss.product_id
-            """, [yoy_snap_day, _SENTINEL_QTY])
-            yoy_stock_by_pid = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
-
-    # ── рекомендации ──────────────────────────────────────────────────────────
+    # ── рекомендации к заказу ─────────────────────────────────────────────────
+    # Формула: max(эта_нед_продажи, прошлая_нед_продажи) × 1.1 − текущий_остаток
+    all_pids = set(curr_sales) | set(prev_sales)
     recs: list[tuple] = []
-    for pid, (pname, sold) in sales_by_pid.items():
-        stock = stock_by_pid.get(pid, 0.0)
-        rec   = math.ceil(sold * 1.1 - stock)
+    for pid in all_pids:
+        pname = curr_sales[pid][0] if pid in curr_sales else ""
+        c_sold = curr_sales[pid][1] if pid in curr_sales else 0.0
+        p_sold = prev_sales.get(pid, 0.0)
+        base   = max(c_sold, p_sold)
+        stock  = curr_stock.get(pid, 0.0)
+        rec    = math.ceil(base * 1.1 - stock)
         if rec > 0:
-            prev = prev_by_pid.get(pid, 0.0)
             cost = cost_by_pid.get(pid, 0.0)
-            recs.append((pname, sold, prev, stock, rec, cost))
-    recs.sort(key=lambda x: -x[4])
-
-    # ── избыток (только СРЕЗКА) ───────────────────────────────────────────────
-    over_rows = sorted(
-        [
-            (sales_by_pid[pid][0], sales_by_pid[pid][1],
-             stock_by_pid.get(pid, 0.0))
-            for pid in sales_by_pid
-            if pid in srezka_pids and stock_by_pid.get(pid, 0) > sales_by_pid[pid][1]
-        ],
-        key=lambda x: -(x[2] - x[1]),
-    )
+            recs.append((pname, rec, cost))
+    recs.sort(key=lambda x: -x[1])
 
     # ── KPI ───────────────────────────────────────────────────────────────────
-    n_to_order  = len(recs)
-    total_kop   = sum(r[4] * r[5] for r in recs if r[5] > 0)
-    total_sold  = sum(v[1] for v in sales_by_pid.values())
-    total_prev  = sum(prev_by_pid.values())
+    n_order   = len(recs)
+    total_kop = sum(r[1] * r[2] for r in recs if r[2] > 0)
 
     # ── праздники ─────────────────────────────────────────────────────────────
-    curr_holidays = _holidays_near(date_from, date_to)
-    yoy_holidays  = _holidays_near(yoy_from,  yoy_to)
-
-    def _holiday_text(holidays):
-        return "  ·  ".join(
-            f"{hd.strftime('%d.%m')} — {name}" for hd, name in holidays
-        )
+    curr_hols = _holidays_near(date_from, date_to)
+    yoy_hols  = _holidays_near(yoy_from,  yoy_to)
 
     # ═════════════════════════════════════════════════════════════════════════
     # РЕНДЕРИНГ
     # ═════════════════════════════════════════════════════════════════════════
     pdf = pk.HermesPDF(section_title="Прогноз", period=period)
 
-    # ─── Страница 1: рекомендации ─────────────────────────────────────────────
+    # ─── Страница 1: список к заказу ─────────────────────────────────────────
     pdf.add_page()
-    pk.cover(pdf, f"Прогноз закупки  ·  {period}")
+    pk.cover(pdf, f"К заказу на следующую неделю  ·  {period}")
 
     pk.kpi_row(pdf, [
-        ("Позиций к заказу",  str(n_to_order),                ""),
-        ("На сумму",          _rub(total_kop),                "₽"),
-        ("vs прошл. неделя",  _pct(total_sold, total_prev),   ""),
-        ("Позиций в избытке", str(len(over_rows)),             ""),
+        ("Позиций к заказу", str(n_order),     ""),
+        ("На сумму",         _rub(total_kop),  "₽"),
+        ("Период анализа",   str(days),         "дн."),
+        ("Склад год назад",  "Розница/База Воровского",  ""),
     ])
 
-    if curr_holidays:
-        pk.callout(pdf, "Праздники в периоде: " + _holiday_text(curr_holidays), kind="info")
+    if curr_hols:
+        pk.callout(pdf, "Праздники: " + _holiday_text(curr_hols), kind="info")
 
-    pk.section_header(pdf, "Рекомендации к заказу  ·  продано × 1.1 − остаток")
+    pk.section_header(pdf, "К заказу  ·  max(эта нед., прошл. нед.) × 1.1 − остаток")
 
     if recs:
         pk.table(
             pdf,
-            headers=["Название", "Продано", "Прошл. нед.", "Остаток", "К заказу"],
+            headers=["Название", "К заказу", "На сумму"],
             rows=[
-                [pname[:42], _qty(sold), _qty(prev), _qty(stock), _qty(rec)]
-                for pname, sold, prev, stock, rec, _ in recs
-            ],
-            col_widths=[90, 22, 24, 22, 16],
-            aligns=["L", "R", "R", "R", "R"],
-            font_size=8.5,
-        )
-    else:
-        pk.callout(pdf, "Всё покрыто остатком — докупать нечего.", kind="ok")
-
-    if over_rows:
-        pk.section_header(pdf, "Избыток СРЕЗКА  ·  остаток > продаж")
-        pk.table(
-            pdf,
-            headers=["Название", "Продано", "Остаток", "Избыток"],
-            rows=[
-                [pname[:70], _qty(sold), _qty(stock), _qty(stock - sold)]
-                for pname, sold, stock in over_rows
-            ],
-            col_widths=[100, 24, 26, 24],
-            aligns=["L", "R", "R", "R"],
-            font_size=8.5,
-        )
-
-    # ─── Страница 2: контекст год назад ──────────────────────────────────────
-    pdf.add_page()
-    yoy_label = f"{yoy_from.strftime('%d.%m')}–{yoy_to.strftime('%d.%m.%Y')}"
-    pk.cover(pdf, f"Год назад  ·  {yoy_label}")
-
-    if yoy_holidays:
-        pk.callout(pdf, "Праздники в периоде: " + _holiday_text(yoy_holidays), kind="info")
-    else:
-        pk.callout(pdf, f"Особых праздников в период {yoy_label} не выявлено.", kind="info")
-
-    pk.section_header(pdf, "Приёмка товара год назад  ·  объём закупки как прокси продаж")
-
-    # Объединяем supply и stock год назад по pid
-    yoy_all_pids = set(yoy_supply) | set(yoy_stock_by_pid)
-    yoy_rows = []
-    for pid in yoy_all_pids:
-        sup_name, sup_qty = yoy_supply.get(pid, ("", 0.0))
-        yoy_stock = yoy_stock_by_pid.get(pid, 0.0)
-        if sup_qty > 0 or yoy_stock > 0:
-            name = sup_name or pid
-            yoy_rows.append((name, sup_qty, yoy_stock))
-    yoy_rows.sort(key=lambda x: -x[1])
-
-    if yoy_rows:
-        pk.table(
-            pdf,
-            headers=["Название", "Принято г.н.", "Остаток г.н."],
-            rows=[
-                [name[:70], _qty(sup_qty), _qty(yoy_stock)]
-                for name, sup_qty, yoy_stock in yoy_rows
+                [
+                    pname[:72],
+                    _qty(float(rec)),
+                    _rub(rec * cost) + " ₽" if cost else "—",
+                ]
+                for pname, rec, cost in recs
             ],
             col_widths=[110, 32, 32],
             aligns=["L", "R", "R"],
             font_size=8.5,
         )
     else:
-        pk.callout(pdf, "Данных о приёмках за этот период год назад нет.", kind="info")
+        pk.callout(pdf, "Заказывать нечего — остатки покрывают спрос.", kind="ok")
+
+    # ─── Страница 2: аналитика трёх периодов ─────────────────────────────────
+    pdf.add_page()
+    pk.cover(pdf, "Аналитика трёх периодов")
+
+    hol_parts = []
+    if curr_hols:
+        hol_parts.append(f"Эта неделя: {_holiday_text(curr_hols)}")
+    if yoy_hols:
+        hol_parts.append(f"Год назад: {_holiday_text(yoy_hols)}")
+    if hol_parts:
+        pk.callout(pdf, "  ·  ".join(hol_parts), kind="info")
+
+    prev_label = f"{prev_from.strftime('%d.%m')}–{prev_to.strftime('%d.%m')}"
+    yoy_label  = f"{yoy_from.strftime('%d.%m')}–{yoy_to.strftime('%d.%m.%Y')}"
+    curr_label = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m')}"
+
+    pk.section_header(
+        pdf,
+        f"Прошл. нед. {prev_label}  ·  Год назад {yoy_label} (Воровского)  ·  Эта нед. {curr_label}",
+    )
+
+    # Групповые заголовки
+    _group_header_row(pdf, [
+        ("Название",         48, CREAM,  INK),
+        (f"Прошл. нед. {prev_label}", 42, SAGE_L, INK),
+        (f"Год назад {yoy_label[:5]}", 42, TERRA,  _WHITE),
+        (f"Эта нед. {curr_label}",    42, INK,    _WHITE),
+    ])
+
+    # Строки аналитики
+    analytics_pids = set(curr_sales) | set(prev_sales) | set(yoy_supply)
+    a_rows = []
+    for pid in analytics_pids:
+        pname = (
+            curr_sales[pid][0] if pid in curr_sales
+            else yoy_supply[pid][0] if pid in yoy_supply
+            else pid
+        )
+        c_sold = curr_sales.get(pid, ("", 0.0))[1] if pid in curr_sales else 0.0
+        p_sold = prev_sales.get(pid, 0.0)
+        y_sup  = yoy_supply[pid][1] if pid in yoy_supply else 0.0
+        p_ost  = prev_stock.get(pid, 0.0)
+        y_ost  = yoy_stock.get(pid, 0.0)
+        c_ost  = curr_stock.get(pid, 0.0)
+        if c_sold == 0 and p_sold == 0 and y_sup == 0:
+            continue
+        a_rows.append((
+            pname,
+            p_sold, p_ost, _over(p_sold, p_ost),
+            y_sup,  y_ost, _over(y_sup,  y_ost),
+            c_sold, c_ost, _over(c_sold, c_ost),
+        ))
+    a_rows.sort(key=lambda x: -(x[7] + x[1]))  # сумма продаж обеих недель
+
+    pk.table(
+        pdf,
+        headers=[
+            "Название",
+            "Прод", "Ост", "Изб",
+            "Прин", "Ост", "Изб",
+            "Прод", "Ост", "Изб",
+        ],
+        rows=[
+            [
+                pname[:30],
+                _qty(p_sold), _qty(p_ost), p_izb,
+                _qty(y_sup),  _qty(y_ost), y_izb,
+                _qty(c_sold), _qty(c_ost), c_izb,
+            ]
+            for pname, p_sold, p_ost, p_izb,
+                       y_sup,  y_ost, y_izb,
+                       c_sold, c_ost, c_izb in a_rows
+        ],
+        col_widths=[48, 14, 14, 14, 14, 14, 14, 14, 14, 14],
+        aligns=["L", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        font_size=7.5,
+    )
 
     return bytes(pdf.output())
