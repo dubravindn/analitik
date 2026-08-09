@@ -72,7 +72,7 @@ def _over(sold: float, stock: float) -> str:
 
 def _stock_on(conn, snap_to: date, store_filter: str | None = None) -> dict[str, float]:
     """Остатки из stock_snapshot на ближайшую дату ≤ snap_to."""
-    store_cond = "AND ss.store_name ILIKE %s" if store_filter else ""
+    store_cond = "AND store_name ILIKE %s" if store_filter else ""
     params_day: list = [snap_to]
     if store_filter:
         params_day.append(f"%{store_filter}%")
