@@ -26,25 +26,14 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
     period = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}"
     days = max((date_to - date_from).days + 1, 1)
 
-    asf = calc.assortment_filter("spd.assortment_id")
+    asf_spd = calc.assortment_filter("spd.assortment_id")
+    asf_si  = calc.assortment_filter("si.product_id")
     delta = timedelta(days=days)
 
     prev_from = date_from - delta
     prev_to   = date_to   - delta
     yoy_from  = date_from - timedelta(days=365)
     yoy_to    = date_to   - timedelta(days=365)
-
-    def _sales_query(d_from, d_to):
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT spd.assortment_id, SUM(spd.sell_qty) AS qty
-                FROM sales_by_product_day spd
-                WHERE spd.day BETWEEN %s AND %s
-                  AND spd.sell_qty > 0
-                  AND {asf}
-                GROUP BY spd.assortment_id
-            """, [d_from, d_to])
-            return {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
     # ── 1. Продажи за период (Ассортимент) ───────────────────────────────────
     with conn.cursor() as cur:
@@ -53,16 +42,36 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
             FROM sales_by_product_day spd
             WHERE spd.day BETWEEN %s AND %s
               AND spd.sell_qty > 0
-              AND {asf}
+              AND {asf_spd}
             GROUP BY spd.assortment_id, spd.product_name
         """, [date_from, date_to])
         sales_rows = cur.fetchall()
 
     sales_by_pid = {r[0]: (r[1], float(r[2] or 0)) for r in sales_rows}
 
-    # ── 1b. Предыдущий период и год назад ────────────────────────────────────
-    prev_by_pid = _sales_query(prev_from, prev_to)
-    yoy_by_pid  = _sales_query(yoy_from, yoy_to)
+    # ── 1b. Предыдущая неделя (продажи) ──────────────────────────────────────
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT spd.assortment_id, SUM(spd.sell_qty)
+            FROM sales_by_product_day spd
+            WHERE spd.day BETWEEN %s AND %s
+              AND spd.sell_qty > 0
+              AND {asf_spd}
+            GROUP BY spd.assortment_id
+        """, [prev_from, prev_to])
+        prev_by_pid = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+    # ── 1c. Закупки год назад (supply_item) — прокси объёма прошлого года ────
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT si.product_id, SUM(si.qty)
+            FROM supply_item si
+            JOIN supply_doc sd ON sd.doc_id = si.doc_id
+            WHERE sd.day BETWEEN %s AND %s
+              AND {asf_si}
+            GROUP BY si.product_id
+        """, [yoy_from, yoy_to])
+        yoy_by_pid = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
     # ── 2. Последний снимок остатков ─────────────────────────────────────────
     with conn.cursor() as cur:
@@ -134,13 +143,13 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
         ("Позиций к заказу",   str(n_to_order),                  ""),
         ("На сумму",           _rub(total_kop),                   "₽"),
         ("vs прошл. неделя",   _pct(total_sold, total_prev),      ""),
-        ("vs год назад",       _pct(total_sold, total_yoy),       ""),
+        ("vs закупка г.н.",    _pct(total_sold, total_yoy),       ""),
     ])
     pk.kpi_row(pdf, [
         ("Позиций в избытке",  str(overstock_count),              ""),
         ("Период анализа",     str(days),                         "дн."),
         ("Прошл. период",      f"{prev_from.strftime('%d.%m')}–{prev_to.strftime('%d.%m')}",  ""),
-        ("Год назад",          f"{yoy_from.strftime('%d.%m')}–{yoy_to.strftime('%d.%m.%Y')}", ""),
+        ("Закупка г.н.",       f"{yoy_from.strftime('%d.%m')}–{yoy_to.strftime('%d.%m.%Y')}", ""),
     ])
 
     pk.section_header(pdf, "Рекомендации к заказу  ·  продано × 1.1 − остаток")
@@ -148,7 +157,7 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
     if recs:
         pk.table(
             pdf,
-            headers=["Название", "Продано", "Нед.назад", "Год назад", "Остаток", "К заказу"],
+            headers=["Название", "Продано", "Нед.назад", "Зак.г.н.", "Остаток", "К заказу"],
             rows=[
                 [
                     pname[:40],
@@ -186,7 +195,7 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
         over_rows.sort(key=lambda x: -(x[4] - x[1]))
         pk.table(
             pdf,
-            headers=["Название", "Продано", "Нед.назад", "Год назад", "Остаток", "Избыток"],
+            headers=["Название", "Продано", "Нед.назад", "Зак.г.н.", "Остаток", "Избыток"],
             rows=[
                 [
                     pname[:40],
