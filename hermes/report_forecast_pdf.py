@@ -194,7 +194,7 @@ def build_forecast_pdf(conn, date_from: date, date_to: date) -> bytes:
     # ── имена всех СРЕЗКА-позиций (из product_dim на случай если продаж нет) ──
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT product_id, name FROM product_dim
+            SELECT product_id, product_name FROM product_dim
             WHERE folder_path LIKE 'Ассортимент/СРЕЗКА%%'
         """)
         srezka_names: dict[str, str] = {r[0]: r[1] for r in cur.fetchall()}
