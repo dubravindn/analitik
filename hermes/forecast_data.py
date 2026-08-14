@@ -183,13 +183,27 @@ def load_stock_snapshot(
     conn,
     store_id: str,
     product_ids: list[str] | None = None,
+    snap_day: date | None = None,
 ) -> dict[str, StockSnapshot]:
     """
-    Последний известный остаток из stock_snapshot (или аналогичной таблицы).
-    Возвращает пустой словарь если таблица не существует.
+    Последний известный остаток из stock_snapshot.
+
+    snap_day — конкретный день снимка (обычно MAX(day) <= cutoff_date).
+    Если не задан — берётся MAX(day) по данному магазину.
+    Возвращает пустой словарь если таблица не существует или данных нет.
     """
     try:
         with conn.cursor() as cur:
+            if snap_day is None:
+                cur.execute(
+                    "SELECT MAX(day) FROM stock_snapshot WHERE store_id = %s",
+                    (store_id,),
+                )
+                row = cur.fetchone()
+                snap_day = row[0] if row and row[0] else None
+            if snap_day is None:
+                return {}
+
             if product_ids is not None:
                 cur.execute("""
                     SELECT product_id, store_id,
@@ -197,8 +211,8 @@ def load_stock_snapshot(
                            COALESCE(stock_qty, 0),
                            COALESCE(reserve_qty, 0)
                     FROM stock_snapshot
-                    WHERE store_id = %s AND product_id = ANY(%s)
-                """, (store_id, product_ids))
+                    WHERE store_id = %s AND day = %s AND product_id = ANY(%s)
+                """, (store_id, snap_day, product_ids))
             else:
                 cur.execute("""
                     SELECT product_id, store_id,
@@ -206,8 +220,8 @@ def load_stock_snapshot(
                            COALESCE(stock_qty, 0),
                            COALESCE(reserve_qty, 0)
                     FROM stock_snapshot
-                    WHERE store_id = %s
-                """, (store_id,))
+                    WHERE store_id = %s AND day = %s
+                """, (store_id, snap_day))
             return {
                 r[0]: StockSnapshot(r[0], r[1], float(r[2]), float(r[3]), float(r[4]))
                 for r in cur.fetchall()

@@ -65,6 +65,8 @@ class DataFlag(str, Enum):
     STAT_FALLBACK             = "STAT_FALLBACK"
     HOLIDAY_MODE              = "HOLIDAY_MODE"
     DOUBLE_COUNT_GUARD        = "DOUBLE_COUNT_GUARD"
+    INCOMING_UNKNOWN          = "INCOMING_UNKNOWN"   # поступление неизвестно (не 0)
+    MANUAL_REVIEW             = "MANUAL_REVIEW"      # рекомендуется ручная проверка
 
 
 # ── Центральная структура результата ─────────────────────────────────────────
@@ -112,8 +114,8 @@ class ForecastResult:
     transfer_out_qty: float = 0.0
 
     # Заказ
-    raw_order_qty:     float = 0.0
-    recommended_order_qty: float = 0.0    # после округления до упаковки
+    raw_order_qty:     float      = 0.0
+    recommended_order_qty: float | None = None  # None = STOCK_UNKNOWN → ручная проверка
 
     # Упаковка
     pack_size: int = 1
@@ -144,7 +146,7 @@ class ForecastResult:
             f"  Подтверждённое пост. : {self.incoming_qty if self.incoming_qty is not None else 'UNKNOWN'}",
             "",
             f"  К заказу (raw)       : {self.raw_order_qty:.0f}",
-            f"  К заказу (упаковки)  : {self.recommended_order_qty:.0f}",
+            f"  К заказу (упаковки)  : {self.recommended_order_qty:.0f}" if self.recommended_order_qty is not None else "  К заказу (упаковки)  : MANUAL_REVIEW",
             "",
             f"  Причина: {self.recommendation_reason}",
         ]

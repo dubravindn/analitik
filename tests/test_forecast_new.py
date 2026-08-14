@@ -110,27 +110,34 @@ class TestRollingMean:
 # ── aggregate_known_demand ────────────────────────────────────────────────────
 
 class TestAggregateKnownDemand:
-    def _pos(self, product_id, qty, is_pre=False):
+    def _pos(self, product_id, qty, is_pre=False, co_id="co1"):
+        # aggregate_known_demand маршрутизирует по date_source, не по is_preorder
+        src = "preorder_event" if is_pre else "explicit"
         return COPosition(
-            co_id="co1",
+            co_id=co_id,
             co_date=date(2026, 5, 1),
             delivery_date=date(2026, 5, 7),
             product_id=product_id,
             product_name="Роза 60",
             ordered_qty=qty,
+            remaining_qty=qty,
+            remaining_qty_uncertain=False,
+            age_days=0,
             is_preorder=is_pre,
             lead_days=6,
+            date_source=src,
         )
 
     def test_simple_aggregation(self):
-        positions = [self._pos("p1", 100.0), self._pos("p1", 200.0)]
+        # aggregate_known_demand дедуплицирует по (co_id, product_id) — разные co_id
+        positions = [self._pos("p1", 100.0, co_id="co1"), self._pos("p1", 200.0, co_id="co2")]
         agg = aggregate_known_demand(positions)
         assert agg["p1"]["known_qty"] == pytest.approx(300.0)
 
     def test_preorder_subset(self):
         positions = [
-            self._pos("p1", 200.0, is_pre=True),
-            self._pos("p1", 100.0, is_pre=False),
+            self._pos("p1", 200.0, is_pre=True,  co_id="co1"),
+            self._pos("p1", 100.0, is_pre=False, co_id="co2"),
         ]
         agg = aggregate_known_demand(positions)
         assert agg["p1"]["known_qty"]    == pytest.approx(300.0)
@@ -138,8 +145,8 @@ class TestAggregateKnownDemand:
 
     def test_large_order_flag(self):
         positions = [
-            self._pos("p1", 600.0),  # >= 500 → large
-            self._pos("p1", 300.0),  # < 500
+            self._pos("p1", 600.0, co_id="co1"),  # >= 500 → large
+            self._pos("p1", 300.0, co_id="co2"),  # < 500
         ]
         agg = aggregate_known_demand(positions, large_order_threshold=500)
         assert agg["p1"]["large_order_qty"] == pytest.approx(600.0)
@@ -372,5 +379,5 @@ class TestForecastResultExplain:
         r = self._make_result()
         text = r.explain()
         assert "Статистический спрос" in text
-        assert "Известные CO" in text
+        assert "Итого CO" in text
         assert "Ожидаемый спрос" in text
