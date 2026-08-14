@@ -148,38 +148,44 @@ def build_base_hybrid_forecast(
         if not sales_matrix.get(pid):
             flags.append(DataFlag.NO_SALES_HISTORY)
 
-        # Known CO
+        # Known CO — 4-компонентная декомпозиция
         co_agg = co_by_product.get(pid, {})
-        known_qty    = float(co_agg.get("known_qty", 0))
-        preorder_qty = float(co_agg.get("preorder_qty", 0))
-        large_qty    = float(co_agg.get("large_order_qty", 0))
+        explicit_qty        = float(co_agg.get("explicit_qty", 0))
+        estimated_large_qty = float(co_agg.get("estimated_large_qty", 0))
+        preorder_qty        = float(co_agg.get("preorder_qty", 0))
+        known_qty           = explicit_qty + estimated_large_qty + preorder_qty
+        large_qty           = float(co_agg.get("large_order_qty", 0))
+        has_uncertain       = bool(co_agg.get("has_remaining_uncertain", False))
 
         if large_qty > 0:
             flags.append(DataFlag.LARGE_ORDER_CO)
+        if estimated_large_qty > 0:
+            flags.append(DataFlag.LARGE_CO_ESTIMATED)
+        if has_uncertain:
+            flags.append(DataFlag.CO_REMAINING_QTY_UNCERTAIN)
         if preorder_qty > 0:
             flags.append(DataFlag.PREORDER_PRESENT)
         if mode in (ForecastMode.MARCH_8, ForecastMode.VALENTINE):
             flags.append(DataFlag.HOLIDAY_MODE)
 
         # HYBRID без double-count:
-        # stat = upper bound от всего спроса
-        # known_order_demand уже покрывает часть stat
-        # residual = max(0, stat - known)
+        # stat = upper bound; stat_residual = max(0, stat - known)
+        # expected = known + stat_residual = max(stat, known)
         stat_residual = max(0.0, stat_demand - known_qty)
         expected = known_qty + stat_residual
         flags.append(DataFlag.DOUBLE_COUNT_GUARD)
 
         if mode == ForecastMode.MARCH_8:
             flags.append(DataFlag.MARCH8_MODE)
-            # Для 8 марта stat не доверяем — используем known + преязаказы
-            # stat_residual оставляем как есть (residual от known)
 
         source = DemandSource.HYBRID if known_qty > 0 else DemandSource.STAT
         model  = f"hybrid(co+mean_cal_{w})" if known_qty > 0 else f"mean_cal_{w}"
 
         reason_parts = []
-        if known_qty > 0:
-            reason_parts.append(f"CO={known_qty:.0f}")
+        if explicit_qty > 0:
+            reason_parts.append(f"explicit={explicit_qty:.0f}")
+        if estimated_large_qty > 0:
+            reason_parts.append(f"est_large={estimated_large_qty:.0f}")
         if preorder_qty > 0:
             reason_parts.append(f"preorder={preorder_qty:.0f}")
         reason_parts.append(f"stat_residual={stat_residual:.0f}")
@@ -199,8 +205,11 @@ def build_base_hybrid_forecast(
             forecast_horizon_days=horizon_days,
             cutoff_date=cutoff_date,
             statistical_demand=round(stat_demand, 1),
-            known_order_demand=round(known_qty, 1),
+            explicit_order_demand=round(explicit_qty, 1),
+            estimated_large_order_demand=round(estimated_large_qty, 1),
             preorder_demand=round(preorder_qty, 1),
+            known_order_demand=round(known_qty, 1),
+            statistical_residual=round(stat_residual, 1),
             expected_demand=round(expected, 1),
             raw_order_qty=max(0.0, round(expected, 1)),
             recommended_order_qty=(

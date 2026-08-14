@@ -155,24 +155,31 @@ def run(
     R(f"\n  Нулевой прогноз: {len(new_retail) - len(retail_nonzero)} SKU "
       f"(no_sales_history или below_oper_start)")
 
-    # ── Секция B: 10 BASE SKU (декомпозиция) ──────────────────────────────────
+    # ── Секция B: 10 BASE SKU (4-компонентная декомпозиция) ───────────────────
 
-    H("B. NEW BASE — декомпозиция HYBRID (10 SKU)")
-    R(f"  {'Название':<40} {'Модель':<28}"
-      f" {'Stat':>7} {'CO':>7} {'Pre':>5} {'Exp':>7} {'Flg'}")
-    R("  " + "─" * 115)
+    H("B. NEW BASE — HYBRID 4-компонентная декомпозиция (10 SKU)")
+    R(f"  {'Название':<40} {'Модель':<22}"
+      f" {'Stat':>6} {'Expl':>6} {'Est':>6} {'Pre':>5} {'StatR':>6} {'Exp':>7} {'Flg'}")
+    R("  " + "─" * 130)
 
     base_sample  = new_base[:limit]
     for r in base_sample:
         flags = "+".join(f.value for f in r.data_quality_flags) or "—"
-        R(f"  {r.product_name[:40]:<40} {r.model_name[:28]:<28}"
-          f" {r.statistical_demand:>7.0f} {r.known_order_demand:>7.0f}"
-          f" {r.preorder_demand:>5.0f} {r.expected_demand:>7.0f} {flags}")
+        R(f"  {r.product_name[:40]:<40} {r.model_name[:22]:<22}"
+          f" {r.statistical_demand:>6.0f}"
+          f" {r.explicit_order_demand:>6.0f}"
+          f" {r.estimated_large_order_demand:>6.0f}"
+          f" {r.preorder_demand:>5.0f}"
+          f" {r.statistical_residual:>6.0f}"
+          f" {r.expected_demand:>7.0f} {flags}")
 
     # BASE с CO
-    base_with_co = [r for r in new_base if r.known_order_demand > 0]
+    base_with_co  = [r for r in new_base if r.known_order_demand > 0]
+    base_with_est = [r for r in new_base if r.estimated_large_order_demand > 0]
     base_with_pre = [r for r in new_base if r.preorder_demand > 0]
-    R(f"\n  Всего BASE: {len(new_base)}  с CO: {len(base_with_co)}  с preorder: {len(base_with_pre)}")
+    R(f"\n  Всего BASE: {len(new_base)}  с explicit CO: {len([r for r in new_base if r.explicit_order_demand > 0])}"
+      f"  с est.large: {len(base_with_est)}  с preorder: {len(base_with_pre)}"
+      f"  итого с CO: {len(base_with_co)}")
 
     # ── Секция C1: RETAIL OLD vs NEW ─────────────────────────────────────────
 
@@ -228,8 +235,10 @@ def run(
                 model_tag = f"[{new_r.model_name}]"
                 if is_base:
                     R(f"    NEW(BASE): stat={new_r.statistical_demand:.0f}"
-                      f"  CO={new_r.known_order_demand:.0f}"
+                      f"  expl={new_r.explicit_order_demand:.0f}"
+                      f"  est={new_r.estimated_large_order_demand:.0f}"
                       f"  pre={new_r.preorder_demand:.0f}"
+                      f"  stat_r={new_r.statistical_residual:.0f}"
                       f"  expected={new_r.expected_demand:.0f}"
                       f"  → order={new_r.recommended_order_qty:.0f}  {model_tag}")
                 else:
@@ -310,24 +319,30 @@ def run(
 
     # ── Секция D: known/preorder/residual breakdown ────────────────────────────
 
-    H("D. BASE — декомпозиция known/preorder/residual (все SKU)")
-    total_stat     = sum(r.statistical_demand  for r in new_base)
-    total_known    = sum(r.known_order_demand  for r in new_base)
-    total_preorder = sum(r.preorder_demand     for r in new_base)
-    total_exp      = sum(r.expected_demand     for r in new_base)
-    known_regular  = total_known - total_preorder
+    H("D. BASE — 4-компонентная декомпозиция (все SKU)")
+    total_stat          = sum(r.statistical_demand           for r in new_base)
+    total_explicit      = sum(r.explicit_order_demand        for r in new_base)
+    total_est_large     = sum(r.estimated_large_order_demand for r in new_base)
+    total_preorder      = sum(r.preorder_demand              for r in new_base)
+    total_known         = sum(r.known_order_demand           for r in new_base)
+    total_stat_residual = sum(r.statistical_residual         for r in new_base)
+    total_exp           = sum(r.expected_demand              for r in new_base)
 
     R(f"  Суммарно по всем BASE SKU:")
-    R(f"    known_regular_CO    = {known_regular:>10.0f}  (обычные CO без флага preorder)")
-    R(f"    known_preorder_CO   = {total_preorder:>10.0f}  (⊆ known_order_demand, не пересекаются)")
-    R(f"    known_order_total   = {total_known:>10.0f}  = regular + preorder")
-    R(f"    statistical_demand  = {total_stat:>10.0f}")
-    R(f"    stat_residual       = {max(0, total_stat - total_known):>10.0f}  = max(0, stat - known)")
-    R(f"    expected_demand     = {total_exp:>10.0f}  = known + stat_residual")
+    R(f"    Tier A — explicit CO   = {total_explicit:>10.0f}  (DPM явно в горизонте)")
+    R(f"    Tier B — est. LARGE    = {total_est_large:>10.0f}  (LARGE без DPM, age<=7d, remaining>0)")
+    R(f"    Tier C — preorder      = {total_preorder:>10.0f}  (только event-window)")
+    R(f"    known_order_total      = {total_known:>10.0f}  = A + B + C")
+    R(f"    statistical_demand     = {total_stat:>10.0f}")
+    R(f"    stat_residual          = {total_stat_residual:>10.0f}  = max(0, stat - known)")
+    R(f"    expected_demand        = {total_exp:>10.0f}  = known + stat_residual")
     R(f"")
-    R(f"  Reconciliation:")
-    R(f"    known_regular ∩ known_preorder = ∅  (по флагу is_preorder — гарантировано)")
-    R(f"    known_order_total = regular + preorder = {known_regular:.0f} + {total_preorder:.0f} = {total_known:.0f}")
+    R(f"  Reconciliation (no double-count):")
+    recon_known = total_explicit + total_est_large + total_preorder
+    R(f"    A + B + C = {total_explicit:.0f} + {total_est_large:.0f} + {total_preorder:.0f} = {recon_known:.0f}")
+    R(f"    known_order_total      = {total_known:.0f}")
+    recon_ok = abs(recon_known - total_known) < 1.0
+    R(f"    MATCH: {'✓ OK' if recon_ok else '✗ РАСХОЖДЕНИЕ'}")
     R(f"")
     R(f"  Проверка формулы HYBRID:")
     R(f"    expected = known + max(0, stat - known)")
@@ -362,6 +377,8 @@ def run(
     # preorder ⊆ known проверка
     pre_dc_ok = all(r.preorder_demand <= r.known_order_demand + 0.01 for r in new_base)
     R(f"  {'✓' if pre_dc_ok else '✗'} preorder ⊆ known_order_demand")
+    # 4-part reconciliation: A+B+C = known (проверка aggregate_known_demand)
+    R(f"  {'✓' if recon_ok else '✗'} A+B+C = known_order_demand (4-part decomp)")
 
     # ── Секция F: UNKNOWN stock/incoming ──────────────────────────────────────
 
@@ -433,7 +450,8 @@ def run(
 
     if not skip_co and not co_backtest_passed:
         blockers.append(
-            "CO horizon assignment backtest НЕ пройден — эвристика moment+Nd не валидирована"
+            "LARGE Tier B qty-weighted backtest НЕ пройден — "
+            "политика remaining_qty ещё не верифицирована на исторических данных"
         )
     if not co_cache_built:
         blockers.append(
@@ -448,14 +466,15 @@ def run(
         ("BASE top-20 CO-view (C3)",        not skip_co),
         ("RETAIL top-20 корректна (C1)",    True),
         ("store-key isolation (product×store)", True),
-        ("preorder dedup (D reconciliation)", pre_dc_ok),
-        ("HYBRID rebuilt = expected (D)",   match),
+        ("preorder ⊆ known (E check)",            pre_dc_ok),
+        ("A+B+C = known 4-part recon (D)",        recon_ok),
+        ("HYBRID rebuilt = expected (D)",          match),
     ]
     R(f"\n  Checklist (8 критериев PRODUCTION_READY):")
     for label, ok in checklist:
         R(f"    {'✓' if ok else '✗'} {label}")
 
-    architecture_ok = dc_ok and pre_dc_ok and match and not skip_co and len(retail_sample) > 0
+    architecture_ok = dc_ok and pre_dc_ok and recon_ok and match and not skip_co and len(retail_sample) > 0
     production_ok   = architecture_ok and co_backtest_passed and co_cache_built and runtime_ok
 
     if not architecture_ok or blockers:
@@ -478,8 +497,8 @@ def run(
             R(f"    ⚠  {w}")
         R("")
         R("  Следующие шаги:")
-        R("    1. co_lead_backtest.py → выбрать политику CO horizon assignment по сегментам")
-        R("    2. etl_customer_orders.py → CO cache в PostgreSQL")
+        R("    1. scripts/co_lead_backtest.py (с --policy-sim) → qty-weighted backtest Tier B LARGE")
+        R("    2. etl_customer_orders.py → CO cache в PostgreSQL (target runtime < 60s)")
         R("    3. Повторить shadow-run → все 8 критериев PASS → PRODUCTION_READY")
     else:
         R("\n  VERDICT: READY_FOR_INTEGRATION")

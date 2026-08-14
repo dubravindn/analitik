@@ -53,15 +53,18 @@ class DemandSource(str, Enum):
 # ── Флаги качества данных ─────────────────────────────────────────────────────
 
 class DataFlag(str, Enum):
-    NO_SALES_HISTORY   = "NO_SALES_HISTORY"
-    BELOW_OPER_START   = "BELOW_OPER_START"
-    NO_STOCK_DATA      = "NO_STOCK_DATA"
-    LARGE_ORDER_CO     = "LARGE_ORDER_CO"
-    PREORDER_PRESENT   = "PREORDER_PRESENT"
-    MARCH8_MODE        = "MARCH8_MODE"
-    STAT_FALLBACK      = "STAT_FALLBACK"
-    HOLIDAY_MODE       = "HOLIDAY_MODE"
-    DOUBLE_COUNT_GUARD = "DOUBLE_COUNT_GUARD"
+    NO_SALES_HISTORY          = "NO_SALES_HISTORY"
+    BELOW_OPER_START          = "BELOW_OPER_START"
+    NO_STOCK_DATA             = "NO_STOCK_DATA"
+    LARGE_ORDER_CO            = "LARGE_ORDER_CO"
+    LARGE_CO_ESTIMATED        = "LARGE_CO_ESTIMATED"          # tier B: LARGE без DPM, estimated
+    CO_REMAINING_QTY_UNCERTAIN = "CO_REMAINING_QTY_UNCERTAIN"  # не смогли вычесть уже отгруженное
+    PREORDER_PRESENT          = "PREORDER_PRESENT"
+    PREORDER_NO_EVENT_WINDOW  = "PREORDER_NO_EVENT_WINDOW"    # preorder вне event-window, не включён
+    MARCH8_MODE               = "MARCH8_MODE"
+    STAT_FALLBACK             = "STAT_FALLBACK"
+    HOLIDAY_MODE              = "HOLIDAY_MODE"
+    DOUBLE_COUNT_GUARD        = "DOUBLE_COUNT_GUARD"
 
 
 # ── Центральная структура результата ─────────────────────────────────────────
@@ -85,11 +88,18 @@ class ForecastResult:
     forecast_horizon_days: int
     cutoff_date:           date      # дата принятия решения о закупке
 
-    # Декомпозиция спроса
-    statistical_demand:  float = 0.0  # stat baseline (штук)
-    known_order_demand:  float = 0.0  # CO на cutoff (штук)
-    preorder_demand:     float = 0.0  # ПРЕДОПЛАТА / праздничные предзаказы (штук)
-    expected_demand:     float = 0.0  # итого = stat_residual + known_co + preorder
+    # Декомпозиция спроса — 4-компонентная модель
+    statistical_demand:           float = 0.0  # stat baseline (штук)
+    # Tier A: CO с явным deliveryPlannedMoment в горизонте
+    explicit_order_demand:        float = 0.0
+    # Tier B: LARGE (>=500 шт), нет DPM, возраст CO <= 7д — estimated
+    estimated_large_order_demand: float = 0.0
+    # Tier C: предзаказы ТОЛЬКО в event-window (MARCH_8 / VALENTINE)
+    preorder_demand:              float = 0.0
+    # Сводные
+    known_order_demand:           float = 0.0  # = explicit + estimated_large + preorder
+    statistical_residual:         float = 0.0  # = max(0, stat - known)
+    expected_demand:              float = 0.0  # = known + stat_residual
 
     # Остаток
     available_stock: float | None = None
@@ -123,8 +133,11 @@ class ForecastResult:
             f"Режим: {self.forecast_mode.value}  Модель: {self.model_name}",
             "",
             f"  Статистический спрос : {self.statistical_demand:.0f}",
-            f"  Известные CO         : {self.known_order_demand:.0f}",
-            f"  Предзаказы           : {self.preorder_demand:.0f}",
+            f"  ├─ Tier A (explicit) : {self.explicit_order_demand:.0f}",
+            f"  ├─ Tier B (est.large): {self.estimated_large_order_demand:.0f}",
+            f"  ├─ Tier C (preorder) : {self.preorder_demand:.0f}",
+            f"  ├─ Итого CO          : {self.known_order_demand:.0f}",
+            f"  └─ Stat residual     : {self.statistical_residual:.0f}",
             f"  Ожидаемый спрос      : {self.expected_demand:.0f}",
             "",
             f"  Доступный остаток    : {self.available_stock if self.available_stock is not None else 'N/A'}",

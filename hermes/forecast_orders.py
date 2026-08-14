@@ -2,16 +2,22 @@
 Слой CustomerOrder — known demand для BASE.
 
 Загружает оформленные заказы из МойСклад API и возвращает
-позиции, которые будут отгружены в горизонте прогноза.
+позиции, которые попадают в горизонт прогноза.
 
 Правило: NO FUTURE LEAKAGE.
   Используем только CO, созданные до cutoff_date.
   CO.moment <= cutoff_date — жёсткое ограничение.
 
-Привязка к горизонту — три уровня (по убыванию точности):
-  A. deliveryPlannedMoment в [horizon_from, horizon_to]
-  B. CO.moment + TYPICAL_LEAD_DAYS попадает в горизонт (heuristic)
-  C. is_preorder без даты — включается всегда
+Три уровня привязки к горизонту (по убыванию точности):
+  A. deliveryPlannedMoment в [horizon_from, horizon_to]       date_source="explicit"
+  B. LARGE (qty>=500) + нет DPM + age<=7d + remaining>0      date_source="large_estimated"
+  C. is_preorder + event-window (MARCH_8/VALENTINE)           date_source="preorder_event"
+
+Tier B — estimated спрос. Включается как estimated_large_order_demand,
+  НЕ как confirmed. Количество = remaining_qty (ordered - shipped).
+
+Tier C — вне event-window CO-предзаказы не включаются.
+  Флаг: PREORDER_NO_EVENT_WINDOW.
 """
 from __future__ import annotations
 
@@ -20,32 +26,34 @@ import json
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Iterator
 
+from hermes.forecast_models import ForecastMode, forecast_mode_for
+
 BASE_API = "https://api.moysklad.ru/api/remap/1.2"
 
-# Из backtest: первый bucket, где >60% объёма известно за >=7 дней.
-LARGE_ORDER_THRESHOLD_DEFAULT: int = 500  # штук
-
-# Типичный lead CO→отгрузка (дней) когда deliveryPlannedMoment не заполнен.
-# Используется только как fallback (tier B). Не прибавляется к stat.
-TYPICAL_LEAD_DAYS_DEFAULT: int = 3
+LARGE_ORDER_THRESHOLD_DEFAULT: int = 500   # штук — LARGE-сегмент
+MAX_CO_AGE_FOR_ESTIMATED:     int = 7      # дней — tier B
 
 
 @dataclass
 class COPosition:
     """Позиция CustomerOrder, попадающая в горизонт прогноза."""
     co_id:        str
-    co_date:      date       # CO.moment (дата создания заказа)
+    co_date:      date        # CO.moment (дата создания)
     delivery_date: date | None  # deliveryPlannedMoment (None если не заполнен)
     product_id:   str
     product_name: str
-    ordered_qty:  float
-    is_preorder:  bool       # ПРЕДОПЛАТА или праздничный флаг
+    ordered_qty:  float       # суммарное количество в позиции
+    remaining_qty: float      # ordered - shipped; = ordered если shipped неизвестен
+    remaining_qty_uncertain: bool  # True если shipped не вернулся из API
+    age_days:     int         # (cutoff_date - co_date).days
+    is_preorder:  bool        # ПРЕДОПЛАТА или праздничный флаг
     lead_days:    int | None  # co_date → delivery_date (None если нет delivery)
-    date_source:  str = "explicit"  # "explicit" | "heuristic" | "preorder_no_date"
+    date_source:  str = "explicit"
+    # Значения: "explicit" | "large_estimated" | "preorder_event"
 
 
 def _get(token: str, path: str, params: dict | None = None) -> dict:
@@ -90,7 +98,7 @@ def _paginate(token: str, path: str, params: dict) -> Iterator[dict]:
         time.sleep(0.2)
 
 
-_PREORDER_KEYWORDS = ("предоплат", "предзаказ", "MARCH_8", "8 марта", "14 февр")
+_PREORDER_KEYWORDS = ("предоплат", "предзаказ", "march_8", "8 марта", "14 февр")
 
 def _is_preorder(co_name: str) -> bool:
     name_lower = co_name.lower()
@@ -104,25 +112,27 @@ def load_known_customer_orders(
     horizon_from: date,
     horizon_to:   date,
     large_order_threshold: int = LARGE_ORDER_THRESHOLD_DEFAULT,
-    typical_lead_days: int = TYPICAL_LEAD_DAYS_DEFAULT,
+    typical_lead_days: int = 3,  # deprecated, kept for API compat
 ) -> list[COPosition]:
     """
-    Загружает CO-позиции, которые попадают в горизонт прогноза.
+    Загружает CO-позиции в горизонт прогноза с 3-уровневым тиром.
 
-    Фильтрация:
-      1. CO.moment <= cutoff_date  (NO FUTURE LEAKAGE — жёсткое)
-      2. Привязка к горизонту [horizon_from, horizon_to] — три уровня:
-         A. deliveryPlannedMoment в горизонте  (точно)
-         B. CO.moment + typical_lead_days в горизонте  (эвристика)
-         C. is_preorder без даты  (всегда включаем)
+    Tier A: deliveryPlannedMoment явно попадает в [horizon_from, horizon_to].
+            Количество = ordered_qty (DPM подтверждён).
 
-    Уровень B используется ТОЛЬКО если deliveryPlannedMoment не заполнен.
-    Это позволяет не выбрасывать реальный спрос молча.
+    Tier B: CO без DPM, LARGE (total_qty >= threshold), age <= 7 дней, remaining > 0.
+            Количество = remaining_qty = ordered_qty - shipped_qty.
+            date_source = "large_estimated".
+            NORMAL CO без DPM → пропуск (P50 lead=0, 77.5% same-day → ложные срабатывания).
 
-    Примечание: когда deliveryPlannedMoment всегда пустой (типичная ситуация),
-    большинство CO попадают через tier B. В этом случае stat_residual остаётся
-    корректным upper bound — формула max(known, stat) не меняется.
+    Tier C: Предзаказ (ключевые слова в названии CO) БЕЗ явного DPM,
+            ТОЛЬКО в event-window (MARCH_8/VALENTINE).
+            Вне event-window → пропуск (флаг PREORDER_NO_EVENT_WINDOW в aggregate).
+            date_source = "preorder_event".
     """
+    mode = forecast_mode_for(horizon_from)
+    event_window = mode in (ForecastMode.MARCH_8, ForecastMode.VALENTINE)
+
     positions: list[COPosition] = []
     stats_log: dict[str, int] = {
         "fetched": 0,
@@ -130,11 +140,12 @@ def load_known_customer_orders(
         "tier_a": 0,
         "tier_b": 0,
         "tier_c": 0,
+        "preorder_out_of_window": 0,
         "out_of_horizon": 0,
         "positions_added": 0,
+        "positions_skipped_remaining_zero": 0,
     }
 
-    # Фильтруем CO созданные до cutoff (правильный фильтр)
     params = {
         "filter": (
             f"store={store_href}"
@@ -152,15 +163,16 @@ def load_known_customer_orders(
             continue
         co_date = date.fromisoformat(co_moment_str[:10])
 
-        # NO FUTURE LEAKAGE (дублируем проверку на случай ошибки API)
+        # NO FUTURE LEAKAGE
         if co_date > cutoff_date:
             stats_log["future_co_skipped"] += 1
             continue
 
         co_name = co.get("name", "")
         is_pre  = _is_preorder(co_name)
+        age_days = (cutoff_date - co_date).days
 
-        # Читаем deliveryPlannedMoment (правильное поле МойСклад)
+        # deliveryPlannedMoment
         dpm_str = co.get("deliveryPlannedMoment", "") or ""
         delivery_date: date | None = None
         if dpm_str:
@@ -169,34 +181,45 @@ def load_known_customer_orders(
             except ValueError:
                 pass
 
-        # ── Tier A: deliveryPlannedMoment явно в горизонте ───────────────────
+        # ── Определяем tier ──────────────────────────────────────────────────
+        rows = co.get("positions", {}).get("rows", [])
+        if not rows:
+            continue
+
+        # Суммарный ordered_qty для threshold-проверки Tier B
+        total_ordered = sum(float(p.get("quantity", 0)) for p in rows)
+
         if delivery_date is not None:
+            # ── Tier A ───────────────────────────────────────────────────────
             if horizon_from <= delivery_date <= horizon_to:
                 date_src = "explicit"
                 stats_log["tier_a"] += 1
             else:
                 stats_log["out_of_horizon"] += 1
-                continue  # дата есть, но вне горизонта → пропуск
+                continue
 
-        # ── Tier B: нет даты + не предзаказ → НЕ включаем ─────────────────────
-        # ВАЖНО: эвристика CO.moment + N дней НЕ используется.
-        # Причина: lead time сильно варьируется (от 0 до 30+ дней),
-        # произвольная константа создаёт false positives для крупных заказов.
-        # После CO lead-time backtest (co_lead_backtest.py) здесь появится
-        # валидированная политика по сегментам (NORMAL / LARGE_ORDER).
-        elif not is_pre:
-            stats_log["out_of_horizon"] += 1
-            continue  # без explicit date → пропуск до backtest
+        elif is_pre:
+            # ── Tier C ───────────────────────────────────────────────────────
+            if event_window:
+                date_src = "preorder_event"
+                stats_log["tier_c"] += 1
+            else:
+                stats_log["preorder_out_of_window"] += 1
+                continue  # вне event-window — не включаем
 
-        # ── Tier C: предзаказ без даты → включаем всегда ────────────────────
+        elif total_ordered >= large_order_threshold and age_days <= MAX_CO_AGE_FOR_ESTIMATED:
+            # ── Tier B ───────────────────────────────────────────────────────
+            date_src = "large_estimated"
+            stats_log["tier_b"] += 1
+
         else:
-            date_src = "preorder_no_date"
-            stats_log["tier_c"] += 1
+            # NORMAL без DPM / старый LARGE → не включаем
+            stats_log["out_of_horizon"] += 1
+            continue
 
         lead = (delivery_date - co_date).days if delivery_date else None
 
-        # Позиции CO
-        rows = co.get("positions", {}).get("rows", [])
+        # ── Позиции ──────────────────────────────────────────────────────────
         for pos in rows:
             a = pos.get("assortment") or {}
             pid   = a.get("id", "")
@@ -204,6 +227,22 @@ def load_known_customer_orders(
             qty   = float(pos.get("quantity", 0))
             if not pid or qty <= 0:
                 continue
+
+            # Вычисляем remaining_qty
+            shipped_raw = pos.get("shipped")
+            if shipped_raw is not None:
+                shipped = float(shipped_raw)
+                remaining_qty      = max(0.0, qty - shipped)
+                remaining_uncertain = False
+            else:
+                remaining_qty      = qty  # консервативно: считаем, что всё ещё нужно
+                remaining_uncertain = True
+
+            # Tier B: пропускаем позиции с remaining <= 0 (уже отгружено полностью)
+            if date_src == "large_estimated" and remaining_qty <= 0:
+                stats_log["positions_skipped_remaining_zero"] += 1
+                continue
+
             positions.append(COPosition(
                 co_id=co.get("id", ""),
                 co_date=co_date,
@@ -211,13 +250,15 @@ def load_known_customer_orders(
                 product_id=pid,
                 product_name=pname,
                 ordered_qty=qty,
+                remaining_qty=remaining_qty,
+                remaining_qty_uncertain=remaining_uncertain,
+                age_days=age_days,
                 is_preorder=is_pre,
                 lead_days=lead,
                 date_source=date_src,
             ))
             stats_log["positions_added"] += 1
 
-    # Сохраняем статистику на объект для shadow-runner
     load_known_customer_orders._last_stats = stats_log  # type: ignore[attr-defined]
     return positions
 
@@ -227,42 +268,55 @@ def aggregate_known_demand(
     large_order_threshold: int = LARGE_ORDER_THRESHOLD_DEFAULT,
 ) -> dict[str, dict]:
     """
-    Агрегирует COPosition → {product_id: {known_qty, preorder_qty, large_order_qty}}.
+    Агрегирует COPosition → {product_id: {...}} с 4-компонентной декомпозицией.
 
-    Deduplication: каждая физическая COPosition считается ровно один раз.
-    preorder_qty — это подмножество known_qty (та же позиция, флаг is_preorder=True).
-    known_qty = preorder_qty + regular_qty (их сумма, без двойного счёта).
+    Компоненты:
+      explicit_qty        — Tier A (DPM в горизонте): ordered_qty
+      estimated_large_qty — Tier B (LARGE estimated): remaining_qty
+      preorder_qty        — Tier C (preorder event): ordered_qty
+      known_qty           — сумма всех трёх (no double count)
 
     Доказательство no-double-count:
-      expected_demand = known_qty + max(0, stat_demand - known_qty)
-                      = max(stat_demand, known_qty)
-    Ни preorder, ни regular_CO не складываются с stat — stat вычитается.
+      expected = known_qty + max(0, stat - known_qty) = max(stat, known_qty)
+    Ни одна позиция не попадает в два тира одновременно (date_source уникален).
     """
     result: dict[str, dict] = {}
-    seen_positions: set[tuple[str, str]] = set()  # (co_id, product_id) для dedup
+    seen: set[tuple[str, str]] = set()  # (co_id, product_id)
 
     for pos in positions:
         pid = pos.product_id
         key = (pos.co_id, pid)
-
-        # Дедупликация на уровне позиций (одна CO × product_id = одна запись)
-        if key in seen_positions:
+        if key in seen:
             continue
-        seen_positions.add(key)
+        seen.add(key)
 
         if pid not in result:
             result[pid] = {
-                "known_qty": 0.0,
-                "preorder_qty": 0.0,
-                "large_order_qty": 0.0,
-                "heuristic_qty": 0.0,   # из tier B (меньше уверенности)
+                "known_qty":              0.0,
+                "explicit_qty":           0.0,   # Tier A
+                "estimated_large_qty":    0.0,   # Tier B
+                "preorder_qty":           0.0,   # Tier C
+                "large_order_qty":        0.0,   # backward compat
+                "heuristic_qty":          0.0,   # deprecated (old Tier B)
+                "has_remaining_uncertain": False, # любая Tier-B позиция с uncertain remaining
             }
-        result[pid]["known_qty"] += pos.ordered_qty
-        if pos.is_preorder:
-            result[pid]["preorder_qty"] += pos.ordered_qty
+
+        # Tier B использует remaining_qty; Tier A/C — ordered_qty
+        if pos.date_source == "large_estimated":
+            qty = pos.remaining_qty
+            result[pid]["estimated_large_qty"] += qty
+            if pos.remaining_qty_uncertain:
+                result[pid]["has_remaining_uncertain"] = True
+        elif pos.date_source == "explicit":
+            qty = pos.ordered_qty
+            result[pid]["explicit_qty"] += qty
+        else:  # preorder_event
+            qty = pos.ordered_qty
+            result[pid]["preorder_qty"] += qty
+
+        result[pid]["known_qty"] += qty
+
         if pos.ordered_qty >= large_order_threshold:
-            result[pid]["large_order_qty"] += pos.ordered_qty
-        if pos.date_source == "heuristic":
-            result[pid]["heuristic_qty"] += pos.ordered_qty
+            result[pid]["large_order_qty"] += qty
 
     return result
