@@ -6,9 +6,21 @@
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from datetime import date, timedelta
 from typing import NamedTuple
+
+_PACK_RE = re.compile(r'(\d{1,3})\s*шт\.?', re.IGNORECASE)
+
+
+def _parse_pack_size(name: str) -> int:
+    m = _PACK_RE.search(name)
+    if m:
+        n = int(m.group(1))
+        if 2 <= n <= 500:
+            return n
+    return 1
 
 
 # ── Типы ─────────────────────────────────────────────────────────────────────
@@ -18,6 +30,7 @@ class ProductInfo(NamedTuple):
     product_name: str
     folder_path:  str
     is_srezka:    bool
+    pack_size:    int = 1
 
 
 class DailySales(NamedTuple):
@@ -48,7 +61,7 @@ def load_srezka_products(conn) -> dict[str, ProductInfo]:
             WHERE is_srezka = TRUE
         """)
         return {
-            r[0]: ProductInfo(r[0], r[1], r[2], r[3])
+            r[0]: ProductInfo(r[0], r[1], r[2], r[3], _parse_pack_size(r[1]))
             for r in cur.fetchall()
         }
 
@@ -65,7 +78,7 @@ def load_products_by_store(conn, store_id: str) -> dict[str, ProductInfo]:
             WHERE s.store_id = %s AND s.sell_qty > 0
         """, (store_id,))
         return {
-            r[0]: ProductInfo(r[0], r[1], r[2], r[3])
+            r[0]: ProductInfo(r[0], r[1], r[2], r[3], _parse_pack_size(r[1]))
             for r in cur.fetchall()
         }
 

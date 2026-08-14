@@ -196,7 +196,9 @@ def run(
         old_r   = old_by_pid.get(pid)
         new_exp = new_exp_by_pid.get(pid, 0.0)
         old_order = float(old_r.order_units) if old_r else 0.0
-        old_name  = old_r.product_name if old_r else pid[:40]
+        new_r_    = new_row_by_pid.get(pid)
+        old_name  = (old_r.product_name if old_r
+                     else (new_r_.product_name if new_r_ else pid[:40]))
         delta = new_exp - old_order
         deltas.append((abs(delta), delta, old_name, old_order, new_exp, pid))
 

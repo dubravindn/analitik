@@ -203,8 +203,11 @@ def build_base_hybrid_forecast(
             preorder_demand=round(preorder_qty, 1),
             expected_demand=round(expected, 1),
             raw_order_qty=max(0.0, round(expected, 1)),
-            recommended_order_qty=math.ceil(expected) if expected > 0 else 0.0,
-            pack_size=1,
+            recommended_order_qty=(
+                math.ceil(expected / info.pack_size) * info.pack_size
+                if expected > 0 else 0.0
+            ),
+            pack_size=info.pack_size,
             data_quality_flags=tuple(flags),
             recommendation_reason=reason,
         ))

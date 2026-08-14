@@ -107,8 +107,11 @@ def build_retail_forecast(
             preorder_demand=0.0,
             expected_demand=round(stat_demand, 1),
             raw_order_qty=max(0.0, round(stat_demand, 1)),
-            recommended_order_qty=math.ceil(stat_demand) if stat_demand > 0 else 0.0,
-            pack_size=1,
+            recommended_order_qty=(
+                math.ceil(stat_demand / info.pack_size) * info.pack_size
+                if stat_demand > 0 else 0.0
+            ),
+            pack_size=info.pack_size,
             data_quality_flags=flags,
             recommendation_reason=reason or f"mean_cal_{w} × {horizon_days}d",
         ))
