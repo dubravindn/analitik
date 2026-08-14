@@ -9,15 +9,21 @@
   CO.moment <= cutoff_date — жёсткое ограничение.
 
 Три уровня привязки к горизонту (по убыванию точности):
-  A. deliveryPlannedMoment в [horizon_from, horizon_to]       date_source="explicit"
-  B. LARGE (qty>=500) + нет DPM + age<=7d + remaining>0      date_source="large_estimated"
-  C. is_preorder + event-window (MARCH_8/VALENTINE)           date_source="preorder_event"
+  A. deliveryPlannedMoment в [horizon_from, horizon_to]          date_source="explicit"
+  B1. LARGE 500–999 + нет DPM + age 0–5d + remaining>0          date_source="large_estimated"
+  B2. LARGE_PLUS >=1000 + нет DPM + age 0–3d + remaining>0      date_source="large_estimated"
+  C. is_preorder + event-window (MARCH_8/VALENTINE)              date_source="preorder_event"
 
-Tier B — estimated спрос. Включается как estimated_large_order_demand,
-  НЕ как confirmed. Количество = remaining_qty (ordered - shipped).
+Tier B policy принята по policy-sim v2 (backtest глобальный ground truth):
+  LARGE 500–999:   age 0–5d → precision 0.76, recall 0.81, FP 25.7%, FN 18.9%
+  LARGE_PLUS >=1000: age 0–3d → precision 0.87, recall 1.00, FP 14.7%, FN 0.2%
+  NORMAL <500 без DPM → не включать (P50 lead=0, 77% same-day → высокий FP, recall=1.00 NORMAL ≠ сигнал).
+  age=0 включён: исключение age=0 убивает recall ([1,3] → FN=69% для LARGE).
 
 Tier C — вне event-window CO-предзаказы не включаются.
   Флаг: PREORDER_NO_EVENT_WINDOW.
+
+Параметры хранятся в конфигурации и переоцениваются по мере накопления истории.
 """
 from __future__ import annotations
 
@@ -34,8 +40,13 @@ from hermes.forecast_models import ForecastMode, forecast_mode_for
 
 BASE_API = "https://api.moysklad.ru/api/remap/1.2"
 
-LARGE_ORDER_THRESHOLD_DEFAULT: int = 500   # штук — LARGE-сегмент
-MAX_CO_AGE_FOR_ESTIMATED:     int = 7      # дней — tier B
+LARGE_ORDER_THRESHOLD_DEFAULT: int = 500    # штук — нижняя граница LARGE
+LARGE_PLUS_ORDER_THRESHOLD:   int = 1000   # штук — LARGE_PLUS (>=1000)
+MAX_CO_AGE_FOR_LARGE:         int = 5      # дней — tier B для LARGE 500–999
+MAX_CO_AGE_FOR_LARGE_PLUS:    int = 3      # дней — tier B для LARGE_PLUS >=1000
+
+# Обратная совместимость
+MAX_CO_AGE_FOR_ESTIMATED = MAX_CO_AGE_FOR_LARGE
 
 
 @dataclass
@@ -112,6 +123,9 @@ def load_known_customer_orders(
     horizon_from: date,
     horizon_to:   date,
     large_order_threshold: int = LARGE_ORDER_THRESHOLD_DEFAULT,
+    large_plus_threshold:  int = LARGE_PLUS_ORDER_THRESHOLD,
+    max_age_large:         int = MAX_CO_AGE_FOR_LARGE,
+    max_age_large_plus:    int = MAX_CO_AGE_FOR_LARGE_PLUS,
     typical_lead_days: int = 3,  # deprecated, kept for API compat
 ) -> list[COPosition]:
     """
@@ -120,10 +134,11 @@ def load_known_customer_orders(
     Tier A: deliveryPlannedMoment явно попадает в [horizon_from, horizon_to].
             Количество = ordered_qty (DPM подтверждён).
 
-    Tier B: CO без DPM, LARGE (total_qty >= threshold), age <= 7 дней, remaining > 0.
+    Tier B: CO без DPM, LARGE (total_qty >= threshold), remaining > 0.
             Количество = remaining_qty = ordered_qty - shipped_qty.
             date_source = "large_estimated".
-            NORMAL CO без DPM → пропуск (P50 lead=0, 77.5% same-day → ложные срабатывания).
+            LARGE 500–999: age 0–5d; LARGE_PLUS >=1000: age 0–3d.
+            NORMAL <500 без DPM → пропуск (P50 lead=0, 77% same-day → высокий FP).
 
     Tier C: Предзаказ (ключевые слова в названии CO) БЕЗ явного DPM,
             ТОЛЬКО в event-window (MARCH_8/VALENTINE).
@@ -207,13 +222,22 @@ def load_known_customer_orders(
                 stats_log["preorder_out_of_window"] += 1
                 continue  # вне event-window — не включаем
 
-        elif total_ordered >= large_order_threshold and age_days <= MAX_CO_AGE_FOR_ESTIMATED:
-            # ── Tier B ───────────────────────────────────────────────────────
-            date_src = "large_estimated"
-            stats_log["tier_b"] += 1
+        elif total_ordered >= large_order_threshold:
+            # ── Tier B: LARGE / LARGE_PLUS ───────────────────────────────────
+            # LARGE_PLUS (>=1000): age 0–3d; LARGE (500–999): age 0–5d
+            if total_ordered >= large_plus_threshold:
+                max_age = max_age_large_plus
+            else:
+                max_age = max_age_large
+            if age_days <= max_age:
+                date_src = "large_estimated"
+                stats_log["tier_b"] += 1
+            else:
+                stats_log["out_of_horizon"] += 1
+                continue
 
         else:
-            # NORMAL без DPM / старый LARGE → не включаем
+            # NORMAL <500 без DPM → не включаем
             stats_log["out_of_horizon"] += 1
             continue
 
