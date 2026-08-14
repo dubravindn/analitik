@@ -178,16 +178,15 @@ def load_known_customer_orders(
                 stats_log["out_of_horizon"] += 1
                 continue  # дата есть, но вне горизонта → пропуск
 
-        # ── Tier B: нет даты → эвристика CO.moment + typical_lead ───────────
+        # ── Tier B: нет даты + не предзаказ → НЕ включаем ─────────────────────
+        # ВАЖНО: эвристика CO.moment + N дней НЕ используется.
+        # Причина: lead time сильно варьируется (от 0 до 30+ дней),
+        # произвольная константа создаёт false positives для крупных заказов.
+        # После CO lead-time backtest (co_lead_backtest.py) здесь появится
+        # валидированная политика по сегментам (NORMAL / LARGE_ORDER).
         elif not is_pre:
-            estimated = co_date + timedelta(days=typical_lead_days)
-            if horizon_from <= estimated <= horizon_to:
-                date_src = "heuristic"
-                delivery_date = estimated  # используем как оценку
-                stats_log["tier_b"] += 1
-            else:
-                stats_log["out_of_horizon"] += 1
-                continue  # эвристика тоже вне горизонта → пропуск
+            stats_log["out_of_horizon"] += 1
+            continue  # без explicit date → пропуск до backtest
 
         # ── Tier C: предзаказ без даты → включаем всегда ────────────────────
         else:

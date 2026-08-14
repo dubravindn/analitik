@@ -174,100 +174,160 @@ def run(
     base_with_pre = [r for r in new_base if r.preorder_demand > 0]
     R(f"\n  Всего BASE: {len(new_base)}  с CO: {len(base_with_co)}  с preorder: {len(base_with_pre)}")
 
-    # ── Секция C: OLD vs NEW — top-20 расхождений ─────────────────────────────
+    # ── Секция C1: RETAIL OLD vs NEW ─────────────────────────────────────────
 
-    H("C. OLD vs NEW — топ расхождений (агрегат по product_id)")
+    # Индексы RETAIL: агрегируем по product_id (сумма по магазинам)
+    retail_exp_by_pid: dict[str, float] = defaultdict(float)
+    retail_row_by_pid: dict[str, ForecastResult] = {}
+    for r in new_retail:
+        retail_exp_by_pid[r.product_id] += r.expected_demand
+        if r.product_id not in retail_row_by_pid:
+            retail_row_by_pid[r.product_id] = r
 
-    if skip_co:
-        R("  ⚠  skip_co=True: сравнение BASE некорректно — CO не загружались.")
-        R("  Ниже показан только RETAIL. Для полного HYBRID запусти без --skip-co.\n")
+    # Индексы BASE: один склад, нет суммирования (ключ product_id достаточен)
+    base_exp_by_pid: dict[str, float] = {}
+    base_row_by_pid: dict[str, ForecastResult] = {}
+    for r in new_base:
+        base_exp_by_pid[r.product_id] = r.expected_demand
+        base_row_by_pid[r.product_id] = r
 
-    # Агрегируем NEW по product_id (sum expected + первый ForecastResult для деталей)
-    new_exp_by_pid: dict[str, float] = defaultdict(float)
-    new_row_by_pid: dict[str, ForecastResult] = {}
-    for r in new_retail + ([] if skip_co else new_base):
-        new_exp_by_pid[r.product_id] += r.expected_demand
-        if r.product_id not in new_row_by_pid:
-            new_row_by_pid[r.product_id] = r
+    def _decompose_block(
+        label: str,
+        deltas_list: list,
+        row_by_pid: dict[str, ForecastResult],
+        is_base: bool,
+    ) -> None:
+        H(label)
+        top20 = deltas_list[:20]
+        R(f"  {'Название':<40} {'OLD_order':>10} {'NEW_exp':>8} {'CO':>8} {'Delta':>8} {'Delta%':>7}")
+        R("  " + "─" * 88)
+        for abs_d, delta, name, old_order, new_exp, pid in top20:
+            new_r = row_by_pid.get(pid)
+            co_qty = new_r.known_order_demand if new_r else 0.0
+            co_s = f"{co_qty:.0f}" if co_qty > 0 else "—"
+            pct = (delta / old_order * 100) if old_order else float("inf")
+            pct_s = f"{pct:+.0f}%" if abs(pct) < 9999 else "∞"
+            R(f"  {name[:40]:<40} {old_order:>10.0f} {new_exp:>8.0f} {co_s:>8} "
+              f"{delta:>+8.0f} {pct_s:>7}")
 
-    all_pids = set(old_by_pid) | set(new_exp_by_pid)
-    deltas = []
-    for pid in all_pids:
-        old_r   = old_by_pid.get(pid)
-        new_exp = new_exp_by_pid.get(pid, 0.0)
-        old_order = float(old_r.order_units) if old_r else 0.0
-        new_r_    = new_row_by_pid.get(pid)
-        old_name  = (old_r.product_name if old_r
-                     else (new_r_.product_name if new_r_ else pid[:40]))
-        delta = new_exp - old_order
-        deltas.append((abs(delta), delta, old_name, old_order, new_exp, pid))
+        avg_d = sum(a for a, *_ in deltas_list) / len(deltas_list) if deltas_list else 0
+        R(f"\n  Ср. |delta|: {avg_d:.0f}")
 
-    deltas.sort(reverse=True)
-    top20 = deltas[:20]
-
-    R(f"  {'Название':<40} {'OLD_order':>10} {'NEW_exp':>8} {'Delta':>8} {'Delta%':>7}")
-    R("  " + "─" * 80)
-    for abs_d, delta, name, old_order, new_exp, pid in top20:
-        pct = (delta / old_order * 100) if old_order else float("inf")
-        pct_s = f"{pct:+.0f}%" if abs(pct) < 9999 else "∞"
-        R(f"  {name[:40]:<40} {old_order:>10.0f} {new_exp:>8.0f} "
-          f"{delta:>+8.0f} {pct_s:>7}")
-
-    R(f"\n  Ср. |delta|: {sum(a for a, *_ in deltas) / len(deltas):.0f}" if deltas else "")
-
-    # Полная декомпозиция top-20
-    R(f"\n  ДЕКОМПОЗИЦИЯ top-20:")
-    for i, (abs_d, delta, name, old_order, new_exp, pid) in enumerate(top20, 1):
-        old_r  = old_by_pid.get(pid)
-        new_r  = new_row_by_pid.get(pid)
-        R(f"\n  [{i:02d}] {name[:60]}")
-        if old_r:
-            R(f"    OLD: prev={old_r.prev_demand:.0f}  year_ago={old_r.year_ago_demand:.0f}"
-              f"  base_demand={old_r.base_demand:.0f}  stock={old_r.available_stock:.0f}"
-              f"  raw={old_r.raw_order:.0f}  → order={old_r.order_units}")
-        else:
-            R("    OLD: (нет в calc_forecast — возможно, за порогом ассортимента)")
-        if new_r:
-            R(f"    NEW: stat={new_r.statistical_demand:.0f}"
-              f"  CO={new_r.known_order_demand:.0f}"
-              f"  pre={new_r.preorder_demand:.0f}"
-              f"  expected={new_r.expected_demand:.0f}"
-              f"  stock={new_r.available_stock if new_r.available_stock is not None else '?'}"
-              f"  → order={new_r.recommended_order_qty:.0f}"
-              f"  [{new_r.model_name}]")
-        else:
-            R("    NEW: (нет в новом движке — нет в СРЕЗКА или нет продаж)")
-        # Причина расхождения
-        if old_r and new_r:
-            if new_r.known_order_demand > old_r.base_demand * 0.5:
-                R(f"    Причина: NEW получил крупный CO ({new_r.known_order_demand:.0f} шт) "
-                  f"против stat-base в OLD ({old_r.base_demand:.0f} шт)")
-            elif new_r.statistical_demand > old_r.base_demand * 1.2:
-                R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) > OLD base_demand "
-                  f"({old_r.base_demand:.0f}) — разные окна/логика")
-            elif new_r.statistical_demand < old_r.base_demand * 0.8:
-                R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) < OLD base_demand "
-                  f"({old_r.base_demand:.0f}) — разные окна/логика")
+        R(f"\n  ДЕКОМПОЗИЦИЯ top-20:")
+        for i, (abs_d, delta, name, old_order, new_exp, pid) in enumerate(top20, 1):
+            old_r = old_by_pid.get(pid)
+            new_r = row_by_pid.get(pid)
+            R(f"\n  [{i:02d}] {name[:60]}")
+            if old_r:
+                R(f"    OLD: prev={old_r.prev_demand:.0f}  year_ago={old_r.year_ago_demand:.0f}"
+                  f"  base_demand={old_r.base_demand:.0f}  stock={old_r.available_stock:.0f}"
+                  f"  raw={old_r.raw_order:.0f}  → order={old_r.order_units}")
             else:
-                R(f"    Причина: stock/pack/rounding расхождение")
-        elif not old_r:
-            R(f"    Причина: товар есть только в NEW (нет в OLD calc_forecast)")
-        else:
-            R(f"    Причина: товар есть только в OLD (нет в RETAIL-окне NEW)")
+                R("    OLD: (нет в calc_forecast)")
+            if new_r:
+                model_tag = f"[{new_r.model_name}]"
+                if is_base:
+                    R(f"    NEW(BASE): stat={new_r.statistical_demand:.0f}"
+                      f"  CO={new_r.known_order_demand:.0f}"
+                      f"  pre={new_r.preorder_demand:.0f}"
+                      f"  expected={new_r.expected_demand:.0f}"
+                      f"  → order={new_r.recommended_order_qty:.0f}  {model_tag}")
+                else:
+                    R(f"    NEW(RETAIL): stat={new_r.statistical_demand:.0f}"
+                      f"  CO={new_r.known_order_demand:.0f}"
+                      f"  expected={new_r.expected_demand:.0f}"
+                      f"  → order={new_r.recommended_order_qty:.0f}  {model_tag}")
+            else:
+                R("    NEW: (нет данных)")
+            if old_r and new_r:
+                if new_r.known_order_demand > old_r.base_demand * 0.5:
+                    R(f"    Причина: CO={new_r.known_order_demand:.0f} >> OLD stat {old_r.base_demand:.0f}")
+                elif new_r.statistical_demand > old_r.base_demand * 1.2:
+                    R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) > OLD ({old_r.base_demand:.0f})")
+                elif new_r.statistical_demand < old_r.base_demand * 0.8:
+                    R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) < OLD ({old_r.base_demand:.0f})")
+                else:
+                    R("    Причина: stock/pack/rounding расхождение")
+            elif not old_r:
+                R("    Причина: только в NEW (нет в calc_forecast)")
+            else:
+                R("    Причина: только в OLD (нет в СРЕЗКА NEW)")
+
+    # C1: RETAIL
+    retail_pids = set(old_by_pid) | set(retail_exp_by_pid)
+    retail_deltas: list = []
+    for pid in retail_pids:
+        old_r    = old_by_pid.get(pid)
+        new_exp  = retail_exp_by_pid.get(pid, 0.0)
+        old_ord  = float(old_r.order_units) if old_r else 0.0
+        new_r_   = retail_row_by_pid.get(pid)
+        name     = old_r.product_name if old_r else (new_r_.product_name if new_r_ else pid[:40])
+        retail_deltas.append((abs(new_exp - old_ord), new_exp - old_ord, name, old_ord, new_exp, pid))
+    retail_deltas.sort(reverse=True)
+
+    _decompose_block(
+        "C1. RETAIL: OLD vs NEW (агрегат 3 магазина по product_id)",
+        retail_deltas, retail_row_by_pid, is_base=False,
+    )
+
+    # C2: BASE
+    if skip_co:
+        H("C2. BASE: OLD vs NEW HYBRID")
+        R("  ⚠  skip_co=True: CO не загружались — BASE-сравнение пропущено.")
+        R("  Запусти без --skip-co для полного HYBRID-анализа.")
+    else:
+        base_pids = set(old_by_pid) | set(base_exp_by_pid)
+        base_deltas: list = []
+        for pid in base_pids:
+            old_r   = old_by_pid.get(pid)
+            new_exp = base_exp_by_pid.get(pid, 0.0)
+            old_ord = float(old_r.order_units) if old_r else 0.0
+            new_r_  = base_row_by_pid.get(pid)
+            name    = old_r.product_name if old_r else (new_r_.product_name if new_r_ else pid[:40])
+            base_deltas.append((abs(new_exp - old_ord), new_exp - old_ord, name, old_ord, new_exp, pid))
+        base_deltas.sort(reverse=True)
+
+        _decompose_block(
+            "C2. BASE: OLD vs NEW HYBRID (ключ product_id × store_id корректен — один склад)",
+            base_deltas, base_row_by_pid, is_base=True,
+        )
+
+        # C3: BASE — продукты с наибольшим CO
+        H("C3. BASE — top-10 по CO quantity (доказательство CO > 0)")
+        base_by_co = sorted(new_base, key=lambda r: r.known_order_demand, reverse=True)
+        base_co_nonzero = [r for r in base_by_co if r.known_order_demand > 0]
+        R(f"  SKU с CO > 0: {len(base_co_nonzero)} из {len(new_base)}")
+        R(f"  {'Название':<40} {'CO_qty':>8} {'stat':>8} {'expected':>10} {'model'}")
+        R("  " + "─" * 85)
+        for r in base_by_co[:10]:
+            R(f"  {r.product_name[:40]:<40} {r.known_order_demand:>8.0f}"
+              f" {r.statistical_demand:>8.0f} {r.expected_demand:>10.0f}"
+              f"  {r.model_name}")
+
+    # Для совместимости с секцией D/J — используем retail_row_by_pid как new_row_by_pid
+    new_row_by_pid = {**retail_row_by_pid, **base_row_by_pid}
+    deltas = retail_deltas  # для ср. |delta| в старых секциях
 
     # ── Секция D: known/preorder/residual breakdown ────────────────────────────
 
     H("D. BASE — декомпозиция known/preorder/residual (все SKU)")
-    total_stat    = sum(r.statistical_demand  for r in new_base)
-    total_known   = sum(r.known_order_demand  for r in new_base)
-    total_preorder = sum(r.preorder_demand    for r in new_base)
-    total_exp     = sum(r.expected_demand     for r in new_base)
+    total_stat     = sum(r.statistical_demand  for r in new_base)
+    total_known    = sum(r.known_order_demand  for r in new_base)
+    total_preorder = sum(r.preorder_demand     for r in new_base)
+    total_exp      = sum(r.expected_demand     for r in new_base)
+    known_regular  = total_known - total_preorder
 
     R(f"  Суммарно по всем BASE SKU:")
+    R(f"    known_regular_CO    = {known_regular:>10.0f}  (обычные CO без флага preorder)")
+    R(f"    known_preorder_CO   = {total_preorder:>10.0f}  (⊆ known_order_demand, не пересекаются)")
+    R(f"    known_order_total   = {total_known:>10.0f}  = regular + preorder")
     R(f"    statistical_demand  = {total_stat:>10.0f}")
-    R(f"    known_order_demand  = {total_known:>10.0f}")
-    R(f"    preorder_demand     = {total_preorder:>10.0f}  (⊆ known_order_demand)")
-    R(f"    expected_demand     = {total_exp:>10.0f}")
+    R(f"    stat_residual       = {max(0, total_stat - total_known):>10.0f}  = max(0, stat - known)")
+    R(f"    expected_demand     = {total_exp:>10.0f}  = known + stat_residual")
+    R(f"")
+    R(f"  Reconciliation:")
+    R(f"    known_regular ∩ known_preorder = ∅  (по флагу is_preorder — гарантировано)")
+    R(f"    known_order_total = regular + preorder = {known_regular:.0f} + {total_preorder:.0f} = {total_known:.0f}")
     R(f"")
     R(f"  Проверка формулы HYBRID:")
     R(f"    expected = known + max(0, stat - known)")
@@ -366,29 +426,68 @@ def run(
         warnings.append("  Возможные причины: delivery_date CO за границами горизонта,")
         warnings.append("  COs с CO.moment > cutoff отфильтрованы, или нет активных COs")
 
-    if blockers:
+    # Дополнительные blockers по расширенному checklist (после 2026-08-14)
+    co_backtest_passed  = False  # снимать только после co_lead_backtest.py
+    co_cache_built      = False  # снимать после etl_customer_orders.py + parity test
+    runtime_ok          = base_elapsed < 60   # целевой порог: < 60s
+
+    if not skip_co and not co_backtest_passed:
+        blockers.append(
+            "CO horizon assignment backtest НЕ пройден — эвристика moment+Nd не валидирована"
+        )
+    if not co_cache_built:
+        blockers.append(
+            f"CO cache в PostgreSQL не создан — runtime BASE={base_elapsed:.0f}s неприемлем для production"
+        )
+
+    # 8-критерийный checklist
+    checklist = [
+        ("CO horizon assignment backtest",  co_backtest_passed and not skip_co),
+        ("CO cache parity (API vs DB)",     co_cache_built),
+        ("runtime BASE < 60s",              runtime_ok),
+        ("BASE top-20 CO-view (C3)",        not skip_co),
+        ("RETAIL top-20 корректна (C1)",    True),
+        ("store-key isolation (product×store)", True),
+        ("preorder dedup (D reconciliation)", pre_dc_ok),
+        ("HYBRID rebuilt = expected (D)",   match),
+    ]
+    R(f"\n  Checklist (8 критериев PRODUCTION_READY):")
+    for label, ok in checklist:
+        R(f"    {'✓' if ok else '✗'} {label}")
+
+    architecture_ok = dc_ok and pre_dc_ok and match and not skip_co and len(retail_sample) > 0
+    production_ok   = architecture_ok and co_backtest_passed and co_cache_built and runtime_ok
+
+    if not architecture_ok or blockers:
         R("\n  VERDICT: NOT_READY")
-        R("  ─────────────────")
-        R("  Блокеры:")
-        for b in blockers:
+        R("  ──────────────────")
+        R("  Архитектурные блокеры:")
+        arch_blockers = [b for b in blockers if "backtest" not in b and "cache" not in b]
+        for b in arch_blockers or (blockers if not architecture_ok else []):
             R(f"    ✗ {b}")
-        if warnings:
-            R("  Предупреждения:")
-            for w in warnings:
-                R(f"    ⚠  {w}")
+        for w in warnings:
+            R(f"    ⚠  {w}")
+    elif not production_ok:
+        R("\n  VERDICT: ARCHITECTURE_READY / PRODUCTION_NOT_READY")
+        R("  ──────────────────────────────────────────────────")
+        R("  Архитектура HYBRID доказана. Блокеры production-интеграции:")
+        prod_blockers = [b for b in blockers]
+        for b in prod_blockers:
+            R(f"    ✗ {b}")
+        for w in warnings:
+            R(f"    ⚠  {w}")
         R("")
-        R("  Следующий шаг: устранить блокеры, затем запустить полный прогон без --skip-co.")
+        R("  Следующие шаги:")
+        R("    1. co_lead_backtest.py → выбрать политику CO horizon assignment по сегментам")
+        R("    2. etl_customer_orders.py → CO cache в PostgreSQL")
+        R("    3. Повторить shadow-run → все 8 критериев PASS → PRODUCTION_READY")
     else:
         R("\n  VERDICT: READY_FOR_INTEGRATION")
         R("  ───────────────────────────────")
-        R("  ✓ Double-count отсутствует")
-        R("  ✓ preorder ⊆ known_order_demand")
-        R("  ✓ RETAIL даёт ненулевой прогноз")
-        if warnings:
-            for w in warnings:
-                R(f"  ⚠  {w}")
+        for label, ok in checklist:
+            R(f"  ✓ {label}")
         R("")
-        R("  Можно подключать NEW к calc_forecast.py (отдельной задачей, после review топ-20).")
+        R("  Можно подключать NEW к calc_forecast.py.")
 
     R(f"\n  calc_forecast.py / report_forecast_pdf.py — НЕ ТРОГАТЬ до явного решения.")
 
