@@ -1,516 +1,227 @@
 """
-Нейтральный data layer для прогнозирования.
-Строит DayRecord (факты одного дня) и ForecastFeatures (агрегаты периода).
-НЕ выполняет прогнозирование.
+Слой загрузки данных для forecast-движка (read-only).
+
+Все функции принимают открытое psycopg3-соединение.
+Никакой бизнес-логики — только SQL → Python-структуры.
 """
 from __future__ import annotations
 
-import statistics
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Literal, Sequence
-
-# ── Типы ──────────────────────────────────────────────────────────────
-
-# Что наблюдаемые факты говорят о наличии товара в этот день.
-# Не прогнозное предположение — только интерпретация имеющихся данных.
-AvailabilityEvidence = Literal[
-    "POSITIVE_STOCK_OBSERVED",  # снимок есть, stock_qty > 0, день не аномальный
-    "NO_SNAPSHOT_ROW",          # строки в stock_snapshot нет (ETL не пишет stock_qty ≤ 0)
-    "SNAPSHOT_UNRELIABLE",      # частичный ETL (SNAPSHOT_VOLUME_ANOMALY)
-    "CONFLICTING_EVIDENCE",     # продажи > 0 при отсутствующем снимке или другие противоречия
-]
-
-# Флаги качества данных. Строки, не числовой score.
-QualityFlag = Literal[
-    "SNAPSHOT_VOLUME_ANOMALY",   # частичный ETL в этот день
-    "BALANCE_MISMATCH",          # V2 balance не закрывается
-    "NO_SNAPSHOT",               # нет строки в stock_snapshot
-    "SALES_WITHOUT_SNAPSHOT",    # продажи есть, снимка нет — противоречие
-]
+from typing import NamedTuple
 
 
-# ── DayRecord ─────────────────────────────────────────────────────────
+# ── Типы ─────────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
-class DayRecord:
-    """Факты одного дня для одного product_id × store_id.
-    Не содержит агрегатов периода и прогнозных предположений.
-    """
-
-    date: date
-    product_id: str
+class ProductInfo(NamedTuple):
+    product_id:   str
     product_name: str
-    store_id: str
-    store_name: str
-
-    # Продажи за день (из sales_by_product_day)
-    sales_qty: float
-
-    # Остатки из stock_snapshot (None если строки нет)
-    stock_qty: float | None
-    available_qty: float | None
-    reserve_qty: float | None
-
-    # Движения с момент.date() == этот день (из *_doc/*_item)
-    supply_qty: float
-    move_in_qty: float
-    move_out_qty: float
-    loss_qty: float
-    enter_qty: float
-
-    # Качество снимка
-    snapshot_present: bool
-    snapshot_volume_anomaly: bool  # частичный ETL в этот день
-
-    # V2 balance-check: этот день как T1, ближайший предыдущий снимок как T0.
-    # None если нет пары снимков для сравнения.
-    balance_ok: bool | None
-    balance_abs_error: float | None
-
-    # Набор строковых флагов качества
-    data_quality_flags: tuple[str, ...]
-
-    # Чем объясняется наблюдаемая доступность — факт, не предположение
-    availability_evidence: AvailabilityEvidence
+    folder_path:  str
+    is_srezka:    bool
 
 
-# ── ForecastFeatures ─────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class ForecastFeatures:
-    """Агрегаты периода для одного product_id × store_id.
-    Входные данные для прогнозной модели. Отдельная структура от DayRecord.
-    """
-
-    product_id: str
-    store_id: str
-    date_from: date
-    date_to: date
-
-    # Количество дней по типу availability_evidence
-    calendar_days: int
-    positive_stock_days: int
-    no_snapshot_days: int
-    unreliable_snapshot_days: int
-    conflicting_evidence_days: int
-
-    # Продажи только по дням POSITIVE_STOCK_OBSERVED
-    confirmed_sales_total: float   # сумма продаж в эти дни
-    confirmed_sales_days: int      # дней с ненулевыми продажами из подтверждённых
-    all_period_sales_total: float  # сумма продаж за весь период
-
-    # Статистики (None если меньше 2 подтверждённых дней)
-    median_daily_sales: float | None
-    mean_daily_sales: float | None
-
-    # Итоги движений за период
-    supply_qty_total: float
-    enter_qty_total: float
-
-    # Качество
-    data_quality_flags: tuple[str, ...]
-    balance_ok_ratio: float | None  # доля дней с balance_ok=True, None если нет данных
+class DailySales(NamedTuple):
+    """Продажи одного SKU в одном магазине за один день."""
+    day:           date
+    store_id:      str
+    assortment_id: str
+    sell_qty:      float
+    revenue_kop:   int
 
 
-# ── Загрузка данных ─────────────────────────────────────────────────
+class StockSnapshot(NamedTuple):
+    product_id:      str
+    store_id:        str
+    available_stock: float
+    stock_all:       float
+    reserve_qty:     float
 
-def _q(conn, sql: str, params=()) -> list:
+
+# ── Справочники ───────────────────────────────────────────────────────────────
+
+def load_srezka_products(conn) -> dict[str, ProductInfo]:
+    """Все товары с is_srezka=TRUE из product_dim."""
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
-
-
-def detect_snapshot_anomaly_dates(conn) -> set[date]:
-    """Находит дни с аномально низким покрытием снимков (< 70% от медианы).
-
-    Алгоритм:
-    1. Считает кол-во SKU per store per day
-    2. Медиана кол-ва по каждому складу
-    3. День считается аномальным для склада если < 70% медианы
-    4. Если >50% складов аномальны в этот день — день аномален глобально
-    """
-    rows = _q(conn, """
-        SELECT day, store_id, COUNT(DISTINCT product_id) AS n_sku
-        FROM stock_snapshot WHERE is_srezka = TRUE
-        GROUP BY day, store_id
-    """)
-    if not rows:
-        return set()
-
-    by_store: dict[str, list] = defaultdict(list)
-    counts: dict[tuple, int] = {}
-    for day, sid, n in rows:
-        by_store[sid].append(n)
-        counts[(day, sid)] = n
-
-    store_medians = {sid: statistics.median(vals) for sid, vals in by_store.items()}
-    all_days = sorted({k[0] for k in counts})
-    stores = list(store_medians)
-
-    anomalies: set[date] = set()
-    for d in all_days:
-        anomalous_stores = sum(
-            1 for sid in stores
-            if counts.get((d, sid), 0) < 0.70 * store_medians[sid]
-        )
-        if anomalous_stores > len(stores) * 0.5:
-            anomalies.add(d)
-    return anomalies
-
-
-def _load_snaps(conn, pids: list[str], d_from: date, d_to: date) -> dict:
-    """Возвращает {(pid, sid, day): {stock, avail, rsrv, ts}}"""
-    rows = _q(conn, """
-        SELECT product_id, store_id, day, stock_qty, available_qty, reserve_qty, synced_at
-        FROM stock_snapshot
-        WHERE product_id = ANY(%s) AND is_srezka = TRUE AND day BETWEEN %s AND %s
-    """, [pids, d_from, d_to])
-    return {
-        (r[0], r[1], r[2]): {
-            "stock": float(r[3] or 0),
-            "avail": float(r[4]) if r[4] is not None else None,
-            "rsrv":  float(r[5]) if r[5] is not None else None,
-            "ts":    r[6],
+        cur.execute("""
+            SELECT product_id, product_name, COALESCE(folder_path, ''), is_srezka
+            FROM product_dim
+            WHERE is_srezka = TRUE
+        """)
+        return {
+            r[0]: ProductInfo(r[0], r[1], r[2], r[3])
+            for r in cur.fetchall()
         }
-        for r in rows
-    }
 
 
-def _load_sales(conn, pids: list[str], d_from: date, d_to: date) -> defaultdict:
-    """Возвращает defaultdict{(pid, sid, day): qty}"""
-    rows = _q(conn, """
-        SELECT assortment_id, store_id, day, sell_qty
-        FROM sales_by_product_day
-        WHERE assortment_id = ANY(%s) AND day BETWEEN %s AND %s
-    """, [pids, d_from, d_to])
-    res: defaultdict = defaultdict(float)
-    for r in rows:
-        res[(r[0], r[1], r[2])] = float(r[3] or 0)
-    return res
+def load_products_by_store(conn, store_id: str) -> dict[str, ProductInfo]:
+    """Все товары с продажами в указанном магазине (за всё время)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT ON (p.product_id)
+                p.product_id, p.product_name,
+                COALESCE(p.folder_path, ''), p.is_srezka
+            FROM product_dim p
+            JOIN sales_by_product_day s ON s.assortment_id = p.product_id
+            WHERE s.store_id = %s AND s.sell_qty > 0
+        """, (store_id,))
+        return {
+            r[0]: ProductInfo(r[0], r[1], r[2], r[3])
+            for r in cur.fetchall()
+        }
 
 
-def _load_movements_by_day(conn, pids: list[str], d_from: date, d_to: date) -> dict:
-    """Движения, сгруппированные по calendar day (moment.date()).
+# ── Продажи ───────────────────────────────────────────────────────────────────
 
-    Возвращает {(pid, sid, day): {supply, enter, loss, move_in, move_out}}
-    Используется для отображения фактов дня в DayRecord.
-    """
-    result: dict = defaultdict(lambda: defaultdict(float))
-
-    def _fetch(sql: str, key: str) -> None:
-        for r in _q(conn, sql, [pids, d_from, d_to]):
-            if r[2]:  # moment не None
-                d = r[2].date()
-                result[(r[0], r[1], d)][key] += float(r[3] or 0)
-
-    _fetch("""
-        SELECT si.product_id, sd.store_id, sd.moment, SUM(si.qty)
-        FROM supply_item si JOIN supply_doc sd ON sd.doc_id = si.doc_id
-        WHERE si.product_id = ANY(%s) AND sd.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "supply")
-    _fetch("""
-        SELECT ei.product_id, ed.store_id, ed.moment, SUM(ei.qty)
-        FROM enter_item ei JOIN enter_doc ed ON ed.doc_id = ei.doc_id
-        WHERE ei.product_id = ANY(%s) AND ed.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "enter")
-    _fetch("""
-        SELECT li.product_id, ld.store_id, ld.moment, SUM(li.qty)
-        FROM loss_item li JOIN loss_doc ld ON ld.doc_id = li.doc_id
-        WHERE li.product_id = ANY(%s) AND ld.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "loss")
-    _fetch("""
-        SELECT mi.product_id, md.store_to_id, md.moment, SUM(mi.qty)
-        FROM move_item mi JOIN move_doc md ON md.doc_id = mi.doc_id
-        WHERE mi.product_id = ANY(%s) AND md.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "move_in")
-    _fetch("""
-        SELECT mi.product_id, md.store_from_id, md.moment, SUM(mi.qty)
-        FROM move_item mi JOIN move_doc md ON md.doc_id = mi.doc_id
-        WHERE mi.product_id = ANY(%s) AND md.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "move_out")
-    return result
-
-
-def _load_movements_ts(conn, pids: list[str], d_from: date, d_to: date) -> dict:
-    """Движения с точными timestamp — для V2 balance check.
-
-    Возвращает {(pid, sid): {key: [(ts, qty)]}}
-    """
-    result: dict = defaultdict(lambda: defaultdict(list))
-
-    def _fetch(sql: str, key: str) -> None:
-        for r in _q(conn, sql, [pids, d_from, d_to]):
-            if r[2]:
-                result[(r[0], r[1])][key].append((r[2], float(r[3] or 0)))
-
-    _fetch("""
-        SELECT si.product_id, sd.store_id, sd.moment, SUM(si.qty)
-        FROM supply_item si JOIN supply_doc sd ON sd.doc_id = si.doc_id
-        WHERE si.product_id = ANY(%s) AND sd.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "supply")
-    _fetch("""
-        SELECT ei.product_id, ed.store_id, ed.moment, SUM(ei.qty)
-        FROM enter_item ei JOIN enter_doc ed ON ed.doc_id = ei.doc_id
-        WHERE ei.product_id = ANY(%s) AND ed.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "enter")
-    _fetch("""
-        SELECT li.product_id, ld.store_id, ld.moment, SUM(li.qty)
-        FROM loss_item li JOIN loss_doc ld ON ld.doc_id = li.doc_id
-        WHERE li.product_id = ANY(%s) AND ld.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "loss")
-    _fetch("""
-        SELECT mi.product_id, md.store_to_id, md.moment, SUM(mi.qty)
-        FROM move_item mi JOIN move_doc md ON md.doc_id = mi.doc_id
-        WHERE mi.product_id = ANY(%s) AND md.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "move_in")
-    _fetch("""
-        SELECT mi.product_id, md.store_from_id, md.moment, SUM(mi.qty)
-        FROM move_item mi JOIN move_doc md ON md.doc_id = mi.doc_id
-        WHERE mi.product_id = ANY(%s) AND md.day BETWEEN %s AND %s
-        GROUP BY 1, 2, 3
-    """, "move_out")
-    return result
-
-
-def _wts(items: list[tuple], t0, t1) -> float:
-    """Сумма qty для движений с t0 < ts <= t1."""
-    return sum(qty for ts, qty in items if t0 < ts <= t1)
-
-
-def _sales_window(sales: defaultdict, pid: str, sid: str, d_start: date, d_end: date) -> float:
-    """Продажи в окне [d_start, d_end) — d_start включён, d_end исключён (V2)."""
-    total = 0.0
-    d = d_start
-    while d < d_end:
-        total += sales.get((pid, sid, d), 0)
-        d += timedelta(days=1)
-    return total
-
-
-def _v2_balance(
-    s0: dict, s1: dict,
-    pid: str, sid: str,
-    d_prev: date, d_curr: date,
-    sales: defaultdict,
-    mv_ts: dict,
-) -> tuple[bool | None, float | None]:
-    """V2 balance check между снимком d_prev и d_curr.
-    Возвращает (balance_ok, abs_error). None если нет обоих снимков.
-    """
-    t0 = s0["ts"]; t1 = s1["ts"]
-    q0 = s0["stock"]; q1 = s1["stock"]
-    mv = mv_ts.get((pid, sid), {})
-    sold   = _sales_window(sales, pid, sid, d_prev, d_curr)
-    supply = _wts(mv.get("supply", []), t0, t1)
-    enter  = _wts(mv.get("enter", []), t0, t1)
-    loss   = _wts(mv.get("loss", []), t0, t1)
-    mi     = _wts(mv.get("move_in", []), t0, t1)
-    mo     = _wts(mv.get("move_out", []), t0, t1)
-    pred   = q0 + supply + enter + mi - sold - mo - loss
-    err    = abs(q1 - pred)
-    return err <= 0.5, round(err, 1)
-
-
-# ── Основные функции ──────────────────────────────────────────────
-
-def build_day_records(
+def load_daily_sales(
     conn,
+    store_id: str,
     date_from: date,
-    date_to: date,
-    *,
+    date_to:   date,
     product_ids: list[str] | None = None,
-    store_ids: list[str] | None = None,
-    anomaly_dates: set[date] | None = None,
-) -> list[DayRecord]:
-    """Строит список DayRecord для всех SKU×Магазин×День в периоде.
-
-    Если product_ids=None — берёт все СРЕЗКА товары из product_dim.
-    Если anomaly_dates=None — вычисляет автоматически через detect_snapshot_anomaly_dates.
-    Данные загружаются с запасом в 1 день для balance check предыдущего дня.
+) -> list[DailySales]:
     """
-    if product_ids is None:
-        rows = _q(conn, "SELECT product_id FROM product_dim WHERE is_srezka = TRUE")
-        product_ids = [r[0] for r in rows]
-    if not product_ids:
-        return []
+    Продажи по дням для магазина. Фильтр по product_ids опционален.
+    """
+    with conn.cursor() as cur:
+        if product_ids is not None:
+            cur.execute("""
+                SELECT day, store_id, assortment_id,
+                       COALESCE(sell_qty, 0), COALESCE(revenue_kop, 0)
+                FROM sales_by_product_day
+                WHERE store_id = %s
+                  AND day BETWEEN %s AND %s
+                  AND sell_qty > 0
+                  AND assortment_id = ANY(%s)
+                ORDER BY day
+            """, (store_id, date_from, date_to, product_ids))
+        else:
+            cur.execute("""
+                SELECT day, store_id, assortment_id,
+                       COALESCE(sell_qty, 0), COALESCE(revenue_kop, 0)
+                FROM sales_by_product_day
+                WHERE store_id = %s
+                  AND day BETWEEN %s AND %s
+                  AND sell_qty > 0
+                ORDER BY day
+            """, (store_id, date_from, date_to))
+        return [DailySales(r[0], r[1], r[2], float(r[3]), int(r[4])) for r in cur.fetchall()]
 
-    if anomaly_dates is None:
-        anomaly_dates = detect_snapshot_anomaly_dates(conn)
 
-    # Загружаем с запасом -1 день для balance check
-    load_from = date_from - timedelta(1)
+def load_store_daily_revenue(
+    conn,
+    store_id: str,
+    date_from: date,
+    date_to:   date,
+) -> dict[date, float]:
+    """Суммарная выручка магазина по дням (в копейках)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT day, SUM(revenue_kop)
+            FROM sales_by_store_day
+            WHERE store_id = %s AND day BETWEEN %s AND %s
+            GROUP BY day
+        """, (store_id, date_from, date_to))
+        return {r[0]: float(r[1]) for r in cur.fetchall()}
 
-    snaps    = _load_snaps(conn, product_ids, load_from, date_to)
-    sales    = _load_sales(conn, product_ids, date_from, date_to)
-    mv_day   = _load_movements_by_day(conn, product_ids, date_from, date_to)
-    mv_ts    = _load_movements_ts(conn, product_ids, load_from, date_to)
-    store_nm = {r[0]: r[1] for r in _q(conn,
-        "SELECT DISTINCT ON (store_id) store_id, store_name FROM stock_snapshot")}
-    prod_nm  = {r[0]: r[1] for r in _q(conn,
-        "SELECT product_id, product_name FROM product_dim WHERE product_id = ANY(%s)",
-        [product_ids])}
 
-    # Все pid×sid комбинации, у которых есть хоть один снимок в периоде
-    ps_pairs: set[tuple[str, str]] = {
-        (pid, sid)
-        for (pid, sid, d) in snaps
-        if pid in set(product_ids) and date_from <= d <= date_to
-    }
-    # Дополнить парами из продаж (могут быть продажи без снимка)
-    for (pid, sid, d) in sales:
-        if date_from <= d <= date_to:
-            ps_pairs.add((pid, sid))
+def load_product_daily_sales_matrix(
+    conn,
+    store_id: str,
+    date_from: date,
+    date_to:   date,
+) -> dict[str, dict[date, float]]:
+    """
+    Возвращает {product_id: {day: qty}} для эффективного расчёта rolling window.
+    """
+    rows = load_daily_sales(conn, store_id, date_from, date_to)
+    matrix: dict[str, dict[date, float]] = defaultdict(dict)
+    for row in rows:
+        matrix[row.assortment_id][row.day] = row.sell_qty
+    return dict(matrix)
 
-    if store_ids:
-        ps_pairs = {(p, s) for p, s in ps_pairs if s in set(store_ids)}
 
-    records: list[DayRecord] = []
-    n_days = (date_to - date_from).days + 1
+def rolling_mean(
+    sales_by_day: dict[date, float],
+    end_date: date,
+    window_days: int,
+    oper_start: date | None = None,
+) -> float:
+    """
+    Среднедневные продажи за calendar-window до end_date.
+    Дни до oper_start исключаются (предоперационные нули не учитываются).
+    Если данных нет — возвращает 0.0.
+    """
+    start = end_date - timedelta(days=window_days - 1)
+    if oper_start is not None:
+        start = max(start, oper_start)
+    n_days = (end_date - start).days + 1
+    if n_days <= 0:
+        return 0.0
+    total = sum(
+        sales_by_day.get(start + timedelta(days=i), 0.0)
+        for i in range(n_days)
+    )
+    return total / n_days
 
-    for pid, sid in sorted(ps_pairs):
-        for i in range(n_days):
-            d = date_from + timedelta(i)
-            snap   = snaps.get((pid, sid, d))
-            prev_d = d - timedelta(1)
-            snap_p = snaps.get((pid, sid, prev_d))
-            s_qty  = sales.get((pid, sid, d), 0)
-            mv     = mv_day.get((pid, sid, d), {})
 
-            # Признаки качества снимка
-            is_anomaly = d in anomaly_dates
-            snap_ok    = snap is not None
+# ── Остаток ───────────────────────────────────────────────────────────────────
 
-            # V2 balance check
-            bal_ok  = None
-            bal_err = None
-            if snap_ok and snap_p is not None and not is_anomaly and prev_d not in anomaly_dates:
-                bal_ok, bal_err = _v2_balance(
-                    snap_p, snap, pid, sid, prev_d, d, sales, mv_ts
-                )
-
-            # Флаги качества
-            flags: list[str] = []
-            if is_anomaly:
-                flags.append("SNAPSHOT_VOLUME_ANOMALY")
-            if not snap_ok:
-                flags.append("NO_SNAPSHOT")
-                if s_qty > 0:
-                    flags.append("SALES_WITHOUT_SNAPSHOT")
-            elif bal_ok is False:
-                flags.append("BALANCE_MISMATCH")
-
-            # Availability evidence — только факты
-            if is_anomaly:
-                evidence: AvailabilityEvidence = "SNAPSHOT_UNRELIABLE"
-            elif not snap_ok and s_qty > 0:
-                evidence = "CONFLICTING_EVIDENCE"
-            elif not snap_ok:
-                evidence = "NO_SNAPSHOT_ROW"
+def load_stock_snapshot(
+    conn,
+    store_id: str,
+    product_ids: list[str] | None = None,
+) -> dict[str, StockSnapshot]:
+    """
+    Последний известный остаток из stock_snapshot (или аналогичной таблицы).
+    Возвращает пустой словарь если таблица не существует.
+    """
+    try:
+        with conn.cursor() as cur:
+            if product_ids is not None:
+                cur.execute("""
+                    SELECT product_id, store_id,
+                           COALESCE(available_qty, 0),
+                           COALESCE(stock_qty, 0),
+                           COALESCE(reserve_qty, 0)
+                    FROM stock_snapshot
+                    WHERE store_id = %s AND product_id = ANY(%s)
+                """, (store_id, product_ids))
             else:
-                # snap присутствует; ETL не пишет stock_qty <= 0,
-                # поэтому наличие строки уже означает положительный остаток
-                evidence = "POSITIVE_STOCK_OBSERVED"
-
-            records.append(DayRecord(
-                date=d,
-                product_id=pid,
-                product_name=prod_nm.get(pid, pid),
-                store_id=sid,
-                store_name=store_nm.get(sid, sid),
-                sales_qty=s_qty,
-                stock_qty=snap["stock"] if snap else None,
-                available_qty=snap.get("avail") if snap else None,
-                reserve_qty=snap.get("rsrv") if snap else None,
-                supply_qty=mv.get("supply", 0),
-                move_in_qty=mv.get("move_in", 0),
-                move_out_qty=mv.get("move_out", 0),
-                loss_qty=mv.get("loss", 0),
-                enter_qty=mv.get("enter", 0),
-                snapshot_present=snap_ok,
-                snapshot_volume_anomaly=is_anomaly,
-                balance_ok=bal_ok,
-                balance_abs_error=bal_err,
-                data_quality_flags=tuple(flags),
-                availability_evidence=evidence,
-            ))
-
-    return records
+                cur.execute("""
+                    SELECT product_id, store_id,
+                           COALESCE(available_qty, 0),
+                           COALESCE(stock_qty, 0),
+                           COALESCE(reserve_qty, 0)
+                    FROM stock_snapshot
+                    WHERE store_id = %s
+                """, (store_id,))
+            return {
+                r[0]: StockSnapshot(r[0], r[1], float(r[2]), float(r[3]), float(r[4]))
+                for r in cur.fetchall()
+            }
+    except Exception:
+        return {}
 
 
-def build_forecast_features(
-    records: list[DayRecord],
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> list[ForecastFeatures]:
-    """Строит ForecastFeatures по списку DayRecord (агрегация за период).
+# ── Магазины ──────────────────────────────────────────────────────────────────
 
-    Группирует по product_id × store_id.
-    date_from/date_to берутся из records если не указаны явно.
-    """
-    if not records:
-        return []
+def load_store_names(conn) -> dict[str, str]:
+    """store_id → store_name из sales_by_store_day."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT store_id, store_name
+            FROM sales_by_store_day
+        """)
+        return {r[0]: r[1] for r in cur.fetchall()}
 
-    by_ps: dict[tuple[str, str], list[DayRecord]] = defaultdict(list)
-    for r in records:
-        by_ps[(r.product_id, r.store_id)].append(r)
 
-    result: list[ForecastFeatures] = []
-    for (pid, sid), recs in by_ps.items():
-        recs_sorted = sorted(recs, key=lambda x: x.date)
-        d_from = date_from or recs_sorted[0].date
-        d_to   = date_to   or recs_sorted[-1].date
-
-        pos    = [r for r in recs if r.availability_evidence == "POSITIVE_STOCK_OBSERVED"]
-        no_sn  = [r for r in recs if r.availability_evidence == "NO_SNAPSHOT_ROW"]
-        unrel  = [r for r in recs if r.availability_evidence == "SNAPSHOT_UNRELIABLE"]
-        confl  = [r for r in recs if r.availability_evidence == "CONFLICTING_EVIDENCE"]
-
-        conf_sales = [r.sales_qty for r in pos]
-        med = statistics.median(conf_sales) if len(conf_sales) >= 2 else None
-        mn  = (sum(conf_sales) / len(conf_sales)) if conf_sales else None
-
-        bal_checks = [r for r in recs if r.balance_ok is not None]
-        bal_ratio  = (
-            sum(1 for r in bal_checks if r.balance_ok) / len(bal_checks)
-            if bal_checks else None
-        )
-
-        all_flags: set[str] = set()
-        for r in recs:
-            all_flags.update(r.data_quality_flags)
-        if len(pos) < 3:
-            all_flags.add("LIMITED_HISTORY")
-
-        result.append(ForecastFeatures(
-            product_id=pid,
-            store_id=sid,
-            date_from=d_from,
-            date_to=d_to,
-            calendar_days=(d_to - d_from).days + 1,
-            positive_stock_days=len(pos),
-            no_snapshot_days=len(no_sn),
-            unreliable_snapshot_days=len(unrel),
-            conflicting_evidence_days=len(confl),
-            confirmed_sales_total=sum(conf_sales),
-            confirmed_sales_days=sum(1 for s in conf_sales if s > 0),
-            all_period_sales_total=sum(r.sales_qty for r in recs),
-            median_daily_sales=med,
-            mean_daily_sales=round(mn, 4) if mn is not None else None,
-            supply_qty_total=sum(r.supply_qty for r in recs),
-            enter_qty_total=sum(r.enter_qty for r in recs),
-            data_quality_flags=tuple(sorted(all_flags)),
-            balance_ok_ratio=round(bal_ratio, 3) if bal_ratio is not None else None,
-        ))
-
-    return result
+def load_store_operational_start(conn, store_id: str) -> date | None:
+    """Первый день с ненулевыми продажами в магазине."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT MIN(day)
+            FROM sales_by_store_day
+            WHERE store_id = %s AND revenue_kop > 0
+        """, (store_id,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
