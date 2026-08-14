@@ -328,136 +328,171 @@ def analyze(records: list[LeadRecord]) -> None:
     print()
 
 
-MAX_CO_AGE_DAYS_TIER_B = 7   # из forecast_orders.py: MAX_CO_AGE_FOR_ESTIMATED
+MAX_CO_AGE_DAYS_TIER_B = 7   # верхняя граница исследования; финал выбирается по backtest
 
 
 def simulate_tier_b_policy(records: list[LeadRecord]) -> None:
     """
-    Симулирует политику LARGE Tier B (forecast_orders.py) на исторических данных.
+    CORRECTED backtest v2: FN считается относительно глобального ground truth.
 
-    Разделение двух величин:
-      remaining_at_cutoff   = ordered_qty - shipped_before_cutoff
-                              (то, что алгоритм ЗНАЕТ на cutoff)
-      actual_shipped_after  = SUM(demand.qty WHERE demand.date > cutoff)
-                              (ground truth: что фактически пришло позже)
-    Это принципиально разные величины.
+    Методологическая ошибка v1: FN считался только среди CO, которые policy уже включила.
+    Исключённые CO полностью исчезали из знаменателя → FN=0 при любом окне → recall=1.00 везде.
 
-    Формулы TP/FP/FN:
-      predicted_qty = remaining_at_cutoff   (Tier B включает всё оставшееся)
-      actual_qty    = actual_in_horizon     (отгружено в [cutoff+1, cutoff+HORIZON])
-      TP_qty = min(predicted, actual)
-      FP_qty = max(0, predicted - actual)  // перепрогноз — ОПАСНО для цветов
-      FN_qty = max(0, actual - predicted)  // недопрогноз — так же опасен
+    v2-методология:
+      cutoff_dates = все уникальные даты создания CO в датасете
+
+      Для каждого cutoff:
+        ground_truth_qty = SUM(actual_demand в [cutoff+1, cutoff+HORIZON])
+                           по ВСЕМ LARGE CO с co_date <= cutoff
+
+        Для каждой policy (age_min, age_max):
+          Для каждого CO:
+            predicted = remaining_at_cutoff  если included, иначе 0
+            TP += min(predicted, actual_in_h)
+            FP += max(0, predicted - actual_in_h)
+            FN += max(0, actual_in_h - predicted)
+
+      Исключённый CO с реальным спросом → FN += actual_in_h (predicted=0).
+      Расширение окна должно давать нормальный trade-off: меньше FN, больше FP.
 
     HISTORICAL_REMAINING_APPROXIMATE:
-      МойСклад API не возвращает ordered/shipped/state CO на историческую дату.
-      Здесь ordered_qty получен из CO positions на момент запроса.
-      Если между исторической датой и сегодня были частичные отмены, ordered_qty
-      будет занижен → remaining занижен → FP занижен → precision завышена.
-      Backtest remaining надо трактовать как ПРИБЛИЖЕНИЕ.
-      Для production (cutoff ≈ today) эффект отсутствует.
+      ordered_qty взят из CO positions на дату запроса (не на historical cutoff).
+      Если позиции отменены/изменены с тех пор — remaining занижен → FP занижен → precision завышена.
+      approximate_CO_count = все CO в датасете (консервативная оценка, точный флаг нужно добавить).
 
     Подсегменты: LARGE (500–999) и LARGE_PLUS (>=1000) — анализируются отдельно.
+    LARGE_PLUS с n < 20 CO помечается EVIDENCE_PROMISING | SAMPLE_SMALL.
     """
 
-    def _run_segment(seg_label: str, seg_recs: list[LeadRecord]) -> list[tuple]:
-        """Запускает симуляцию для одного сегмента, возвращает age_results."""
+    def _pct(v: float, d: float) -> float:
+        return 100.0 * v / d if d > 0 else float("nan")
+
+    def _quantile(lst: list[float], p: float) -> float:
+        if not lst:
+            return 0.0
+        s = sorted(lst)
+        return s[min(int(len(s) * p), len(s) - 1)]
+
+    def _f(v: float) -> str:
+        return f"{v:.2f}" if v == v else "  —  "
+
+    def _run_segment(seg_label: str, seg_recs: list[LeadRecord]) -> None:
         if not seg_recs:
-            print(f"\n  Нет записей для {seg_label}.")
-            return []
+            print(f"\n  Нет {seg_label} записей.")
+            return
 
-        # Уникальные CO для этого сегмента
-        co_info: dict[str, dict] = {}
+        # CO-level структура
+        co_data: dict[str, dict] = {}
         for r in seg_recs:
-            if r.co_id not in co_info:
-                co_info[r.co_id] = {
+            if r.co_id not in co_data:
+                co_data[r.co_id] = {
                     "co_date":     r.co_date,
-                    "ordered_qty": r.co_ordered_qty,  # из CO positions, не из demand
-                    "demands":     [],
+                    "ordered_qty": r.co_ordered_qty,  # из CO positions
+                    "shipments":   [],                 # (date, qty)
                 }
-            co_info[r.co_id]["demands"].append((r.demand_date, r.qty))
+            co_data[r.co_id]["shipments"].append((r.demand_date, r.qty))
 
-        print(f"\n{'═'*70}")
-        print(f"POLICY SIMULATION: {seg_label}  (age <= {MAX_CO_AGE_DAYS_TIER_B}d, horizon = {HORIZON_DAYS}d)")
-        print(f"  HISTORICAL_REMAINING_APPROXIMATE — см. docstring функции")
-        print(f"  Уникальных CO: {len(co_info)}")
-        print(f"  Всего Demand-записей: {len(seg_recs)}")
+        n_co = len(co_data)
+        small_sample = n_co < 20
+
+        # Набор cutoff-дат = все уникальные даты создания CO
+        cutoff_dates = sorted(set(info["co_date"] for info in co_data.values()))
+
+        print(f"\n{'═'*74}")
+        print(f"POLICY SIM v2 — глобальный ground truth: {seg_label}")
+        if small_sample:
+            print(f"  ⚠  EVIDENCE_PROMISING | SAMPLE_SMALL (n={n_co} CO) — не выбирать финальное правило")
+        print(f"  Уникальных CO: {n_co}  |  Cutoff-дат: {len(cutoff_dates)}  |  Horizon: {HORIZON_DAYS}d")
+        print(f"  HISTORICAL_REMAINING_APPROXIMATE:")
+        print(f"    approximate_CO_count  = {n_co} (все; точный флаг нужно добавить в LeadRecord)")
+        print(f"    approximate_qty_share = неизвестна (зависит от доли отменённых позиций)")
+        print(f"    Эффект: ordered_qty может быть занижен → FP занижен → precision завышена")
         print()
-        print(f"  Определения:")
-        print(f"    remaining_at_cutoff = ordered_qty - shipped_before_cutoff")
-        print(f"    predicted_qty       = remaining_at_cutoff")
-        print(f"    actual_in_horizon   = shipped_in [cutoff+1, cutoff+{HORIZON_DAYS}]")
-        print(f"    FP_qty              = max(0, predicted - actual)  ← перепрогноз")
-        print(f"    FN_qty              = max(0, actual - predicted)  ← недопрогноз")
+        print(f"  FN теперь включает CO, исключённые policy, у которых был реальный спрос в горизонте.")
+        print(f"  Расширение окна → меньше FN (больше CO включено), больше FP (больше ложного объёма).")
         print()
 
-        print(f"  {'age':>5} {'incl':>6} {'excl0':>6} "
-              f"{'predicted':>10} {'actual_h':>10} "
-              f"{'TP_qty':>10} {'FP_qty':>10} {'FN_qty':>10} "
-              f"{'prec':>7} {'recall':>7}")
-        print(f"  {'-'*95}")
+        # Политики для тестирования
+        variants = [
+            (0, 1), (0, 2), (0, 3), (0, 5), (0, 7),
+            (1, 3), (1, 5), (1, 7),
+        ]
 
-        age_results = []
-        for age in range(0, MAX_CO_AGE_DAYS_TIER_B + 1):
-            tp_qty = fp_qty = fn_qty = predicted_total = actual_h_total = 0.0
-            incl = excl_zero = 0
+        hdr = (f"  {'policy':>8}  {'gt_qty':>8} {'pred':>8} {'TP':>8} {'FP':>8} {'FN':>8} "
+               f"{'prec':>5} {'recall':>6} {'F1':>5} "
+               f"{'fp/gt%':>7} {'fn/gt%':>7} {'fp_med':>7} {'fp_p90':>7} {'fn_med':>7}")
+        print(hdr)
+        print(f"  {'-'*(len(hdr) - 2)}")
 
-            for co_id, info in co_info.items():
-                cutoff  = info["co_date"] + timedelta(days=age)
-                h_from  = cutoff + timedelta(days=1)
-                h_to    = cutoff + timedelta(days=HORIZON_DAYS)
+        for age_min, age_max in variants:
+            total_gt = total_pred = total_tp = total_fp = total_fn = 0.0
+            per_fp: list[float] = []
+            per_fn: list[float] = []
+            n_active = 0
 
-                shipped_before  = sum(q for d, q in info["demands"] if d <= cutoff)
-                remaining       = max(0.0, info["ordered_qty"] - shipped_before)
+            for cutoff in cutoff_dates:
+                h_from = cutoff + timedelta(days=1)
+                h_to   = cutoff + timedelta(days=HORIZON_DAYS)
 
-                if remaining <= 0:
-                    excl_zero += 1
-                    continue
-                incl += 1
+                c_gt = c_pred = c_tp = c_fp = c_fn = 0.0
 
-                actual_in_h = sum(q for d, q in info["demands"] if h_from <= d <= h_to)
-                predicted_total += remaining
-                actual_h_total  += actual_in_h
+                for co_id, info in co_data.items():
+                    age = (cutoff - info["co_date"]).days
+                    if age < 0:
+                        continue  # CO не существует на этот cutoff
 
-                tp_qty += min(remaining, actual_in_h)
-                fp_qty += max(0.0, remaining - actual_in_h)
-                fn_qty += max(0.0, actual_in_h - remaining)
+                    actual_in_h = sum(q for d, q in info["shipments"] if h_from <= d <= h_to)
+                    c_gt += actual_in_h
 
-            prec   = tp_qty / (tp_qty + fp_qty) if (tp_qty + fp_qty) > 0 else float("nan")
-            recall = tp_qty / (tp_qty + fn_qty) if (tp_qty + fn_qty) > 0 else float("nan")
-            prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
-            recall_s = f"{recall:.2f}" if recall == recall else "  —  "
+                    shipped_before = sum(q for d, q in info["shipments"] if d <= cutoff)
+                    remaining = max(0.0, info["ordered_qty"] - shipped_before)
+                    included  = (age_min <= age <= age_max) and remaining > 0
+                    predicted = remaining if included else 0.0
 
-            age_results.append((age, incl, excl_zero,
-                                 predicted_total, actual_h_total,
-                                 tp_qty, fp_qty, fn_qty, prec, recall))
-            print(f"  {age:>5}  {incl:>6}  {excl_zero:>6}  "
-                  f"{predicted_total:>10.0f}  {actual_h_total:>10.0f}  "
-                  f"{tp_qty:>10.0f}  {fp_qty:>10.0f}  {fn_qty:>10.0f}  "
-                  f"{prec_s:>7}  {recall_s:>7}")
+                    c_pred += predicted
+                    c_tp   += min(predicted, actual_in_h)
+                    c_fp   += max(0.0, predicted - actual_in_h)
+                    c_fn   += max(0.0, actual_in_h - predicted)
 
-        # Сводная таблица по age-окнам (для выбора политики)
+                if c_gt > 0 or c_pred > 0:
+                    total_gt   += c_gt
+                    total_pred += c_pred
+                    total_tp   += c_tp
+                    total_fp   += c_fp
+                    total_fn   += c_fn
+                    per_fp.append(c_fp)
+                    per_fn.append(c_fn)
+                    n_active += 1
+
+            prec   = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else float("nan")
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else float("nan")
+            f1     = (2*prec*recall/(prec+recall)
+                      if (prec == prec and recall == recall and prec + recall > 0)
+                      else float("nan"))
+
+            fp_gt_pct = _pct(total_fp, total_gt)
+            fn_gt_pct = _pct(total_fn, total_gt)
+            fp_med = _quantile(per_fp, 0.5)
+            fp_p90 = _quantile(per_fp, 0.9)
+            fn_med = _quantile(per_fn, 0.5)
+
+            pol = f"[{age_min},{age_max}]"
+            print(f"  {pol:>8}  {total_gt:>8.0f} {total_pred:>8.0f} {total_tp:>8.0f} "
+                  f"{total_fp:>8.0f} {total_fn:>8.0f} {_f(prec):>5} {_f(recall):>6} {_f(f1):>5} "
+                  f"{_f(fp_gt_pct):>7} {_f(fn_gt_pct):>7} "
+                  f"{fp_med:>7.0f} {fp_p90:>7.0f} {fn_med:>7.0f}  n={n_active}")
+
         print()
-        print(f"  Выбор age-window — trade-off FP (списания) vs FN (дефицит):")
-        print(f"  {'window':>8} {'TP_qty':>10} {'FP_qty':>10} {'FN_qty':>10} {'prec':>7} {'recall':>7} {'bias':>8}")
-        print(f"  {'-'*65}")
-        for max_age in [3, 4, 5, 6, 7]:
-            rows = [r for r in age_results if r[0] <= max_age]
-            tp = sum(r[5] for r in rows)
-            fp = sum(r[6] for r in rows)
-            fn = sum(r[7] for r in rows)
-            bias = tp + fp - (tp + fn) if (tp + fn) > 0 else 0.0
-            prec   = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
-            recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
-            prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
-            recall_s = f"{recall:.2f}" if recall == recall else "  —  "
-            print(f"  {f'<={max_age}':>8}  {tp:>10.0f}  {fp:>10.0f}  {fn:>10.0f}  "
-                  f"{prec_s:>7}  {recall_s:>7}  {bias:>+8.0f}")
+        print(f"  Легенда:")
+        print(f"    gt_qty   = реальный спрос в горизонте (не меняется при смене policy)")
+        print(f"    fp/gt%   = FP / gt × 100%  ← лишняя закупка % от реального спроса")
+        print(f"    fn/gt%   = FN / gt × 100%  ← пропущенный спрос % от реального")
+        print(f"    fp_med   = медиана FP за один cutoff  ← типичный риск одной закупки")
+        print(f"    fp_p90   = P90 FP за один cutoff      ← worst-case без хвоста")
+        print(f"    fn_med   = медиана FN за один cutoff  ← типичный недозаказ")
+        print(f"    n        = число активных cutoff-дат (gt>0 или pred>0)")
 
-        return age_results
-
-    # Запускаем отдельно для LARGE (500–999) и LARGE_PLUS (>=1000)
-    large_recs     = [r for r in records if r.segment == "LARGE"]
+    large_recs      = [r for r in records if r.segment == "LARGE"]
     large_plus_recs = [r for r in records if r.segment == "LARGE_PLUS"]
 
     _run_segment("LARGE (500–999 шт.)", large_recs)
@@ -467,10 +502,10 @@ def simulate_tier_b_policy(records: list[LeadRecord]) -> None:
         print("\n  Нет LARGE/LARGE_PLUS записей для policy simulation.")
 
     print()
-    print(f"  Выбор age-window: не только по precision.")
-    print(f"  FP → риск излишка и списаний (для цветов особенно критично)")
-    print(f"  FN → риск дефицита и потерянных продаж")
-    print(f"  Решение — после анализа таблицы выше.")
+    print(f"  Кандидат на временное правило (ожидает валидации по цифрам выше):")
+    print(f"    LARGE ≥500 без DPM: 1 <= order_age_days <= 3 → ESTIMATED_LARGE_ORDER")
+    print(f"    age=0 исключён: LARGE age=0 даёт precision 0.74 — слишком много FP.")
+    print(f"    Финальное правило выбирается по fp/gt% и fn/gt%, не по абсолютным штукам.")
 
 
 def main() -> None:
