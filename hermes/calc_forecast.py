@@ -563,10 +563,18 @@ def build_forecast_new(
             load_stock_snapshot(conn, cfg.store_id, snap_day=snap_day)
             if snap_day else {}
         )
+        # Если ETL снимка запустился (есть хоть одна запись) — отсутствующий
+        # продукт = нулевой остаток (CONFIRMED_ZERO), а не UNKNOWN.
+        # STOCK_UNKNOWN остаётся только когда snapshot вообще не нашёлся.
+        snapshot_ran = len(stock_by_pid) > 0
 
         # ── 3. Пополнение v1 + флаги ────────────────────────────────────────
         for r in results:
             snap = stock_by_pid.get(r.product_id)
+            if snap is None and snapshot_ran:
+                # МойСклад не вернул строку → товара нет в наличии = 0
+                from hermes.forecast_data import StockSnapshot as _SS
+                snap = _SS(r.product_id, cfg.store_id, 0.0, 0.0, 0.0)
             apply_replenishment_to_result(r, snap)
 
             # v1: поступления ещё не загружаются → INCOMING_UNKNOWN
@@ -575,7 +583,7 @@ def build_forecast_new(
                 if DataFlag.INCOMING_UNKNOWN not in flags:
                     r.data_quality_flags = flags + (DataFlag.INCOMING_UNKNOWN,)
 
-            # STOCK_UNKNOWN → ручная проверка, не выдавать конкретный заказ
+            # Настоящий STOCK_UNKNOWN (снимок вообще не нашёлся) → ручная проверка
             if r.available_stock is None:
                 flags = r.data_quality_flags
                 if DataFlag.MANUAL_REVIEW not in flags:
