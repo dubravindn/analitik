@@ -51,12 +51,13 @@ HORIZON_DAYS = 7            # типичный горизонт прогноза
 
 
 class LeadRecord(NamedTuple):
-    co_id:      str
-    co_date:    date
-    demand_id:  str
-    demand_date: date
-    qty:        float
-    segment:    str        # NORMAL / LARGE / PREORDER
+    co_id:          str
+    co_date:        date
+    demand_id:      str
+    demand_date:    date
+    qty:            float   # qty из Demand (одна отгрузка)
+    co_ordered_qty: float   # total ordered в CO (из позиций CO)
+    segment:        str     # NORMAL / LARGE / LARGE_PLUS / PREORDER
 
 
 def _is_preorder(co_name: str) -> bool:
@@ -64,11 +65,14 @@ def _is_preorder(co_name: str) -> bool:
     return any(k in n for k in _PREORDER_KEYWORDS)
 
 
-def _segment(qty: float, is_pre: bool) -> str:
+def _segment(co_ordered_qty: float, is_pre: bool) -> str:
+    """Сегментация по ordered_qty CO, не по qty отдельной отгрузки."""
     if is_pre:
         return "PREORDER"
-    if qty >= LARGE_ORDER_THRESHOLD:
-        return "LARGE"
+    if co_ordered_qty >= 1000:
+        return "LARGE_PLUS"   # крупнейшие — отдельно
+    if co_ordered_qty >= LARGE_ORDER_THRESHOLD:
+        return "LARGE"        # 500–999
     return "NORMAL"
 
 
@@ -152,9 +156,9 @@ def collect_leads(token: str, store_id: str) -> list[LeadRecord]:
     })
     print(f"  Demand загружено: {len(demands)}")
 
-    # ── Шаг 2: CO за LOOKBACK_CO_DAYS ──────────────────────────────────────
+    # ── Шаг 2: CO за LOOKBACK_CO_DAYS — с positions для ordered_qty ─────────
     co_from = today - timedelta(days=LOOKBACK_CO_DAYS)
-    print(f"  Загружаем CustomerOrder за {LOOKBACK_CO_DAYS} дней...", flush=True)
+    print(f"  Загружаем CustomerOrder за {LOOKBACK_CO_DAYS} дней (с positions)...", flush=True)
     cos = _paginate(token, "/entity/customerorder", {
         "filter": (
             f"store={store_href}"
@@ -162,18 +166,22 @@ def collect_leads(token: str, store_id: str) -> list[LeadRecord]:
             f";moment<={today.strftime('%Y-%m-%d 23:59:59')}"
         ),
         "order": "moment,asc",
+        "expand": "positions",  # нужен ordered_qty из позиций CO
     })
     print(f"  CustomerOrder загружено: {len(cos)}")
 
-    # ── Шаг 3: Индекс CO → meta ──────────────────────────────────────────
+    # ── Шаг 3: Индекс CO → meta (включая ordered_qty) ───────────────────
     co_meta: dict[str, dict] = {}
     for co in cos:
         cid = co.get("id", "")
         if not cid:
             continue
+        positions = co.get("positions", {}).get("rows", [])
+        ordered_qty = sum(float(p.get("quantity", 0)) for p in positions)
         co_meta[cid] = {
-            "moment": co.get("moment", "")[:10],
-            "name":   co.get("name", ""),
+            "moment":      co.get("moment", "")[:10],
+            "name":        co.get("name", ""),
+            "ordered_qty": ordered_qty,  # total ordered — без future leakage
         }
 
     # ── Шаг 4: Джойн Demand → CO ───────────────────────────────────────────
@@ -199,24 +207,25 @@ def collect_leads(token: str, store_id: str) -> list[LeadRecord]:
 
         co_date = date.fromisoformat(co_info["moment"])
         co_name = co_info["name"]
+        co_ordered = co_info["ordered_qty"]
         is_pre = _is_preorder(co_name)
 
-        # Суммарный qty по позициям demand
+        # qty из Demand (одна отгрузка, может быть частичной)
         positions = demand.get("positions", {}).get("rows", [])
         total_qty = sum(float(p.get("quantity", 0)) for p in positions)
         if total_qty <= 0:
             continue
 
-        seg = _segment(total_qty, is_pre)
-        lead = (d_date - co_date).days
+        # Сегментация по CO ordered_qty, а не по qty одной отгрузки
+        seg = _segment(co_ordered, is_pre)
 
-        # Отрицательный lead = demand раньше CO (аномалия, включаем)
         records.append(LeadRecord(
             co_id=co_id,
             co_date=co_date,
             demand_id=demand.get("id", ""),
             demand_date=d_date,
             qty=total_qty,
+            co_ordered_qty=co_ordered,
             segment=seg,
         ))
 
@@ -324,133 +333,144 @@ MAX_CO_AGE_DAYS_TIER_B = 7   # из forecast_orders.py: MAX_CO_AGE_FOR_ESTIMATED
 
 def simulate_tier_b_policy(records: list[LeadRecord]) -> None:
     """
-    Симулирует политику LARGE Tier B из forecast_orders.py.
+    Симулирует политику LARGE Tier B (forecast_orders.py) на исторических данных.
 
-    ANTI-LEAKAGE: для каждого cutoff = co_date + age:
-      shipped_before_cutoff = SUM(demand.qty WHERE demand.date <= cutoff)
-      remaining_at_cutoff   = total_shipped_ever - shipped_before_cutoff
-    Используется как прокси для (ordered_qty - shipped_before_cutoff), т.к.
-    ordered_qty нет в demand-данных. Это КОНСЕРВАТИВНО: remaining >= реального
-    (если CO отгружен не полностью), что создаёт пессимистичный FP — безопасно.
+    Разделение двух величин:
+      remaining_at_cutoff   = ordered_qty - shipped_before_cutoff
+                              (то, что алгоритм ЗНАЕТ на cutoff)
+      actual_shipped_after  = SUM(demand.qty WHERE demand.date > cutoff)
+                              (ground truth: что фактически пришло позже)
+    Это принципиально разные величины.
 
-    STATE_AT_CUTOFF_AVAILABLE = false
-    МойСклад API не возвращает состояние CO на историческую дату.
-    Следствие: в shadow-runner при cutoff = вчера, shipped = сегодняшнее значение.
-    Эффект минимальный для свежих CO (age 0-7д), т.к. отгрузки однодневные.
+    Формулы TP/FP/FN:
+      predicted_qty = remaining_at_cutoff   (Tier B включает всё оставшееся)
+      actual_qty    = actual_in_horizon     (отгружено в [cutoff+1, cutoff+HORIZON])
+      TP_qty = min(predicted, actual)
+      FP_qty = max(0, predicted - actual)  // перепрогноз — ОПАСНО для цветов
+      FN_qty = max(0, actual - predicted)  // недопрогноз — так же опасен
 
-    Формулы (per CO per age):
-      remaining_at_cutoff = total_shipped - shipped_before_cutoff
-      tp_qty = min(remaining, actual_in_horizon)   // правильно включён
-      fp_qty = max(0, remaining - actual_in_horizon) // перепрогноз
-      fn_qty = max(0, actual_in_horizon - remaining)  // недопрогноз
-      bias   = tp_qty + fp_qty - actual_in_horizon_total
+    HISTORICAL_REMAINING_APPROXIMATE:
+      МойСклад API не возвращает ordered/shipped/state CO на историческую дату.
+      Здесь ordered_qty получен из CO positions на момент запроса.
+      Если между исторической датой и сегодня были частичные отмены, ordered_qty
+      будет занижен → remaining занижен → FP занижен → precision завышена.
+      Backtest remaining надо трактовать как ПРИБЛИЖЕНИЕ.
+      Для production (cutoff ≈ today) эффект отсутствует.
+
+    Подсегменты: LARGE (500–999) и LARGE_PLUS (>=1000) — анализируются отдельно.
     """
-    large_recs = [r for r in records if r.segment == "LARGE"]
-    if not large_recs:
-        print("\n  Нет LARGE записей для policy simulation.")
-        return
 
-    print(f"\n{'═'*70}")
-    print(f"POLICY SIMULATION: LARGE Tier B")
-    print(f"  Параметры: age <= {MAX_CO_AGE_DAYS_TIER_B}d, remaining > 0, horizon = {HORIZON_DAYS}d")
-    print(f"  STATE_AT_CUTOFF_AVAILABLE = false (API не знает исторических state)")
-    print(f"  Всего LARGE CO-Demand пар: {len(large_recs)}")
+    def _run_segment(seg_label: str, seg_recs: list[LeadRecord]) -> list[tuple]:
+        """Запускает симуляцию для одного сегмента, возвращает age_results."""
+        if not seg_recs:
+            print(f"\n  Нет записей для {seg_label}.")
+            return []
 
-    # Уникальные CO (объединяем позиции по co_id)
-    co_info: dict[str, dict] = {}
-    for r in large_recs:
-        if r.co_id not in co_info:
-            co_info[r.co_id] = {"co_date": r.co_date, "demands": []}
-        co_info[r.co_id]["demands"].append((r.demand_date, r.qty))
+        # Уникальные CO для этого сегмента
+        co_info: dict[str, dict] = {}
+        for r in seg_recs:
+            if r.co_id not in co_info:
+                co_info[r.co_id] = {
+                    "co_date":     r.co_date,
+                    "ordered_qty": r.co_ordered_qty,  # из CO positions, не из demand
+                    "demands":     [],
+                }
+            co_info[r.co_id]["demands"].append((r.demand_date, r.qty))
 
-    # total_shipped = прокси для ordered_qty
-    for info in co_info.values():
-        info["total_shipped"] = sum(q for _, q in info["demands"])
+        print(f"\n{'═'*70}")
+        print(f"POLICY SIMULATION: {seg_label}  (age <= {MAX_CO_AGE_DAYS_TIER_B}d, horizon = {HORIZON_DAYS}d)")
+        print(f"  HISTORICAL_REMAINING_APPROXIMATE — см. docstring функции")
+        print(f"  Уникальных CO: {len(co_info)}")
+        print(f"  Всего Demand-записей: {len(seg_recs)}")
+        print()
+        print(f"  Определения:")
+        print(f"    remaining_at_cutoff = ordered_qty - shipped_before_cutoff")
+        print(f"    predicted_qty       = remaining_at_cutoff")
+        print(f"    actual_in_horizon   = shipped_in [cutoff+1, cutoff+{HORIZON_DAYS}]")
+        print(f"    FP_qty              = max(0, predicted - actual)  ← перепрогноз")
+        print(f"    FN_qty              = max(0, actual - predicted)  ← недопрогноз")
+        print()
 
-    print(f"  Уникальных LARGE CO: {len(co_info)}")
+        print(f"  {'age':>5} {'incl':>6} {'excl0':>6} "
+              f"{'predicted':>10} {'actual_h':>10} "
+              f"{'TP_qty':>10} {'FP_qty':>10} {'FN_qty':>10} "
+              f"{'prec':>7} {'recall':>7}")
+        print(f"  {'-'*95}")
 
-    # Общий «реальный спрос в горизонте» (глобально, для recall)
-    # Для каждого CO: actual_in_horizon при age=0 (cutoff=co_date)
-    total_actual_in_h_age0 = 0.0
-    for info in co_info.values():
-        h_from = info["co_date"] + timedelta(days=1)
-        h_to   = info["co_date"] + timedelta(days=HORIZON_DAYS)
-        total_actual_in_h_age0 += sum(q for d, q in info["demands"] if h_from <= d <= h_to)
+        age_results = []
+        for age in range(0, MAX_CO_AGE_DAYS_TIER_B + 1):
+            tp_qty = fp_qty = fn_qty = predicted_total = actual_h_total = 0.0
+            incl = excl_zero = 0
 
-    # ── По-age: строка на каждый age ─────────────────────────────────────────
+            for co_id, info in co_info.items():
+                cutoff  = info["co_date"] + timedelta(days=age)
+                h_from  = cutoff + timedelta(days=1)
+                h_to    = cutoff + timedelta(days=HORIZON_DAYS)
+
+                shipped_before  = sum(q for d, q in info["demands"] if d <= cutoff)
+                remaining       = max(0.0, info["ordered_qty"] - shipped_before)
+
+                if remaining <= 0:
+                    excl_zero += 1
+                    continue
+                incl += 1
+
+                actual_in_h = sum(q for d, q in info["demands"] if h_from <= d <= h_to)
+                predicted_total += remaining
+                actual_h_total  += actual_in_h
+
+                tp_qty += min(remaining, actual_in_h)
+                fp_qty += max(0.0, remaining - actual_in_h)
+                fn_qty += max(0.0, actual_in_h - remaining)
+
+            prec   = tp_qty / (tp_qty + fp_qty) if (tp_qty + fp_qty) > 0 else float("nan")
+            recall = tp_qty / (tp_qty + fn_qty) if (tp_qty + fn_qty) > 0 else float("nan")
+            prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
+            recall_s = f"{recall:.2f}" if recall == recall else "  —  "
+
+            age_results.append((age, incl, excl_zero,
+                                 predicted_total, actual_h_total,
+                                 tp_qty, fp_qty, fn_qty, prec, recall))
+            print(f"  {age:>5}  {incl:>6}  {excl_zero:>6}  "
+                  f"{predicted_total:>10.0f}  {actual_h_total:>10.0f}  "
+                  f"{tp_qty:>10.0f}  {fp_qty:>10.0f}  {fn_qty:>10.0f}  "
+                  f"{prec_s:>7}  {recall_s:>7}")
+
+        # Сводная таблица по age-окнам (для выбора политики)
+        print()
+        print(f"  Выбор age-window — trade-off FP (списания) vs FN (дефицит):")
+        print(f"  {'window':>8} {'TP_qty':>10} {'FP_qty':>10} {'FN_qty':>10} {'prec':>7} {'recall':>7} {'bias':>8}")
+        print(f"  {'-'*65}")
+        for max_age in [3, 4, 5, 6, 7]:
+            rows = [r for r in age_results if r[0] <= max_age]
+            tp = sum(r[5] for r in rows)
+            fp = sum(r[6] for r in rows)
+            fn = sum(r[7] for r in rows)
+            bias = tp + fp - (tp + fn) if (tp + fn) > 0 else 0.0
+            prec   = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+            recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+            prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
+            recall_s = f"{recall:.2f}" if recall == recall else "  —  "
+            print(f"  {f'<={max_age}':>8}  {tp:>10.0f}  {fp:>10.0f}  {fn:>10.0f}  "
+                  f"{prec_s:>7}  {recall_s:>7}  {bias:>+8.0f}")
+
+        return age_results
+
+    # Запускаем отдельно для LARGE (500–999) и LARGE_PLUS (>=1000)
+    large_recs     = [r for r in records if r.segment == "LARGE"]
+    large_plus_recs = [r for r in records if r.segment == "LARGE_PLUS"]
+
+    _run_segment("LARGE (500–999 шт.)", large_recs)
+    _run_segment("LARGE_PLUS (>=1000 шт.)", large_plus_recs)
+
+    if not large_recs and not large_plus_recs:
+        print("\n  Нет LARGE/LARGE_PLUS записей для policy simulation.")
+
     print()
-    print(f"  {'age':>5} {'incl':>6} {'excl':>6} "
-          f"{'tp_qty':>10} {'fp_qty':>10} {'fn_qty':>10} {'bias':>8} {'prec':>7} {'recall':>7}")
-    print(f"  {'-'*80}")
-
-    age_results = []
-    for age in range(0, MAX_CO_AGE_DAYS_TIER_B + 1):
-        tp_qty = fp_qty = fn_qty = 0.0
-        incl = excl_zero = 0
-
-        for co_id, info in co_info.items():
-            cutoff   = info["co_date"] + timedelta(days=age)
-            h_from   = cutoff + timedelta(days=1)
-            h_to     = cutoff + timedelta(days=HORIZON_DAYS)
-
-            # ANTI-LEAKAGE: only shipped before cutoff
-            shipped_before    = sum(q for d, q in info["demands"] if d <= cutoff)
-            remaining         = max(0.0, info["total_shipped"] - shipped_before)
-
-            # remaining <= 0 → CO полностью исполнен до cutoff → не включаем
-            if remaining <= 0:
-                excl_zero += 1
-                continue
-            incl += 1
-
-            actual_in_h = sum(q for d, q in info["demands"] if h_from <= d <= h_to)
-
-            tp_qty += min(remaining, actual_in_h)
-            fp_qty += max(0.0, remaining - actual_in_h)
-            fn_qty += max(0.0, actual_in_h - remaining)
-
-        prec_denom = tp_qty + fp_qty
-        prec   = tp_qty / prec_denom if prec_denom > 0 else float("nan")
-        recall_denom = tp_qty + fn_qty
-        recall = tp_qty / recall_denom if recall_denom > 0 else float("nan")
-        bias   = tp_qty + fp_qty - (total_actual_in_h_age0 if age == 0 else (tp_qty + fn_qty))
-        prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
-        recall_s = f"{recall:.2f}" if recall == recall else "  —  "
-        bias_s   = f"{bias:+.0f}"
-
-        age_results.append((age, incl, excl_zero, tp_qty, fp_qty, fn_qty, prec, recall))
-        print(f"  {age:>5}  {incl:>6}  {excl_zero:>6}  "
-              f"{tp_qty:>10.0f}  {fp_qty:>10.0f}  {fn_qty:>10.0f}  "
-              f"{bias_s:>8}  {prec_s:>7}  {recall_s:>7}")
-
-    # ── По-window: cumulative (<=3, <=4, <=5, <=6, <=7) ──────────────────────
-    print()
-    print(f"  Выбор окна age — cumulative FP vs FN (какой age-max выгоднее):")
-    print(f"  {'age_max':>8} {'total_tp':>10} {'total_fp':>10} {'total_fn':>10} {'prec':>7} {'recall':>7}")
-    print(f"  {'-'*60}")
-
-    for max_age in [3, 4, 5, 6, 7]:
-        window_rows = [r for r in age_results if r[0] <= max_age]
-        # Суммируем уникальный вклад: для каждого CO берём только ОДНУ строку (age=co_age_at_forecast)
-        # Упрощение: суммируем по всем age <= max_age как независимые точки наблюдения
-        tp_sum = sum(r[3] for r in window_rows)
-        fp_sum = sum(r[4] for r in window_rows)
-        fn_sum = sum(r[5] for r in window_rows)
-        prec = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else float("nan")
-        recall = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else float("nan")
-        prec_s   = f"{prec:.2f}" if prec == prec else "  —  "
-        recall_s = f"{recall:.2f}" if recall == recall else "  —  "
-        print(f"  {f'<={max_age}':>8}  {tp_sum:>10.0f}  {fp_sum:>10.0f}  {fn_sum:>10.0f}  "
-              f"{prec_s:>7}  {recall_s:>7}")
-
-    print()
-    print(f"  Интерпретация:")
-    print(f"    remaining_at_cutoff = total_shipped_ever - shipped_before_cutoff")
-    print(f"    tp_qty  = min(remaining, actual_in_horizon) — правильно включено")
-    print(f"    fp_qty  = max(0, remaining - actual_in_horizon) — перепрогноз (опасен для цветов)")
-    print(f"    fn_qty  = max(0, actual_in_horizon - remaining) — недопрогноз")
-    print(f"    bias>0  = систематическое завышение закупки")
-    print(f"    excl    = CO с remaining=0 на этом age → правильно исключены")
+    print(f"  Выбор age-window: не только по precision.")
+    print(f"  FP → риск излишка и списаний (для цветов особенно критично)")
+    print(f"  FN → риск дефицита и потерянных продаж")
+    print(f"  Решение — после анализа таблицы выше.")
 
 
 def main() -> None:

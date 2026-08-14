@@ -350,3 +350,62 @@ class TestRemainingQtyAntiLeakage:
         ]
         remaining = self._remaining(1000.0, demands, cutoff)
         assert remaining == 700.0  # 1000 - 300
+
+    def test_concrete_tp_fp_fn_scenario(self):
+        """
+        Конкретный сценарий из ТЗ:
+          ordered = 1000
+          shipped_before_cutoff = 250
+          shipped_in_horizon    = 500   ← actual_in_horizon (ground truth)
+          shipped_after_horizon = 200   ← future data (нельзя использовать)
+          never_shipped         = 50    ← отменено или не исполнено
+
+          remaining_at_cutoff (CORRECT) = 1000 - 250 = 750
+          predicted = 750
+          TP  = min(750, 500) = 500
+          FP  = max(0, 750 - 500) = 250   ← перепрогноз
+          FN  = max(0, 500 - 750) = 0
+
+          WRONG approach (using total_shipped_ever as proxy):
+            total_shipped_ever = 250 + 500 + 200 = 950  (never=50 не отгружено)
+            wrong_remaining = total_shipped_ever - shipped_before = 950 - 250 = 700
+            wrong_FP = max(0, 700 - 500) = 200   ← ЗАНИЖЕН на 50!
+        """
+        from datetime import date, timedelta
+
+        cutoff    = date(2026, 8, 1)
+        h_from    = cutoff + timedelta(days=1)
+        h_to      = cutoff + timedelta(days=14)
+
+        demands = [
+            (date(2026, 7, 28),  250.0),   # before cutoff — shipped
+            (date(2026, 8, 5),   300.0),   # in horizon
+            (date(2026, 8, 10),  200.0),   # in horizon
+            (date(2026, 8, 20),  200.0),   # after horizon (future)
+            # never_shipped = 50 (нет в demand records)
+        ]
+        total_ordered    = 1000.0
+        total_shipped_ever = sum(q for _, q in demands)  # 950
+
+        # --- CORRECT approach: ordered_qty - shipped_before ---
+        remaining_correct = self._remaining(total_ordered, demands, cutoff)
+        assert remaining_correct == 750.0, f"Expected 750, got {remaining_correct}"
+
+        actual_in_h = sum(q for d, q in demands if h_from <= d <= h_to)
+        assert actual_in_h == 500.0
+
+        tp_correct = min(remaining_correct, actual_in_h)
+        fp_correct = max(0.0, remaining_correct - actual_in_h)
+        fn_correct = max(0.0, actual_in_h - remaining_correct)
+
+        assert tp_correct == 500.0
+        assert fp_correct == 250.0  # перепрогноз
+        assert fn_correct == 0.0
+
+        # --- WRONG approach: total_shipped_ever - shipped_before ---
+        shipped_before = sum(q for d, q in demands if d <= cutoff)
+        wrong_remaining = max(0.0, total_shipped_ever - shipped_before)  # 950 - 250 = 700
+        assert wrong_remaining == 700.0  # занижен!
+
+        fp_wrong = max(0.0, wrong_remaining - actual_in_h)
+        assert fp_wrong == 200.0  # на 50 меньше реального FP=250 → политика выглядит лучше, чем есть
