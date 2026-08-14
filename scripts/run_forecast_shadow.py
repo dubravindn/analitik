@@ -178,19 +178,25 @@ def run(
 
     H("C. OLD vs NEW — топ расхождений (агрегат по product_id)")
 
-    # Агрегируем NEW RETAIL по product_id
-    new_by_pid: dict[str, float] = defaultdict(float)
-    for r in new_retail + new_base:
-        new_by_pid[r.product_id] += r.expected_demand
+    if skip_co:
+        R("  ⚠  skip_co=True: сравнение BASE некорректно — CO не загружались.")
+        R("  Ниже показан только RETAIL. Для полного HYBRID запусти без --skip-co.\n")
 
-    # Совмещаем
-    all_pids = set(old_by_pid) | set(new_by_pid)
+    # Агрегируем NEW по product_id (sum expected + первый ForecastResult для деталей)
+    new_exp_by_pid: dict[str, float] = defaultdict(float)
+    new_row_by_pid: dict[str, ForecastResult] = {}
+    for r in new_retail + ([] if skip_co else new_base):
+        new_exp_by_pid[r.product_id] += r.expected_demand
+        if r.product_id not in new_row_by_pid:
+            new_row_by_pid[r.product_id] = r
+
+    all_pids = set(old_by_pid) | set(new_exp_by_pid)
     deltas = []
     for pid in all_pids:
-        old_r = old_by_pid.get(pid)
-        new_exp = new_by_pid.get(pid, 0.0)
+        old_r   = old_by_pid.get(pid)
+        new_exp = new_exp_by_pid.get(pid, 0.0)
         old_order = float(old_r.order_units) if old_r else 0.0
-        old_name = old_r.product_name if old_r else pid[:40]
+        old_name  = old_r.product_name if old_r else pid[:40]
         delta = new_exp - old_order
         deltas.append((abs(delta), delta, old_name, old_order, new_exp, pid))
 
@@ -206,6 +212,46 @@ def run(
           f"{delta:>+8.0f} {pct_s:>7}")
 
     R(f"\n  Ср. |delta|: {sum(a for a, *_ in deltas) / len(deltas):.0f}" if deltas else "")
+
+    # Полная декомпозиция top-20
+    R(f"\n  ДЕКОМПОЗИЦИЯ top-20:")
+    for i, (abs_d, delta, name, old_order, new_exp, pid) in enumerate(top20, 1):
+        old_r  = old_by_pid.get(pid)
+        new_r  = new_row_by_pid.get(pid)
+        R(f"\n  [{i:02d}] {name[:60]}")
+        if old_r:
+            R(f"    OLD: prev={old_r.prev_demand:.0f}  year_ago={old_r.year_ago_demand:.0f}"
+              f"  base_demand={old_r.base_demand:.0f}  stock={old_r.available_stock:.0f}"
+              f"  raw={old_r.raw_order:.0f}  → order={old_r.order_units}")
+        else:
+            R("    OLD: (нет в calc_forecast — возможно, за порогом ассортимента)")
+        if new_r:
+            R(f"    NEW: stat={new_r.statistical_demand:.0f}"
+              f"  CO={new_r.known_order_demand:.0f}"
+              f"  pre={new_r.preorder_demand:.0f}"
+              f"  expected={new_r.expected_demand:.0f}"
+              f"  stock={new_r.available_stock if new_r.available_stock is not None else '?'}"
+              f"  → order={new_r.recommended_order_qty:.0f}"
+              f"  [{new_r.model_name}]")
+        else:
+            R("    NEW: (нет в новом движке — нет в СРЕЗКА или нет продаж)")
+        # Причина расхождения
+        if old_r and new_r:
+            if new_r.known_order_demand > old_r.base_demand * 0.5:
+                R(f"    Причина: NEW получил крупный CO ({new_r.known_order_demand:.0f} шт) "
+                  f"против stat-base в OLD ({old_r.base_demand:.0f} шт)")
+            elif new_r.statistical_demand > old_r.base_demand * 1.2:
+                R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) > OLD base_demand "
+                  f"({old_r.base_demand:.0f}) — разные окна/логика")
+            elif new_r.statistical_demand < old_r.base_demand * 0.8:
+                R(f"    Причина: NEW stat ({new_r.statistical_demand:.0f}) < OLD base_demand "
+                  f"({old_r.base_demand:.0f}) — разные окна/логика")
+            else:
+                R(f"    Причина: stock/pack/rounding расхождение")
+        elif not old_r:
+            R(f"    Причина: товар есть только в NEW (нет в OLD calc_forecast)")
+        else:
+            R(f"    Причина: товар есть только в OLD (нет в RETAIL-окне NEW)")
 
     # ── Секция D: known/preorder/residual breakdown ────────────────────────────
 
@@ -302,34 +348,47 @@ def run(
     # ── Секция J: вывод ───────────────────────────────────────────────────────
 
     H("J. Вывод")
-    issues: list[str] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
+
     if not dc_ok:
-        issues.append("double-count обнаружен в BASE")
+        blockers.append("double-count обнаружен в BASE (expected > stat + known)")
     if not pre_dc_ok:
-        issues.append("preorder > known в некоторых SKU")
+        blockers.append("preorder > known_order_demand в некоторых SKU")
     if len(retail_sample) == 0:
-        issues.append("нет RETAIL SKU с ненулевым прогнозом")
-
-    if issues:
-        R("  ✗ БЛОКЕРЫ перед подключением к production:")
-        for issue in issues:
-            R(f"    - {issue}")
-    else:
-        R("  ✓ Базовые проверки пройдены.")
-
+        blockers.append("нет RETAIL SKU с ненулевым прогнозом")
     if skip_co:
-        R("  ⚠  Запущен с --skip-co: BASE-прогноз без CustomerOrders.")
-        R("     Запусти без --skip-co для реального HYBRID.")
+        blockers.append("запущен с --skip-co: полная HYBRID-валидация не проводилась")
     elif not base_with_co:
-        R("  ⚠  BASE: ни один SKU не получил CO-demand.")
-        R("     Возможные причины:")
-        R("     - deliveredBy не заполнен в COs")
-        R("     - горизонт не пересекается с delivery_date CO")
-        R("     - нет активных COs на cutoff")
+        warnings.append("BASE: ни один SKU не получил CO-demand")
+        warnings.append("  Возможные причины: delivery_date CO за границами горизонта,")
+        warnings.append("  COs с CO.moment > cutoff отфильтрованы, или нет активных COs")
 
-    R(f"\n  calc_forecast.py — НЕ МЕНЯТЬ до завершения shadow-валидации.")
-    R(f"  Следующий шаг: убедиться что known_order_demand > 0 на реальном горизонте,")
-    R(f"  или реализовать fallback через demand-историю CO как proxy.")
+    if blockers:
+        R("\n  VERDICT: NOT_READY")
+        R("  ─────────────────")
+        R("  Блокеры:")
+        for b in blockers:
+            R(f"    ✗ {b}")
+        if warnings:
+            R("  Предупреждения:")
+            for w in warnings:
+                R(f"    ⚠  {w}")
+        R("")
+        R("  Следующий шаг: устранить блокеры, затем запустить полный прогон без --skip-co.")
+    else:
+        R("\n  VERDICT: READY_FOR_INTEGRATION")
+        R("  ───────────────────────────────")
+        R("  ✓ Double-count отсутствует")
+        R("  ✓ preorder ⊆ known_order_demand")
+        R("  ✓ RETAIL даёт ненулевой прогноз")
+        if warnings:
+            for w in warnings:
+                R(f"  ⚠  {w}")
+        R("")
+        R("  Можно подключать NEW к calc_forecast.py (отдельной задачей, после review топ-20).")
+
+    R(f"\n  calc_forecast.py / report_forecast_pdf.py — НЕ ТРОГАТЬ до явного решения.")
 
     # ── JSON дамп ─────────────────────────────────────────────────────────────
 
