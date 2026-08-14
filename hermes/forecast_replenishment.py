@@ -26,7 +26,9 @@ def calculate_replenishment(
     Параметры:
       expected_demand     — ожидаемый спрос (из forecast engine, штук)
       available_stock     — доступный остаток (None = UNKNOWN)
-      reserve_qty         — резерв (вычитается из stock)
+                            ВАЖНО: это МойСклад-поле "quantity" = stock - reserve (уже нетто).
+                            Резерв НЕ вычитается повторно.
+      reserve_qty         — резерв (только для информации/логирования, в формулу не входит)
       confirmed_incoming  — подтверждённое поступление (None = UNKNOWN, не 0)
       transfer_in_qty     — входящие перемещения
       transfer_out_qty    — исходящие перемещения
@@ -38,7 +40,7 @@ def calculate_replenishment(
 
     Цепочка:
       target_stock   = expected_demand + safety_stock
-      net_available  = available_stock + confirmed_incoming + transfer_in - transfer_out - reserve
+      net_available  = available_stock + confirmed_incoming + transfer_in - transfer_out
       raw_order      = max(0, target_stock - net_available)
       rounded_order  = ceil(raw_order / pack_size) * pack_size
     """
@@ -48,12 +50,13 @@ def calculate_replenishment(
     stock_contribution = available_stock if available_stock is not None else 0.0
     incoming = confirmed_incoming if confirmed_incoming is not None else 0.0
 
+    # reserve_qty НЕ вычитается: available_stock = МойСклад "quantity" = stock - reserve (уже нетто).
+    # Вычитать ещё раз значит двойной учёт резерва → завышенный заказ.
     net_available = (
         stock_contribution
         + incoming
         + transfer_in_qty
         - transfer_out_qty
-        - reserve_qty
     )
 
     raw_order = max(0.0, target_stock - net_available)
@@ -83,14 +86,17 @@ def apply_replenishment_to_result(result, stock_snapshot) -> None:
     Обновляет ForecastResult остатком и пересчитывает заказ.
     Мутирует result in-place (удобно для shadow mode).
     """
+    DataFlag = __import__("hermes.forecast_models", fromlist=["DataFlag"]).DataFlag
     if stock_snapshot:
         result.available_stock = stock_snapshot.available_stock
         result.stock_all       = stock_snapshot.stock_all
         result.reserve_qty     = stock_snapshot.reserve_qty
+        # reserve > physical stock → отрицательный остаток, флаг для ручного контроля
+        if result.available_stock is not None and result.available_stock < 0:
+            if DataFlag.NEGATIVE_AVAILABLE not in result.data_quality_flags:
+                result.data_quality_flags = result.data_quality_flags + (DataFlag.NEGATIVE_AVAILABLE,)
     else:
-        result.data_quality_flags = result.data_quality_flags + (
-            __import__("hermes.forecast_models", fromlist=["DataFlag"]).DataFlag.NO_STOCK_DATA,
-        )
+        result.data_quality_flags = result.data_quality_flags + (DataFlag.NO_STOCK_DATA,)
 
     raw, rounded, reason = calculate_replenishment(
         expected_demand=result.expected_demand,

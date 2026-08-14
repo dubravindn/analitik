@@ -303,17 +303,19 @@ class TestCalculateReplenishment:
         )
         assert raw == pytest.approx(80.0)
 
-    def test_reserve_increases_order(self):
+    def test_reserve_does_not_double_subtract(self):
+        # available_stock = МойСклад "quantity" = stock - reserve (уже нетто).
+        # reserve_qty передаётся для информации, но в формулу не входит — нет двойного вычитания.
         raw, _, _ = calculate_replenishment(
             expected_demand=100.0,
-            available_stock=50.0,
+            available_stock=50.0,   # уже нетто: stock=80, reserve=30, avail=50
             reserve_qty=30.0,
             confirmed_incoming=None,
             transfer_in_qty=0.0,
             transfer_out_qty=0.0,
             pack_size=1,
         )
-        assert raw == pytest.approx(80.0)
+        assert raw == pytest.approx(50.0)  # 100 - 50; если бы вычиталось дважды — было бы 80
 
     def test_transfer_in_reduces_order(self):
         raw, _, _ = calculate_replenishment(

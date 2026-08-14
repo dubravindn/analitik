@@ -157,28 +157,62 @@ class TestPreorderDemand:
         assert r.recommended_order_qty == 150.0
 
 
-# ── Тест 5: Reserve → уменьшает эффективный остаток ─────────────────────────
+# ── Тест 5: Reserve — нет двойного вычитания (available уже нетто) ────────────
 
-class TestReserveReducesStock:
-    def test_reserve_subtracts_from_net_available(self):
-        """available=80, reserve=30 → net_avail=50; raw=100-50=50."""
-        raw, rounded, _ = calculate_replenishment(
-            expected_demand=100.0,
-            available_stock=80.0,
-            reserve_qty=30.0,
+class TestReserveNoBugCase:
+    """
+    available_stock = МойСклад "quantity" = stock - reserve (уже нетто).
+    Резерв НЕ вычитается второй раз.
+    Реальные примеры из integration shadow (2026-08-14):
+      Zentoo:  stock=128, reserve=25, available=103, expected=132 → raw=29 (не 54)
+      Мондиаль: stock=46, reserve=40, available=6,   expected=58  → raw=52 (не 92)
+    """
+
+    def test_real_world_zentoo(self):
+        """stock=128, reserve=25, available=103, expected=132 → raw=29."""
+        raw, _, _ = calculate_replenishment(
+            expected_demand=132.0,
+            available_stock=103.0,  # МойСклад quantity = 128 - 25
+            reserve_qty=25.0,       # только информационно
             confirmed_incoming=None,
             transfer_in_qty=0.0,
             transfer_out_qty=0.0,
-            pack_size=1,
+            pack_size=5,
         )
-        assert raw == 50.0
+        assert raw == pytest.approx(29.0)  # 132 - 103; без фикса было бы 54
+
+    def test_real_world_mondial(self):
+        """stock=46, reserve=40, available=6, expected=58 → raw=52."""
+        raw, _, _ = calculate_replenishment(
+            expected_demand=58.0,
+            available_stock=6.0,    # МойСклад quantity = 46 - 40
+            reserve_qty=40.0,
+            confirmed_incoming=None,
+            transfer_in_qty=0.0,
+            transfer_out_qty=0.0,
+            pack_size=25,
+        )
+        assert raw == pytest.approx(52.0)  # 58 - 6; без фикса было бы 92
+
+    def test_reserve_change_does_not_affect_replenishment(self):
+        """При фиксированном available изменение reserve_qty не меняет raw_order."""
+        kwargs = dict(
+            expected_demand=100.0, available_stock=50.0, confirmed_incoming=None,
+            transfer_in_qty=0.0, transfer_out_qty=0.0, pack_size=1,
+        )
+        raw0,  _, _ = calculate_replenishment(reserve_qty=0.0,  **kwargs)
+        raw30, _, _ = calculate_replenishment(reserve_qty=30.0, **kwargs)
+        raw60, _, _ = calculate_replenishment(reserve_qty=60.0, **kwargs)
+        assert raw0 == raw30 == raw60 == pytest.approx(50.0)
 
     def test_reserve_via_apply(self):
+        """apply_replenishment_to_result: snap с корректным нетто-available."""
         r = _result(expected_demand=100.0, pack_size=1)
-        snap = StockSnapshot("p1", "store_base", 80.0, 80.0, 30.0)  # reserve=30
+        # available=50 (нетто: stock=80, reserve=30); reserve НЕ вычитается снова
+        snap = StockSnapshot("p1", "store_base", 50.0, 80.0, 30.0)
         apply_replenishment_to_result(r, snap)
-        assert r.raw_order_qty == 50.0   # 100 - (80 - 30)
-        assert r.reserve_qty == 30.0
+        assert r.raw_order_qty == 50.0   # 100 - 50
+        assert r.reserve_qty == 30.0     # записано в result для информации
 
 
 # ── Тест 6: Zero stock → raw = expected_demand ───────────────────────────────

@@ -67,6 +67,7 @@ class DataFlag(str, Enum):
     DOUBLE_COUNT_GUARD        = "DOUBLE_COUNT_GUARD"
     INCOMING_UNKNOWN          = "INCOMING_UNKNOWN"   # поступление неизвестно (не 0)
     MANUAL_REVIEW             = "MANUAL_REVIEW"      # рекомендуется ручная проверка
+    NEGATIVE_AVAILABLE        = "NEGATIVE_AVAILABLE" # остаток < 0 (резерв > физический остаток)
 
 
 # ── Центральная структура результата ─────────────────────────────────────────
