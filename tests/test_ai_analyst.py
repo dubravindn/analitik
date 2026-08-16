@@ -6,7 +6,11 @@ from datetime import date
 import pytest
 
 from hermes.ai_analyst import AIValidationError, validate_response
-from hermes.analysis_payload import build_forecast_analysis_payload, combine_daily_payload
+from hermes.analysis_payload import (
+    _month_start_back,
+    build_forecast_analysis_payload,
+    combine_daily_payload,
+)
 from hermes.anomaly_rules import evaluate_payload
 
 
@@ -133,3 +137,8 @@ def test_daily_payload_prefixes_fact_ids():
     assert {f["id"] for f in daily["facts"]} == {
         "daily.period.period.rev", "daily.state.stock.neg",
     }
+
+
+def test_month_start_back_crosses_year_boundary():
+    assert _month_start_back(date(2026, 1, 16), 1) == date(2025, 12, 1)
+    assert _month_start_back(date(2026, 8, 16), 12) == date(2025, 8, 1)

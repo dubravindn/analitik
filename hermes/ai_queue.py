@@ -120,6 +120,7 @@ def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
                         bot_token, target.strip(), render_telegram_summary(result),
                         _feedback_markup(run_id),
                     )
+            log.info("AI live result delivered: %s", run_id)
         elif run_mode == "live":
             for target in str(result.get("chat_id") or "").split(","):
                 if target.strip():

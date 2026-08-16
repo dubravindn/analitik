@@ -26,6 +26,13 @@ _METRICS = (
     ("avg_check", "Средний чек", "kop"),
 )
 
+_MONTH_HISTORY_METRICS = (
+    ("rev", "Выручка", "kop"),
+    ("profit", "Валовая прибыль", "kop"),
+    ("checks", "Чеки", "count"),
+    ("avg_check", "Средний чек", "kop"),
+)
+
 
 def _plain(value: Any) -> Any:
     if isinstance(value, (date, datetime)):
@@ -82,6 +89,12 @@ def _fact(
 def _year_back(value: date) -> date:
     day = min(value.day, calendar.monthrange(value.year - 1, value.month)[1])
     return value.replace(year=value.year - 1, day=day)
+
+
+def _month_start_back(value: date, months: int) -> date:
+    """Первый день месяца на ``months`` месяцев раньше ``value``."""
+    absolute = value.year * 12 + value.month - 1 - months
+    return date(absolute // 12, absolute % 12 + 1, 1)
 
 
 def _comparison_windows(as_of: date) -> list[tuple[str, date, date, date, date]]:
@@ -183,6 +196,48 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
             f"history.same_weekday.{idx}.checks", "history", "Чеки в тот же день недели",
             checks, "count", period=day_value.isoformat(),
         ))
+
+    # Текущий месяц сравнивается с тем же числом каждого из 12 прошлых
+    # месяцев. Неполные локальные месяцы не используются для выводов: иначе
+    # отсутствие синхронизации выглядело бы как реальное падение бизнеса.
+    for offset in range(1, 13):
+        hist_from = _month_start_back(d_to, offset)
+        hist_last_day = calendar.monthrange(hist_from.year, hist_from.month)[1]
+        hist_to = hist_from.replace(day=min(d_to.day, hist_last_day))
+        expected_days = (hist_to - hist_from).days + 1
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT day)
+                FROM sales_by_store_day
+                WHERE day BETWEEN %s AND %s
+                """,
+                (hist_from, hist_to),
+            )
+            covered_days = int((cur.fetchone() or (0,))[0])
+
+        hist_label = f"{hist_from:%d.%m.%Y}–{hist_to:%d.%m.%Y}"
+        facts.append(_fact(
+            f"history.month_{offset:02d}.coverage", "data_quality",
+            "Покрытие исторического месяца", covered_days, "days",
+            period=hist_label,
+            details={
+                "expected_days": expected_days,
+                "complete": covered_days >= expected_days,
+                "months_back": offset,
+            },
+        ))
+        if covered_days < expected_days:
+            continue
+
+        historical = _pdf_summary(conn, hist_from, hist_to, None)
+        for key, label, unit in _MONTH_HISTORY_METRICS:
+            facts.append(_fact(
+                f"history.month_{offset:02d}.{key}", "history",
+                f"{label} за сопоставимую часть месяца",
+                historical.get(key, 0), unit, period=hist_label,
+                details={"months_back": offset, "coverage_days": covered_days},
+            ))
 
     with conn.cursor() as cur:
         cur.execute("""
