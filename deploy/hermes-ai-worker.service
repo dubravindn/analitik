@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=hermes-ai
 Group=hermes-ai
-WorkingDirectory=/opt/hermes/app
+WorkingDirectory=/var/lib/hermes-ai/app
 StateDirectory=hermes-ai
 StateDirectoryMode=0770
 UMask=0007
@@ -16,7 +16,7 @@ Environment=CODEX_BIN=/var/lib/hermes-ai/.local/bin/codex
 Environment=AI_SPOOL_DIR=/var/lib/hermes-ai/spool
 Environment=AI_CODEX_WORKDIR=/tmp
 Environment=AI_CODEX_TIMEOUT=300
-ExecStart=/opt/hermes/venv/bin/python -m hermes ai-worker
+ExecStart=/usr/bin/python3 -m hermes.ai_worker
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true

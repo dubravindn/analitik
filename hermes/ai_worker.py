@@ -79,3 +79,6 @@ def run_forever() -> None:
         if not process_one():
             time.sleep(float(os.environ.get("AI_WORKER_POLL_SECONDS", "2")))
 
+
+if __name__ == "__main__":
+    run_forever()
