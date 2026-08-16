@@ -6,11 +6,75 @@ from datetime import date
 from . import config
 
 
+_BASE_STORE = "База Воровского 107/1"
+
+
 def _rub(kop: float) -> str:
     return f"{kop / 100:,.0f}".replace(",", " ")
 
 
-def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None = None) -> str:
+def get_top_clients(
+    conn, d_from: date, d_to: date,
+    store_name: str = _BASE_STORE, limit: int = 40,
+) -> list[tuple]:
+    """Топ идентифицированных клиентов выбранного склада по выручке."""
+    excluded = list(config.RETAIL_PLACEHOLDER_AGENTS or [""])
+    excluded += list(config.INTERNAL_AGENTS or [""])
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT agent_name,
+                   COUNT(*) FILTER (WHERE doc_type = 'demand') AS orders,
+                   COALESCE(SUM(sum_kop), 0) AS revenue
+            FROM sales_doc
+            WHERE day BETWEEN %s AND %s
+              AND store_name = %s
+              AND agent_id IS NOT NULL AND agent_id != ''
+              AND NOT (agent_name = ANY(%s))
+            GROUP BY agent_id, agent_name
+            ORDER BY revenue DESC
+            LIMIT %s
+        """, (d_from, d_to, store_name, excluded, limit))
+        return cur.fetchall()
+
+
+def get_churn_clients(
+    conn, limit: int | None = None, store_name: str = _BASE_STORE,
+    inactive_days: int = 10, min_avg_check_kop: int = 1_000_000,
+) -> list[tuple]:
+    """Все клиенты БАЗЫ с паузой и средним чеком от заданной суммы."""
+    excluded = list(config.RETAIL_PLACEHOLDER_AGENTS or [""])
+    excluded += list(config.INTERNAL_AGENTS or [""])
+    limit_sql = "LIMIT %s" if limit is not None else ""
+    params = [store_name, excluded, inactive_days, min_avg_check_kop]
+    if limit is not None:
+        params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT agent_name,
+                   MAX(day) AS last_day,
+                   CURRENT_DATE - MAX(day) AS days_since,
+                   COUNT(*) AS orders,
+                   COALESCE(SUM(sum_kop), 0) AS revenue,
+                   COALESCE(AVG(sum_kop), 0) AS avg_check
+            FROM sales_doc
+            WHERE store_name = %s
+              AND doc_type = 'demand'
+              AND agent_id IS NOT NULL AND agent_id != ''
+              AND NOT (agent_name = ANY(%s))
+            GROUP BY agent_id, agent_name
+            HAVING CURRENT_DATE - MAX(day) > %s
+               AND AVG(sum_kop) >= %s
+            ORDER BY days_since DESC, avg_check DESC, agent_name
+            {limit_sql}
+        """, params)
+        return cur.fetchall()
+
+
+def build_clients_report(
+    conn, d_from: date, d_to: date, store_name: str | None = None,
+    include_top: bool = True, top_limit: int = 20,
+    include_churn: bool = True, churn_limit: int = 50,
+) -> str:
     period_str = (
         d_from.strftime("%d.%m.%Y") if d_from == d_to
         else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
@@ -70,24 +134,15 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     hints = config.INTERNAL_HINTS or []
     excluded = list(placeholders) + list(internal)
 
-    # Топ-20 по выручке — БЕЗ заглушек розницы и внутренних контрагентов.
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT agent_name,
-                   COUNT(*) FILTER (WHERE doc_type = 'demand') AS orders,
-                   SUM(sum_kop) AS rev
-            FROM sales_doc
-            WHERE day BETWEEN %s AND %s {sf}
-              AND agent_id IS NOT NULL AND agent_id != ''
-              AND NOT (agent_name = ANY(%s))
-            GROUP BY agent_id, agent_name
-            ORDER BY SUM(sum_kop) DESC
-            LIMIT 20
-        """, p + [excluded])
-        top = cur.fetchall()
+    # Топ клиентов: при общем отчёте только склад БАЗА.
+    top_store = store_name or _BASE_STORE
+    top = (
+        get_top_clients(conn, d_from, d_to, top_store, limit=top_limit)
+        if include_top else []
+    )
 
     if top:
-        lines.append(f"🏆 Топ-{len(top)} клиентов:")
+        lines.append(f"🏆 Топ-{len(top)} клиентов · {top_store}:")
         suspect = False
         for i, (name, orders, rev) in enumerate(top, 1):
             avg = float(rev) / orders if orders else 0
@@ -124,59 +179,26 @@ def build_clients_report(conn, d_from: date, d_to: date, store_name: str | None 
     if (ph_kop and float(ph_kop) != 0) or (in_kop and float(in_kop) != 0):
         lines.append("")
 
-    # Детектор оттока (канал «опт», история 180 дней, ≥3 покупки)
-    with conn.cursor() as cur:
-        cur.execute("""
-            WITH intervals AS (
-                SELECT agent_id, agent_name,
-                       day - LAG(day) OVER (PARTITION BY agent_id ORDER BY day) AS gap
-                FROM (
-                    SELECT DISTINCT agent_id, agent_name, day
-                    FROM sales_doc
-                    WHERE channel = 'опт' AND doc_type = 'demand'
-                      AND day >= CURRENT_DATE - 180
-                ) d
-            ),
-            avg_gap AS (
-                SELECT agent_id, agent_name,
-                       AVG(gap) AS avg_gap_days,
-                       COUNT(*) AS purchases
-                FROM intervals
-                WHERE gap IS NOT NULL
-                GROUP BY agent_id, agent_name
-                HAVING COUNT(*) >= 3
-            ),
-            last_seen AS (
-                SELECT agent_id, MAX(day) AS last_day
-                FROM sales_doc WHERE channel = 'опт' AND doc_type = 'demand'
-                GROUP BY agent_id
-            )
-            SELECT a.agent_name, a.avg_gap_days, l.last_day,
-                   CURRENT_DATE - l.last_day AS days_since,
-                   (CURRENT_DATE - l.last_day)::float / NULLIF(a.avg_gap_days, 0) AS overdue_ratio
-            FROM avg_gap a JOIN last_seen l USING (agent_id)
-            -- Отток: просрочка ≥1.5× среднего интервала И прошло ≥7 дней —
-            -- второй порог убирает ложные тревоги на выходных (интервал 2 дн.).
-            WHERE (CURRENT_DATE - l.last_day) > a.avg_gap_days * 1.5
-              AND (CURRENT_DATE - l.last_day) >= 7
-            ORDER BY overdue_ratio DESC
-            LIMIT 15
-        """)
-        churned = cur.fetchall()
-
-    lines.append("")
-    lines.append("⚠️ Возможный отток (оптовики):")
-    lines.append("Отток — всегда за последние 180 дней, не зависит от выбранного периода.")
-    if churned:
-        for name, avg_gap, last_day, days_since, ratio in churned:
-            last_str = last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day)
-            avg_str = f"{float(avg_gap):.0f}"
-            lines.append(
-                f"  • {name}: посл. заказ {last_str}"
-                f" ({int(days_since)} дн. назад, обычно кажд. {avg_str} дн."
-                f" — просрочка ×{float(ratio):.1f})"
-            )
-    else:
-        lines.append("✅ Отставших оптовиков не обнаружено")
+    if include_churn:
+        churned = get_churn_clients(
+            conn, limit=None, store_name=_BASE_STORE, inactive_days=10,
+            min_avg_check_kop=1_000_000,
+        )
+        lines.append("")
+        lines.append("⚠️ Возможный отток · БАЗА:")
+        lines.append(
+            "Все клиенты без заказа больше 10 дней со средним чеком от 10 000 ₽."
+        )
+        if churned:
+            for name, last_day, days_since, orders, revenue, avg_check in churned:
+                last_str = last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day)
+                lines.append(
+                    f"  • {name}: посл. заказ {last_str}"
+                    f" ({int(days_since)} дн. назад, {int(orders)} заказов,"
+                    f" всего {_rub(float(revenue))} ₽,"
+                    f" ср. чек {_rub(float(avg_check))} ₽)"
+                )
+        else:
+            lines.append("✅ Отставших оптовиков не обнаружено")
 
     return "\n".join(lines)

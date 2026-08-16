@@ -8,22 +8,10 @@
   Используем только CO, созданные до cutoff_date.
   CO.moment <= cutoff_date — жёсткое ограничение.
 
-Три уровня привязки к горизонту (по убыванию точности):
-  A. deliveryPlannedMoment в [horizon_from, horizon_to]          date_source="explicit"
-  B1. LARGE 500–999 + нет DPM + age 0–5d + remaining>0          date_source="large_estimated"
-  B2. LARGE_PLUS >=1000 + нет DPM + age 0–3d + remaining>0      date_source="large_estimated"
-  C. is_preorder + event-window (MARCH_8/VALENTINE)              date_source="preorder_event"
-
-Tier B policy принята по policy-sim v2 (backtest глобальный ground truth):
-  LARGE 500–999:   age 0–5d → precision 0.76, recall 0.81, FP 25.7%, FN 18.9%
-  LARGE_PLUS >=1000: age 0–3d → precision 0.87, recall 1.00, FP 14.7%, FN 0.2%
-  NORMAL <500 без DPM → не включать (P50 lead=0, 77% same-day → высокий FP, recall=1.00 NORMAL ≠ сигнал).
-  age=0 включён: исключение age=0 убивает recall ([1,3] → FN=69% для LARGE).
-
-Tier C — вне event-window CO-предзаказы не включаются.
-  Флаг: PREORDER_NO_EVENT_WINDOW.
-
-Параметры хранятся в конфигурации и переоцениваются по мере накопления истории.
+Утверждённый источник заказа для БАЗЫ:
+  проект «Ближайшая поставка» + статус «Под заказ».
+Все неотгруженные позиции этих заказов считаются known demand.
+Формула HYBRID и защита от двойного счёта не меняются.
 """
 from __future__ import annotations
 
@@ -39,6 +27,9 @@ from typing import Iterator
 from hermes.forecast_models import ForecastMode, forecast_mode_for
 
 BASE_API = "https://api.moysklad.ru/api/remap/1.2"
+
+_PROJECT_KEYWORD = "ближайшая поставка"
+_STATE_KEYWORD = "под заказ"
 
 LARGE_ORDER_THRESHOLD_DEFAULT: int = 500    # штук — нижняя граница LARGE
 LARGE_PLUS_ORDER_THRESHOLD:   int = 1000   # штук — LARGE_PLUS (>=1000)
@@ -64,7 +55,7 @@ class COPosition:
     is_preorder:  bool        # ПРЕДОПЛАТА или праздничный флаг
     lead_days:    int | None  # co_date → delivery_date (None если нет delivery)
     date_source:  str = "explicit"
-    # Значения: "explicit" | "large_estimated" | "preorder_event"
+    # Значения: "selected_order" | legacy tier names
 
 
 def _get(token: str, path: str, params: dict | None = None) -> dict:
@@ -109,6 +100,24 @@ def _paginate(token: str, path: str, params: dict) -> Iterator[dict]:
         time.sleep(0.2)
 
 
+def _find_project_href(token: str) -> str:
+    """Найти проект «Ближайшая поставка»."""
+    page = _get(token, "/entity/project", {"limit": 100})
+    for project in page.get("rows", []):
+        if _PROJECT_KEYWORD in project.get("name", "").lower():
+            return project.get("meta", {}).get("href", "")
+    return ""
+
+
+def _find_state_href(token: str) -> str:
+    """Найти статус заказа покупателя «Под заказ»."""
+    meta = _get(token, "/entity/customerorder/metadata")
+    for state in meta.get("states", []):
+        if _STATE_KEYWORD in state.get("name", "").lower():
+            return state.get("meta", {}).get("href", "")
+    return ""
+
+
 _PREORDER_KEYWORDS = ("предоплат", "предзаказ", "march_8", "8 марта", "14 февр")
 
 def _is_preorder(co_name: str) -> bool:
@@ -145,13 +154,18 @@ def load_known_customer_orders(
             Вне event-window → пропуск (флаг PREORDER_NO_EVENT_WINDOW в aggregate).
             date_source = "preorder_event".
     """
-    mode = forecast_mode_for(horizon_from)
-    event_window = mode in (ForecastMode.MARCH_8, ForecastMode.VALENTINE)
+    project_href = _find_project_href(token)
+    state_href = _find_state_href(token)
+    if not project_href:
+        raise RuntimeError("Не найден проект «Ближайшая поставка»")
+    if not state_href:
+        raise RuntimeError("Не найден статус «Под заказ»")
 
     positions: list[COPosition] = []
     stats_log: dict[str, int] = {
         "fetched": 0,
         "future_co_skipped": 0,
+        "selected_orders": 0,
         "tier_a": 0,
         "tier_b": 0,
         "tier_c": 0,
@@ -164,6 +178,8 @@ def load_known_customer_orders(
     params = {
         "filter": (
             f"store={store_href}"
+            f";project={project_href}"
+            f";state={state_href}"
             f";moment<={cutoff_date.strftime('%Y-%m-%d 23:59:59')}"
         ),
         "order": "moment,desc",
@@ -201,10 +217,17 @@ def load_known_customer_orders(
         if not rows:
             continue
 
+        # Проект и статус уже отфильтрованы API-запросом.
+        # «Ближайшая поставка» — это явно выбранный горизон.
+        date_src = "selected_order"
+        stats_log["selected_orders"] += 1
+
         # Суммарный ordered_qty для threshold-проверки Tier B
         total_ordered = sum(float(p.get("quantity", 0)) for p in rows)
 
-        if delivery_date is not None:
+        if date_src == "selected_order":
+            pass
+        elif delivery_date is not None:
             # ── Tier A ───────────────────────────────────────────────────────
             if horizon_from <= delivery_date <= horizon_to:
                 date_src = "explicit"
@@ -263,7 +286,7 @@ def load_known_customer_orders(
                 remaining_uncertain = True
 
             # Tier B: пропускаем позиции с remaining <= 0 (уже отгружено полностью)
-            if date_src == "large_estimated" and remaining_qty <= 0:
+            if remaining_qty <= 0:
                 stats_log["positions_skipped_remaining_zero"] += 1
                 continue
 
@@ -331,9 +354,11 @@ def aggregate_known_demand(
             result[pid]["estimated_large_qty"] += qty
             if pos.remaining_qty_uncertain:
                 result[pid]["has_remaining_uncertain"] = True
-        elif pos.date_source == "explicit":
-            qty = pos.ordered_qty
+        elif pos.date_source in ("explicit", "selected_order"):
+            qty = pos.remaining_qty if pos.date_source == "selected_order" else pos.ordered_qty
             result[pid]["explicit_qty"] += qty
+            if pos.remaining_qty_uncertain:
+                result[pid]["has_remaining_uncertain"] = True
         else:  # preorder_event
             qty = pos.ordered_qty
             result[pid]["preorder_qty"] += qty

@@ -30,6 +30,25 @@ _LS_JOIN = """
 _LS_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
              "THEN round(i.qty * pp.price_kop) ELSE i.total_kop END")
 
+# I4: вторая цена — оптовая «Наличка» из карточки на дату документа. Где нет
+# наличной цены — вклад в наличный итог 0 (в строке показываем «нал —»).
+_LS_NAL = """
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM nal_price_asof n
+        WHERE n.product_id = i.product_id AND n.priced_from <= d.day
+        ORDER BY n.priced_from DESC LIMIT 1
+    ) np ON true
+"""
+_LS_NAL_TOTAL = ("CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0 "
+                 "THEN round(i.qty * np.price_kop) ELSE 0 END")
+
+
+def _two_price(cost_unit, nal_unit) -> str:
+    """«закуп X ₽ · нал Y ₽» (прочерк, если цены нет)."""
+    c = f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
+    n = f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
+    return f"{c} · {n}"
+
 
 # Оприходования (enter) — «+»-сторона инвентаризации. Та же методика цены, что и
 # у списаний (закупочная из карточки на дату, фолбэк на цену документа).
@@ -232,6 +251,15 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     p  = p + [adj]
     cnt, total_qty, total_kop = spoil_cnt, spoil_qty, spoil_kop
 
+    # I4: наличный итог порчи (по оптовой цене «Наличка», где известна).
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(SUM({_LS_NAL_TOTAL}), 0)
+            {_LS_JOIN} {_LS_NAL}
+            WHERE d.day BETWEEN %s AND %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
+        """, p)
+        total_nal_kop = float(cur.fetchone()[0] or 0)
+
     # I9: покрытие закупочными ценами из карточки (как в продажах/остатках/перемещениях).
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -248,6 +276,26 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
         cov = _cov_kop / _all_kop * 100
         lines.append(f"По закупочным ценам: {cov:.0f}% стоимости · "
                      f"МойСклад: {100 - cov:.0f}% (нет закупочной в карточке)")
+        # K2: симметричная строка покрытия «Наличка»
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(*) FILTER (WHERE np.price_kop IS NOT NULL AND np.price_kop > 0),
+                       COUNT(*),
+                       COALESCE(SUM(CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0
+                                        THEN {_LS_TOTAL} ELSE 0 END), 0),
+                       COALESCE(SUM({_LS_TOTAL}), 0)
+                {_LS_JOIN} {_LS_NAL}
+                WHERE d.day BETWEEN %s AND %s
+                  AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%') {sf}
+            """, p)
+            _nal_r = cur.fetchone() or (0, 0, 0, 0)
+        _nal_pos = int(_nal_r[0] or 0)
+        _nal_kop2 = float(_nal_r[2] or 0)
+        _nal_all2 = float(_nal_r[3] or 0)
+        if int(_nal_r[1] or 0):
+            _pct = _nal_kop2 / _nal_all2 * 100 if _nal_all2 else 0
+            _pfx = "⚠️ " if _pct < 90 else ""
+            lines.append(f"{_pfx}Наличная цена известна для {_nal_pos} из {int(_nal_r[1])} поз. ({_pct:.0f}% суммы)")
         lines.append("")
 
     # Разбивка по складам
@@ -333,40 +381,47 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
             header += f" · {description}"
         lines.append(header)
 
-        # I4: закупочная цена позиции на дату документа.
+        # I4: две цены позиции — закупочная (фолбэк cost_kop) и наличная, на дату.
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT i.product_name, i.qty, i.cost_kop, i.total_kop,
-                       pp.price_kop
+                       pp.price_kop, np.price_kop
                 FROM loss_item i
                 LEFT JOIN LATERAL (
                     SELECT price_kop FROM purchase_price_asof p
                     WHERE p.product_id = i.product_id AND p.priced_from <= %s
                     ORDER BY p.priced_from DESC LIMIT 1
                 ) pp ON true
+                LEFT JOIN LATERAL (
+                    SELECT price_kop FROM nal_price_asof n
+                    WHERE n.product_id = i.product_id AND n.priced_from <= %s
+                    ORDER BY n.priced_from DESC LIMIT 1
+                ) np ON true
                 WHERE i.doc_id = %s AND i.product_id IN (SELECT product_id FROM product_dim WHERE folder_path LIKE 'Ассортимент/%%')
                 ORDER BY i.total_kop DESC
-            """, [doc_day, doc_id])
+            """, [doc_day, doc_day, doc_id])
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, ms_cost, ms_total, purch in positions:
+        doc_nal = 0.0
+        for pname, qty, ms_cost, ms_total, purch, nal in positions:
             covered = purch is not None and purch > 0
             unit = int(purch) if covered else int(ms_cost or 0)
             pos_total = round(float(qty) * unit) if covered else float(ms_total)
+            nal_unit = int(nal) if nal else 0
             doc_total += float(pos_total)
-            price_str = f"закуп {_rub(unit)} ₽" if unit else "закуп —"
+            doc_nal += float(qty) * nal_unit
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед. · {price_str} · "
+                f"  • {pname}: {_qty(float(qty))} ед. · {_two_price(unit, nal_unit)} · "
                 f"{_rub(float(pos_total))} ₽"
             )
         lines.append(
             f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · "
-            f"закуп {_rub(doc_total)} ₽"
+            f"закуп {_rub(doc_total)} ₽ · нал {_rub(doc_nal)} ₽"
         )
         lines.append("")
 
     # Порча (розница) — из сводного запроса (не затирать переменной цикла!)
     lines.append(f"═══ ИТОГО ПОРЧА (розница): {_qty(float(total_qty))} ед. · "
-                 f"закуп {_rub(float(total_kop))} ₽ ═══")
+                 f"закуп {_rub(float(total_kop))} ₽ · нал {_rub(total_nal_kop)} ₽ ═══")
     return "\n".join(lines)

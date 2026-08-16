@@ -38,12 +38,23 @@ _ST_JOIN = """
 _ST_UNIT  = "COALESCE(NULLIF(pp.price_kop, 0), stock_snapshot.cost_price_kop)"
 _ST_VALUE = f"stock_qty * {_ST_UNIT}"
 
+# Оптовая цена «Наличка» на дату снимка (блок I) — вторая цена в строках.
+_NAL_JOIN = """
+    LEFT JOIN LATERAL (
+        SELECT price_kop FROM nal_price_asof n
+        WHERE n.product_id = stock_snapshot.product_id AND n.priced_from <= stock_snapshot.day
+        ORDER BY n.priced_from DESC LIMIT 1
+    ) np ON true
+"""
+
 STALE_SREZKA_MIN_DAYS = 5   # I3: залежалая СРЕЗКА — строго больше 5 дней без продаж
 
 
-def _two_price(cost_unit) -> str:
-    """«закуп X ₽» — закупочная цена из карточки или прочерк."""
-    return f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
+def _two_price(cost_unit, nal_unit) -> str:
+    """«закуп X ₽ · нал Y ₽» (прочерк, если цены нет)."""
+    c = f"закуп {_rub(cost_unit)} ₽" if cost_unit else "закуп —"
+    n = f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
+    return f"{c} · {n}"
 
 
 def _supply_days_map(conn):
@@ -187,8 +198,8 @@ def build_stock_by_qty(
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT stock_snapshot.product_id, product_name, is_srezka, stock_qty,
-                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
-                FROM stock_snapshot {_ST_JOIN}
+                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit
+                FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 50
@@ -197,14 +208,14 @@ def build_stock_by_qty(
 
         lines.append(f"── Топ-{len(rows)} по остатку ──")
         nocost_n = 0
-        for pid, name, is_srezka, qty, cost_unit, cost_total in rows:
+        for pid, name, is_srezka, qty, cost_unit, cost_total, nal_unit in rows:
             tag = " [СР]" if is_srezka else ""
             if not cost_unit:
                 nocost_n += 1
             tail = "⚠️ нет закуп. цены" if not cost_unit else _rub(float(cost_total)) + " ₽"
             lines.append(
                 f"  • {name}{tag}: {_qty(float(qty))} ед. · {_days_on_shelf(pid)} · "
-                f"{_two_price(cost_unit)} · {tail}"
+                f"{_two_price(cost_unit, nal_unit)} · {tail}"
             )
         if nocost_n:
             lines.append("")
@@ -218,11 +229,11 @@ def build_stock_by_qty(
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT stock_snapshot.product_id, product_name, is_srezka, stock_qty,
-                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total,
+                       {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit,
                        COUNT(*) OVER() AS total_cnt,
                        SUM(stock_qty) OVER() AS total_qty,
                        SUM({_ST_VALUE}) OVER() AS total_cost
-                FROM stock_snapshot {_ST_JOIN}
+                FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
                 WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 AND store_name = %s {gf}
                 ORDER BY stock_qty DESC
                 LIMIT 15
@@ -238,12 +249,12 @@ def build_stock_by_qty(
         lines.append(
             f"   Позиций: {total_cnt} · {_qty(store_qty)} ед. · {_rub(store_cost)} ₽"
         )
-        for pid, name, is_srezka, qty, cost_unit, cost_total, *_ in rows:
+        for pid, name, is_srezka, qty, cost_unit, cost_total, nal_unit, *_ in rows:
             tag = " [СР]" if is_srezka else ""
             tail = "⚠️ нет закуп." if not cost_unit else f"{_rub(float(cost_total))} ₽"
             lines.append(
                 f"  • {name}{tag}: {_qty(float(qty))} ед. · {_days_on_shelf(pid)} · "
-                f"{_two_price(cost_unit)} · {tail}"
+                f"{_two_price(cost_unit, nal_unit)} · {tail}"
             )
         lines.append("")
 
@@ -343,21 +354,21 @@ def build_stock_report(
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT store_name, product_name, stock_qty,
-                   {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total
-            FROM stock_snapshot {_ST_JOIN}
+                   {_ST_UNIT} AS cost_unit, {_ST_VALUE} AS cost_total, np.price_kop AS nal_unit
+            FROM stock_snapshot {_ST_JOIN} {_NAL_JOIN}
             WHERE day = %s AND stock_qty > 0 AND reserve_qty = 0 {sf} {gf}
             ORDER BY store_name, stock_qty DESC
         """, p)
         rows = cur.fetchall()
 
     stale_srezka: dict[str, list] = defaultdict(list)
-    for sname, pname, qty, cost_unit, cost_total in rows:
+    for sname, pname, qty, cost_unit, cost_total, nal_unit in rows:
         last = last_sales.get(pname)
         days_idle = (day - last).days if last else 9999
         if days_idle <= STALE_SREZKA_MIN_DAYS:   # I3: строго > 5 дней
             continue
         stale_srezka[sname].append({
-            "name": pname, "qty": float(qty), "cost_unit": cost_unit,
+            "name": pname, "qty": float(qty), "cost_unit": cost_unit, "nal_unit": nal_unit,
             "cost_total": float(cost_total), "days": days_idle, "nocost": not cost_unit,
         })
 
@@ -402,7 +413,7 @@ def build_stock_report(
                 tail = "⚠️ нет закуп. цены" if e["nocost"] else _rub(e["cost_total"]) + " ₽"
                 lines.append(
                     f"    • {e['name']}: {_qty(e['qty'])} ед. · {idle} · "
-                    f"{_two_price(e['cost_unit'])} · {tail}"
+                    f"{_two_price(e['cost_unit'], e['nal_unit'])} · {tail}"
                 )
             lines.append("")
 

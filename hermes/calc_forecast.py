@@ -42,7 +42,7 @@ _SENTINEL_QTY = 9999
 # ── Feature flag ──────────────────────────────────────────────────────────────
 # "old" — production bot (Telegram/PDF) использует старый движок; "new" — NEW engine.
 # Переключать только после прохождения всех 8 критериев production-readiness.
-FORECAST_ENGINE: str = "old"
+FORECAST_ENGINE: str = "new"
 
 # ── Парсинг размера упаковки из названия товара ───────────────────────────────
 _PACK_RE = re.compile(r'(\d{1,3})\s*шт\.?', re.IGNORECASE)
@@ -488,6 +488,33 @@ class ForecastStoreConfig:
     store_id:   str
     channel:    str   # "BASE" | "RETAIL"
     store_href: str = ""   # требуется для BASE (загрузка CO из МойСклад)
+
+
+# Магазины СРЕЗКА для NEW engine (СОБРАНИЕ исключён — не цветочный).
+# Общий публичный конфиг используют Telegram handler и PDF-генератор.
+_BASE_STORE_HREF = (
+    "https://api.moysklad.ru/api/remap/1.2"
+    "/entity/store/b4a45a8e-3d5e-11f0-0a80-0b690011c5d1"
+)
+SREZKA_STORE_CONFIGS: list[ForecastStoreConfig] = [
+    ForecastStoreConfig(
+        store_id="b4a45a8e-3d5e-11f0-0a80-0b690011c5d1",
+        channel="BASE",
+        store_href=_BASE_STORE_HREF,
+    ),
+    ForecastStoreConfig(
+        store_id="acb431e3-3c6b-11f0-0a80-0b6600098edd",
+        channel="RETAIL",
+    ),
+    ForecastStoreConfig(
+        store_id="45168e06-344d-11f1-0a80-0c0400012fef",
+        channel="RETAIL",
+    ),
+    ForecastStoreConfig(
+        store_id="4a32d3c1-344d-11f1-0a80-13ba00011c8b",
+        channel="RETAIL",
+    ),
+]
 
 
 def _get_snap_day(conn, cutoff_date: date) -> date | None:

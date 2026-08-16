@@ -21,21 +21,27 @@ log = logging.getLogger("hermes.bot")
 
 # Для каждой секции: список шагов ["period", "store"]
 _DIALOG_STEPS: dict[str, list[str]] = {
+    # ── новые кнопки ──────────────────────────────────────────────────────────
+    "period_report":   ["period"],   # 📊 Отчёт за период — один PDF по всем разделам
+    "current_state":   [],           # 📦 Состояние на сегодня — без диалога, на дату запроса
+    # ── legacy (rollback, маппинги работают, кнопки скрыты) ──────────────────
     "sales":    ["period", "store"],
-    "stock":    ["period", "store"],             # группа СРЕЗКА — всегда фиксирована
+    "stock":    ["period", "store"],
     "stale":    ["period", "store", "group"],
     "loss":     ["period", "store"],
     "reserves": ["period", "store"],
-    "expenses": ["period", "store"],  # фильтр по складу через project_name
-    "move":     ["period", "store"],  # перемещения между складами
-    "audit":    ["period"],           # удалённые/изменённые документы из МойСклад
-    "clients":  ["period", "store"], # клиентская аналитика (топ + отток)
-    "forecast": [],                  # прогноз закупки — без диалога, запускается сразу
-    "prices":   [],                  # качество цен — снимок, без диалога
+    "expenses": ["period", "store"],
+    "move":     ["period", "store"],
+    "audit":    ["period"],
+    "clients":  ["period", "store"],
+    "forecast": [],
+    "prices":   [],
     "pdf":      ["period", "store"],
 }
 
 _SECTION_TITLE = {
+    "period_report":   "📊 Отчёт за период",
+    "current_state":   "📦 Состояние на сегодня",
     "sales":    "📊 Продажи",
     "stock":    "📦 Остатки",
     "stale":    "🚨 Залежалые",
@@ -51,6 +57,10 @@ _SECTION_TITLE = {
 }
 
 _BUTTON_TO_SECTION = {
+    # ── новые кнопки ──────────────────────────────────────────────────────────
+    "📊 отчёт за период":      "period_report",
+    "📦 состояние на сегодня": "current_state",
+    # ── legacy (rollback) ─────────────────────────────────────────────────────
     "📊 продажи":    "sales",
     "📦 остатки":    "stock",
     "🚨 залежалые":  "stale",
@@ -85,19 +95,17 @@ _PERIOD_BUTTONS: dict[str, str] = {
 }
 
 _HELP_TEXT = """\
-📋 Hermes — аналитика
+📋 Hermes — аналитика цветочной базы
 
-Кнопки меню (все с выбором периода и склада):
-  📊 Продажи    — выручка, прибыль, топ позиций
-  📦 Остатки    — свободный остаток на дату
-  🚨 Залежалые  — позиции без движения
-  🗑 Списания   — все документы с позициями
-  🎯 Резервы    — товары отложены под клиента
-  💸 Расходы    — все платежи за период
-  🔄 Перемещения — движение товара между складами
-  🛒 Прогноз    — что заказать на фургон (5 блоков)
-  🏷 Цены       — где не заполнена закупочная цена
-  📄 Отчёт PDF  — полный отчёт одним файлом
+Две кнопки:
+
+📊 Отчёт за период
+  Выбираешь период → получаешь PDF:
+  продажи, списания, расходы, перемещения, клиенты, изменения.
+
+📦 Состояние на сегодня
+  Без выбора периода → PDF по каждому складу:
+  прогноз закупки, остатки, залежалые, резервы.
 
 Клавиатуру можно скрыть стрелкой ↓ внизу
 и вернуть касанием иконки клавиатуры.
@@ -171,8 +179,16 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     msg = upd["message"]
     from_chat = str(msg.get("chat", {}).get("id", ""))
     text = (msg.get("text") or "").strip()
-    if from_chat != chat_id or not text:
+    allowed_chats = {
+        value.strip()
+        for value in str(chat_id).split(",")
+        if value.strip()
+    }
+    if from_chat not in allowed_chats or not text:
         return
+
+    # Отвечаем именно тому разрешённому пользователю, который отправил сообщение.
+    chat_id = from_chat
 
     log.info("Сообщение: %s", text[:80])
     norm = text.lower().strip()
@@ -368,7 +384,7 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
     sc = synclock.active()
     if sc:
         name, mins = sc
-        if section in ("pdf", "forecast"):
+        if section in ("pdf", "forecast", "period_report", "current_state"):
             tg.send_message(
                 bot_token, chat_id,
                 f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
@@ -382,8 +398,10 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
             f"⚠️ Данные могут быть неполными — идёт обновление ({name}, ~{mins} мин).",
         )
 
-    # Для audit — нет фильтра по складу
-    if section == "audit":
+    # Новые секции отправляют свои сообщения сами — не дублировать
+    if section in ("period_report", "current_state", "forecast"):
+        pass
+    elif section == "audit":
         tg.send_message(bot_token, chat_id,
                         f"⏳ Запрашиваю данные…\nПериод: {_fmt_period(d_from, d_to)}")
     elif section == "pdf":
@@ -408,6 +426,16 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         _run_sales(conn_factory, client_factory, d_from, d_to, store_name,
                    bot_token, chat_id)
         return
+    if section == "forecast":
+        _run_forecast(conn_factory, client_factory, bot_token, chat_id)
+        return
+    if section == "period_report":
+        _run_period_report(conn_factory, client_factory, d_from, d_to,
+                           bot_token, chat_id)
+        return
+    if section == "current_state":
+        _run_current_state(conn_factory, client_factory, bot_token, chat_id)
+        return
 
     try:
         if section == "stock":
@@ -431,8 +459,6 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         elif section == "clients":
             text = _run_clients(conn_factory, client_factory, d_from, d_to, store_name,
                                 bot_token, chat_id)
-        elif section == "forecast":
-            text = _run_forecast(conn_factory, client_factory, bot_token, chat_id)
         elif section == "prices":
             text = _run_prices(conn_factory, bot_token, chat_id)
         elif section == "audit":
@@ -518,11 +544,466 @@ def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token
 
 
 def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
-    from .report_forecast import build_forecast_report
+    import datetime as _dt
+    from .calc_forecast import (
+        build_forecast_new, build_forecast, summarize,
+        FORECAST_ENGINE, SREZKA_STORE_CONFIGS,
+    )
+    from .report_forecast_pdf import build_forecast_pdf
+    from .charts import chart_forecast_summary, chart_forecast_history
+
     conn   = conn_factory()
     client = client_factory()
-    tg.send_message(bot_token, chat_id, "⏳ Запрашиваю заказы и остатки…")
-    return build_forecast_report(client, conn)
+    token  = config.MOYSKLAD_TOKEN()
+
+    tg.send_message(bot_token, chat_id, "⏳ Считаю прогноз закупки…")
+
+    today      = _dt.date.today()
+    monday     = today - _dt.timedelta(days=today.weekday())
+    sunday     = monday + _dt.timedelta(days=6)
+    next_mon   = monday + _dt.timedelta(days=7)
+    next_sun   = next_mon + _dt.timedelta(days=6)
+
+    # ── запуск NEW engine ───────────────────────────────────────────────────────
+    results_new = build_forecast_new(
+        conn, token, SREZKA_STORE_CONFIGS,
+        cutoff_date=today,
+        horizon_from=next_mon,
+        horizon_to=next_sun,
+    )
+
+    # ── OLD engine — только для subgroup / prev_demand ──────────────────────────
+    old_rows = build_forecast(conn, token, SREZKA_STORE_CONFIGS,
+                              cutoff_date=today,
+                              horizon_from=next_mon,
+                              horizon_to=next_sun)
+    subgroups_by_pid = {r.product_id: (r.subgroup or "Другое") for r in old_rows}
+
+    # ── краткая сводка ──────────────────────────────────────────────────────────
+    total_order  = sum(r.recommended_order_qty or 0 for r in results_new)
+    total_sku    = len({r.product_id for r in results_new if (r.recommended_order_qty or 0) > 0})
+    zero_stock   = sum(1 for r in results_new if (r.available_stock or 0) <= 0)
+    period_label = f"{next_mon.strftime('%d.%m')}–{next_sun.strftime('%d.%m.%Y')}"
+
+    summary_lines = [
+        f"📦 *Прогноз закупки СРЕЗКИ* — {period_label}",
+        f"",
+        f"К заказу: *{int(total_order)} шт.* ({total_sku} SKU)",
+        f"Нулевой остаток: {zero_stock} позиций",
+    ]
+    if results_new:
+        top5 = sorted(
+            [(r.product_name, r.recommended_order_qty or 0) for r in results_new
+             if (r.recommended_order_qty or 0) > 0],
+            key=lambda x: x[1], reverse=True,
+        )[:5]
+        if top5:
+            summary_lines.append("")
+            summary_lines.append("Топ-5 к заказу:")
+            for name, qty in top5:
+                summary_lines.append(f"  • {name[:35]} — {int(qty)} шт.")
+
+    tg.send_message(bot_token, chat_id, "\n".join(summary_lines))
+
+    # ── сохранить в БД ──────────────────────────────────────────────────────────
+    _save_forecast_run(conn, results_new, next_mon, next_sun)
+
+    # ── график — обзор ──────────────────────────────────────────────────────────
+    png_summary = chart_forecast_summary(results_new, subgroups_by_pid)
+    if png_summary:
+        tg.send_photo(bot_token, chat_id, png_summary,
+                      caption=f"Обзор прогноза {period_label}")
+
+    # ── график — история ────────────────────────────────────────────────────────
+    history = _load_forecast_history(conn)
+    if history:
+        png_hist = chart_forecast_history(history)
+        if png_hist:
+            tg.send_photo(bot_token, chat_id, png_hist,
+                          caption="Динамика прогноза по неделям")
+
+    # ── PDF ─────────────────────────────────────────────────────────────────────
+    try:
+        pdf_bytes = build_forecast_pdf(conn, next_mon, next_sun, token=token)
+        period_safe = f"{next_mon.strftime('%Y%m%d')}-{next_sun.strftime('%Y%m%d')}"
+        tg.send_document(bot_token, chat_id, pdf_bytes,
+                         f"forecast_{period_safe}.pdf",
+                         f"Прогноз закупки {period_label}")
+    except Exception as e:
+        log.exception("Ошибка PDF прогноза: %s", e)
+        tg.send_message(bot_token, chat_id, f"⚠️ PDF не сгенерирован: {e}")
+
+    tg.send_message(bot_token, chat_id, "✅ Прогноз готов.", tg.main_reply_keyboard())
+
+
+def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
+    """Build and send one period PDF without progress texts or separate charts."""
+    import threading
+    from .etl_sales import run as etl_sales
+    from .etl_stock import run as etl_stock
+    from .etl_loss import run as etl_loss
+    from .etl_cashflow import run as etl_cashflow
+    from .etl_clients import run as etl_clients
+    from .etl_move import run as etl_move
+    from .report_sales_pdf import build_sales_pdf
+
+    done = threading.Event()
+    result = [None]
+    error = [None]
+
+    def _worker():
+        try:
+            conn = conn_factory()
+            client = client_factory()
+            missing = _missing_days(conn, d_from, d_to)
+            if missing:
+                etl_sales(client, conn, min(missing), max(missing))
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM stock_snapshot WHERE day=%s", (d_to,))
+                if cur.fetchone()[0] == 0:
+                    etl_stock(client, conn, d_to)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+                if cur.fetchone()[0] == 0:
+                    etl_loss(client, conn, d_from, d_to)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s", (d_from, d_to))
+                if cur.fetchone()[0] == 0:
+                    etl_cashflow(client, conn, d_from, d_to)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM sales_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+                if cur.fetchone()[0] == 0:
+                    etl_clients(client, conn, d_from, d_to)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+                if cur.fetchone()[0] == 0:
+                    etl_move(client, conn, d_from, d_to)
+
+            # Данны для четырёх сравнений PDF: день, неделя, месяц, год к году.
+            import calendar
+            from datetime import timedelta
+
+            month_start = d_to.replace(day=1)
+            previous_month_last = month_start - timedelta(days=1)
+            previous_month_start = previous_month_last.replace(day=1)
+            previous_month_to = previous_month_start.replace(
+                day=min(d_to.day, previous_month_last.day),
+            )
+
+            def _year_back(value):
+                day = min(value.day, calendar.monthrange(value.year - 1, value.month)[1])
+                return value.replace(year=value.year - 1, day=day)
+
+            comparison_windows = [
+                (d_to - timedelta(days=13), d_to),
+                (month_start, d_to),
+                (previous_month_start, previous_month_to),
+                (_year_back(d_from), _year_back(d_to)),
+            ]
+            for cmp_from, cmp_to in comparison_windows:
+                missing_cmp = _missing_days(conn, cmp_from, cmp_to)
+                if missing_cmp:
+                    etl_sales(client, conn, min(missing_cmp), max(missing_cmp))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s",
+                        (cmp_from, cmp_to),
+                    )
+                    if cur.fetchone()[0] == 0:
+                        etl_loss(client, conn, cmp_from, cmp_to)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s",
+                        (cmp_from, cmp_to),
+                    )
+                    if cur.fetchone()[0] == 0:
+                        etl_cashflow(client, conn, cmp_from, cmp_to)
+            result[0] = build_sales_pdf(
+                conn, d_from, d_to, None, include_management_sections=True,
+                client=client,
+            )
+        except Exception as exc:
+            error[0] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=900):
+        tg.send_message(bot_token, chat_id, "⚠️ PDF не удалось собрать за 15 минут.")
+        return
+    if error[0]:
+        log.error("Ошибка PDF за период: %s", error[0], exc_info=error[0])
+        tg.send_message(bot_token, chat_id, f"⚠️ Ошибка PDF: {error[0]}")
+        return
+    period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
+    tg.send_document(
+        bot_token, chat_id, result[0], f"period_report_{period_safe}.pdf",
+        f"Отчёт за {_fmt_period(d_from, d_to)}",
+    )
+
+
+def _run_current_state_pdf_only(conn_factory, bot_token, chat_id):
+    """Build and send one current-state PDF without progress texts or charts."""
+    import datetime as _dt
+    import threading
+    from .report_current_state import build_current_state_pdf, _latest_day
+
+    done = threading.Event()
+    result = [None]
+    error = [None]
+    snap_day = [_dt.date.today()]
+
+    def _worker():
+        try:
+            conn = conn_factory()
+            snap_day[0] = _latest_day(conn)
+            result[0] = build_current_state_pdf(conn, config.MOYSKLAD_TOKEN())
+        except Exception as exc:
+            error[0] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=900):
+        tg.send_message(bot_token, chat_id, "⚠️ PDF не удалось собрать за 15 минут.")
+        return
+    if error[0]:
+        log.error("Ошибка PDF состояния: %s", error[0], exc_info=error[0])
+        tg.send_message(bot_token, chat_id, f"⚠️ Ошибка PDF: {error[0]}")
+        return
+    tg.send_document(
+        bot_token, chat_id, result[0],
+        f"current_state_{snap_day[0].strftime('%Y%m%d')}.pdf",
+        f"Состояние на {snap_day[0].strftime('%d.%m.%Y')}",
+    )
+
+
+def _run_period_report(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
+    """📊 Отчёт за период — только PDF."""
+    _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, chat_id)
+    return
+    import datetime as _dt
+    from .report_pdf import _pdf_summary
+    from .charts import chart_period_summary
+
+    tg.send_message(
+        bot_token, chat_id,
+        f"⏳ Формирую управленческий отчёт…\nПериод: {_fmt_period(d_from, d_to)}",
+    )
+
+    conn       = conn_factory()
+    period_len = (d_to - d_from).days + 1
+    prev_to    = d_from - _dt.timedelta(days=1)
+    prev_from  = prev_to - _dt.timedelta(days=period_len - 1)
+
+    s = sp = None
+    try:
+        s  = _pdf_summary(conn, d_from,    d_to,    None)
+        sp = _pdf_summary(conn, prev_from, prev_to, None)
+    except Exception as _e:
+        log.warning("period_report _pdf_summary failed: %s", _e)
+
+    # ── Краткое текстовое сообщение ───────────────────────────────────────────
+    if s:
+        def _rr(kop):
+            return f"{int(kop or 0) // 100:,}".replace(",", " ") + " ₽"
+
+        def _dd(cur, prv):
+            try:
+                return f" ({(cur - prv) / abs(prv) * 100:+.0f}%)"
+            except (ZeroDivisionError, TypeError):
+                return ""
+
+        profit_before = (s["profit"] or 0) - (s["op_expenses"] or 0)
+        sp_profit_before = ((sp["profit"] or 0) - (sp["op_expenses"] or 0)) if sp else 0
+
+        lines = [
+            f"📊 *{_fmt_period(d_from, d_to)}*",
+            f"_{_fmt_period(prev_from, prev_to)} — сравнение_",
+            "",
+            f"Выручка:                {_rr(s['rev'])}{_dd(s['rev'], sp['rev'] if sp else 0)}",
+            f"Валовая прибыль:        {_rr(s['profit'])}{_dd(s['profit'], sp['profit'] if sp else 0)}",
+            f"Прибыль до списаний:    {_rr(profit_before)}{_dd(profit_before, sp_profit_before)}",
+            f"Прибыль после списаний: {_rr(s['result'])}{_dd(s['result'], sp['result'] if sp else 0)}",
+            f"Списания:               {_rr(s['loss'])}",
+            f"Расходы:                {_rr(s['op_expenses'])}",
+            f"Чеков: {s['checks']}  ·  ср. {_rr(s['avg_check'])}",
+            "",
+            "График и полный отчёт ниже.",
+        ]
+        tg.send_message(bot_token, chat_id, "\n".join(lines))
+
+    # ── График ────────────────────────────────────────────────────────────────
+    if s and sp:
+        try:
+            png = chart_period_summary(
+                s, sp,
+                label_curr=_fmt_period(d_from, d_to),
+                label_prev=_fmt_period(prev_from, prev_to),
+            )
+            if png:
+                tg.send_photo(bot_token, chat_id, png,
+                              caption=f"Сравнение: {_fmt_period(d_from, d_to)} vs {_fmt_period(prev_from, prev_to)}")
+        except Exception as _e:
+            log.warning("chart_period_summary failed: %s", _e)
+
+    _run_pdf(conn_factory, client_factory, d_from, d_to, None, bot_token, chat_id)
+
+
+def _run_current_state(conn_factory, client_factory, bot_token, chat_id):
+    """📦 Состояние на сегодня — только PDF."""
+    _run_current_state_pdf_only(conn_factory, bot_token, chat_id)
+    return
+    import threading
+    import datetime as _dt
+    from .report_current_state import (
+        build_current_state_pdf, _latest_day, _stores_with_data,
+    )
+    from .calc_forecast import build_forecast_new, SREZKA_STORE_CONFIGS
+    from .charts import chart_forecast_summary
+
+    tg.send_message(bot_token, chat_id, "⏳ Формирую состояние на сегодня…")
+
+    conn  = conn_factory()
+    token = config.MOYSKLAD_TOKEN()
+    today = _dt.date.today()
+
+    # Прогноз для краткого текста + график
+    try:
+        monday   = today - _dt.timedelta(days=today.weekday())
+        next_mon = monday   + _dt.timedelta(days=7)
+        next_sun = next_mon + _dt.timedelta(days=6)
+        fc_results = build_forecast_new(
+            conn, token, SREZKA_STORE_CONFIGS,
+            cutoff_date=today,
+            horizon_from=next_mon,
+            horizon_to=next_sun,
+        )
+        order_sku  = len({r.product_id for r in fc_results if (r.recommended_order_qty or 0) > 0})
+        order_qty  = int(sum(r.recommended_order_qty or 0 for r in fc_results))
+        zero_stock = sum(1 for r in fc_results if (r.available_stock or 0) <= 0)
+    except Exception as _e:
+        log.warning("forecast for current_state failed: %s", _e)
+        fc_results = []
+        order_sku = order_qty = zero_stock = 0
+
+    try:
+        snap_day   = _latest_day(conn)
+        stores_str = ", ".join(_stores_with_data(conn, snap_day)) or "нет данных"
+    except Exception:
+        snap_day   = today
+        stores_str = "данные запрашиваются"
+
+    tg.send_message(bot_token, chat_id, "\n".join([
+        f"📦 *Состояние на {snap_day.strftime('%d.%m.%Y')}*",
+        "",
+        f"Склады: {stores_str}",
+        f"Нулевой остаток: {zero_stock} позиций",
+        f"К заказу: {order_sku} SKU / {order_qty} шт.",
+        "",
+        "Полный отчёт по складам формируется…",
+    ]))
+
+    # График прогноза
+    if fc_results:
+        try:
+            png = chart_forecast_summary(fc_results, {})
+            if png:
+                tg.send_photo(
+                    bot_token, chat_id, png,
+                    caption=(f"Прогноз закупки {next_mon.strftime('%d.%m')}–"
+                             f"{next_sun.strftime('%d.%m.%Y')}"),
+                )
+        except Exception as _e:
+            log.warning("chart_forecast_summary for current_state failed: %s", _e)
+
+    # PDF — тяжёлая операция, до 2–3 мин
+    done       = threading.Event()
+    pdf_result = [None]
+    pdf_error  = [None]
+
+    def _worker():
+        try:
+            pdf_result[0] = build_current_state_pdf(conn, token)
+        except Exception as exc:
+            pdf_error[0]  = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(timeout=360):
+        tg.send_message(
+            bot_token, chat_id,
+            "⏳ PDF формируется дольше 6 минут, попробуй позже.",
+            tg.main_reply_keyboard(),
+        )
+        return
+
+    if pdf_error[0]:
+        log.exception("build_current_state_pdf: %s", pdf_error[0])
+        tg.send_message(
+            bot_token, chat_id,
+            f"⚠️ Ошибка PDF: {pdf_error[0]}",
+            tg.main_reply_keyboard(),
+        )
+        return
+
+    tg.send_document(
+        bot_token, chat_id,
+        pdf_result[0],
+        f"current_state_{snap_day.strftime('%Y%m%d')}.pdf",
+        f"Состояние на {snap_day.strftime('%d.%m.%Y')}",
+    )
+    tg.send_message(bot_token, chat_id, "✅ Готово.", tg.main_reply_keyboard())
+
+
+def _save_forecast_run(conn, results, horizon_from, horizon_to):
+    """Сохраняет итоги прогностического запуска в таблицу forecast_run."""
+    if not results:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS forecast_run (
+                id             SERIAL PRIMARY KEY,
+                run_at         TIMESTAMPTZ DEFAULT NOW(),
+                horizon_from   DATE NOT NULL,
+                horizon_to     DATE NOT NULL,
+                total_order    NUMERIC,
+                total_demand   NUMERIC,
+                total_stock    NUMERIC,
+                sku_count      INT
+            )
+        """)
+        total_order  = sum(r.recommended_order_qty or 0 for r in results)
+        total_demand = sum(r.expected_demand or 0 for r in results)
+        total_stock  = sum(max(r.available_stock or 0, 0) for r in results)
+        sku_count    = len({r.product_id for r in results})
+        cur.execute(
+            """
+            INSERT INTO forecast_run
+              (horizon_from, horizon_to, total_order, total_demand, total_stock, sku_count)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (horizon_from, horizon_to,
+             total_order, total_demand, total_stock, sku_count),
+        )
+    conn.commit()
+
+
+def _load_forecast_history(conn):
+    """Возвращает последние 8 запусков из forecast_run (хронологически)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT horizon_from, total_order, total_demand, total_stock
+                FROM forecast_run
+                ORDER BY horizon_from DESC
+                LIMIT 8
+            """)
+            rows = cur.fetchall()
+        return list(reversed(rows)) if rows and len(rows) >= 2 else []
+    except Exception:
+        return []
 
 
 def _run_prices(conn_factory, bot_token, chat_id):

@@ -144,6 +144,7 @@ def _get_losses_by_store(
         cur.execute(f"""
             SELECT d.store_name,
                    SUM(CASE
+                       WHEN COALESCE(i.total_kop, 0) = 0 THEN 0
                        WHEN i.product_id IS NOT NULL
                             AND pp.price_kop IS NOT NULL AND pp.price_kop > 0
                            THEN round(i.qty * pp.price_kop{disc_case})
@@ -276,8 +277,369 @@ def _render_income_split(
     pdf.ln(4)
 
 
+def _plain_report_text(text: str) -> str:
+    """Remove chat-only pictograms while keeping readable PDF punctuation."""
+    for marker in (
+        "💸", "📍", "📉", "📋", "📅", "📤", "📥", "👥", "🏆",
+        "⚠️", "⚠", "✅", "⚙", "🏪", "📊", "🔄", "💰",
+        "🔍", "🗑️", "🗑", "✏️", "✏",
+    ):
+        text = text.replace(marker, "")
+    return text.replace("\ufe0f", "").strip()
+
+
+def _append_text_section(pdf: pk.HermesPDF, title: str, content: str) -> None:
+    """Append a text report using the established branded sales-PDF layout."""
+    pdf.add_page()
+    pk.cover(pdf, title)
+    for raw in content.splitlines():
+        line = _plain_report_text(raw)
+        if not line:
+            pdf.ln(2)
+            continue
+        if line.startswith("──"):
+            pk.section_header(pdf, line.strip("─ "))
+            continue
+        if line.startswith("▸") or (line.endswith(":") and len(line) < 72):
+            pdf.set_font("DejaVu_B", size=8.5)
+        else:
+            pdf.set_font("DejaVu", size=8.0)
+        pdf.set_text_color(*pk.INK)
+        pdf.set_x(pk._MARGIN)
+        pdf.multi_cell(pk._INNER_W, 4.3, line, align="L",
+                       new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+
+def _append_top_clients(
+    pdf: pk.HermesPDF, rows: list[tuple], store_name: str,
+) -> None:
+    """Компактный лист A4 с топ-клиентами выбранного склада."""
+    if not rows:
+        return
+    pdf.add_page()
+    pk.cover(pdf, f"ТОП-{len(rows)} КЛИЕНТОВ · БАЗА")
+    pdf.set_x(pk._MARGIN)
+    pdf.set_font("DejaVu", size=7.2)
+    pdf.set_text_color(*pk.SAGE)
+    pdf.cell(
+        pk._INNER_W, 4, store_name,
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(2)
+    table_rows = []
+    for idx, (name, orders, revenue) in enumerate(rows, 1):
+        revenue = float(revenue or 0)
+        avg = revenue / int(orders or 1)
+        table_rows.append([
+            str(idx), _trunc(name or "—", 46), str(int(orders or 0)),
+            _rub(revenue) + " ₽", _rub(avg) + " ₽",
+        ])
+    pk.table(
+        pdf,
+        headers=["#", "Клиент", "Заказов", "Выручка", "Средний чек"],
+        rows=table_rows,
+        col_widths=[8, 83, 19, 34, 30],
+        aligns=["R", "L", "R", "R", "R"],
+        font_size=7.2,
+        max_rows=40,
+    )
+
+
+def _append_churn_clients(pdf: pk.HermesPDF, rows: list[tuple]) -> None:
+    """Все клиенты БАЗЫ: без заказа >10 дней, средний чек >=10 000 ₽."""
+    pdf.add_page()
+    pdf.set_x(pk._MARGIN)
+    pk.cover(pdf, "ВОЗМОЖНЫЙ ОТТОК · БАЗА")
+    pdf.set_x(pk._MARGIN)
+    pdf.set_font("DejaVu", size=7.2)
+    pdf.set_text_color(*pk.SAGE)
+    pdf.cell(
+        pk._INNER_W, 4,
+        "Все клиенты БАЗЫ без заказа больше 10 дней · средний чек от 10 000 ₽.",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(2)
+    if not rows:
+        pk.callout(pdf, "Отставших оптовиков не обнаружено.", kind="ok")
+        return
+
+    headers = [
+        "Клиент", "Последний заказ", "Без заказа", "Заказов",
+        "Всего", "Средний чек",
+    ]
+    widths = [58, 28, 18, 16, 26, 28]
+    aligns = ["L", "C", "R", "R", "R", "R"]
+    row_h = 4.2
+
+    def _header() -> None:
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu_B", size=6.5)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_fill_color(*pk.INK)
+        for idx, (title, width, align) in enumerate(zip(headers, widths, aligns)):
+            pdf.cell(
+                width, 5.2, title, align=align, fill=True,
+                new_x="LMARGIN" if idx == len(headers) - 1 else "RIGHT",
+                new_y="NEXT" if idx == len(headers) - 1 else "TOP",
+            )
+        pdf.set_text_color(*pk.INK)
+
+    _header()
+    for idx, (name, last_day, days_since, orders, revenue, avg_check) in enumerate(rows):
+        if pdf.get_y() + row_h > pdf.page_break_trigger:
+            pdf.add_page()
+            _header()
+        fill = idx % 2 == 0
+        if fill:
+            pdf.set_fill_color(*pk.CREAM)
+        values = [
+            _trunc(name or "—", 31),
+            last_day.strftime("%d.%m.%Y") if hasattr(last_day, "strftime") else str(last_day),
+            f"{int(days_since)} дн.",
+            str(int(orders or 0)),
+            _rub(float(revenue or 0)) + " ₽",
+            _rub(float(avg_check or 0)) + " ₽",
+        ]
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu", size=6.4)
+        pdf.set_text_color(*pk.INK)
+        for col, (value, width, align) in enumerate(zip(values, widths, aligns)):
+            pdf.cell(
+                width, row_h, value, align=align, fill=fill,
+                new_x="LMARGIN" if col == len(values) - 1 else "RIGHT",
+                new_y="NEXT" if col == len(values) - 1 else "TOP",
+            )
+    pdf.set_fill_color(255, 255, 255)
+
+
+def _append_period_changes(
+    pdf: pk.HermesPDF, conn, d_from: date, d_to: date,
+    store_name: str | None, current: dict,
+) -> None:
+    """Append a compact current-vs-previous period comparison."""
+    from datetime import timedelta
+
+    period_len = (d_to - d_from).days + 1
+    prev_to = d_from - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=period_len - 1)
+
+    discount_pids = calc.discount_product_ids(conn)
+    store_id_f = _store_id_for(conn, store_name)
+    pdata = _sales_purchase_data(
+        conn, prev_from, prev_to, store_id_f, discount_pids=discount_pids,
+    )
+    by_store = pdata["by_store"]
+    sf = "AND store_name = %s" if store_name else ""
+    params = [prev_from, prev_to] + ([store_name] if store_name else [])
+    with conn.cursor() as cur_db:
+        cur_db.execute(f"""
+            SELECT store_id, store_name, channel,
+                   COALESCE(SUM(revenue_kop), 0), COALESCE(SUM(checks), 0)
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s {sf}
+            GROUP BY store_id, store_name, channel
+        """, params)
+        prev_stores = cur_db.fetchall()
+    prev_biz = [r for r in prev_stores if r[2] in ("розница", "опт", "ресторан")]
+    prev_rev = sum(int(r[3] or 0) for r in prev_biz)
+    prev_cost = sum(int(by_store.get(r[0], {}).get("pc", 0)) for r in prev_biz)
+    prev_profit = prev_rev - prev_cost
+    prev_exp = int(get_operational_expenses(conn, prev_from, prev_to)["total"] or 0)
+    prev_loss = int(_get_losses_by_store(
+        conn, prev_from, prev_to, discount_pids=discount_pids,
+    ).get("__total__", 0))
+    prev_checks = sum(int(r[4] or 0) for r in prev_biz)
+    prev = {
+        "rev": prev_rev,
+        "profit": prev_profit,
+        "before": prev_profit - prev_exp,
+        "result": prev_profit - prev_exp - prev_loss,
+        "loss": prev_loss,
+        "op_expenses": prev_exp,
+        "checks": prev_checks,
+        "avg_check": prev_rev // prev_checks if prev_checks else 0,
+    }
+    cur = current
+
+    def _delta(value, old) -> str:
+        if not old:
+            return "—"
+        return f"{(value - old) / abs(old) * 100:+.0f}%"
+
+    cur_before = int(cur["before"] or 0)
+    prev_before = int(prev["before"] or 0)
+    metrics = [
+        ("Выручка", int(cur["rev"] or 0), int(prev["rev"] or 0), True),
+        ("Валовая прибыль", int(cur["profit"] or 0), int(prev["profit"] or 0), True),
+        ("Прибыль до списаний", cur_before, prev_before, True),
+        ("Прибыль после списаний", int(cur["result"] or 0), int(prev["result"] or 0), True),
+        ("Списания", int(cur["loss"] or 0), int(prev["loss"] or 0), True),
+        ("Операционные расходы", int(cur["op_expenses"] or 0), int(prev["op_expenses"] or 0), True),
+        ("Чеки", int(cur["checks"] or 0), int(prev["checks"] or 0), False),
+        ("Средний чек", int(cur["avg_check"] or 0), int(prev["avg_check"] or 0), True),
+    ]
+
+    pdf.add_page()
+    pk.cover(pdf, "СРАВНЕНИЕ С ПРЕДЫДУЩИМ ПЕРИОДОМ")
+    current_label = (
+        d_from.strftime("%d.%m.%Y") if d_from == d_to
+        else f"{d_from.strftime('%d.%m.%Y')} - {d_to.strftime('%d.%m.%Y')}"
+    )
+    previous_label = (
+        prev_from.strftime("%d.%m.%Y") if prev_from == prev_to
+        else f"{prev_from.strftime('%d.%m.%Y')} - {prev_to.strftime('%d.%m.%Y')}"
+    )
+    pdf.set_x(pk._MARGIN)
+    pdf.set_font("DejaVu", size=9)
+    pdf.set_text_color(*pk.INK)
+
+
+def _period_metrics(conn, d_from: date, d_to: date, store_name: str | None,
+                    discount_pids: set[str]) -> dict:
+    """Финансовые показатели одного периода той же методикой, что PDF."""
+    store_id_f = _store_id_for(conn, store_name)
+    pdata = _sales_purchase_data(
+        conn, d_from, d_to, store_id_f, discount_pids=discount_pids,
+    )
+    by_store = pdata["by_store"]
+    sf = "AND store_name = %s" if store_name else ""
+    params = [d_from, d_to] + ([store_name] if store_name else [])
+    with conn.cursor() as cur_db:
+        cur_db.execute(f"""
+            SELECT store_id, store_name, channel,
+                   COALESCE(SUM(revenue_kop), 0), COALESCE(SUM(checks), 0)
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s {sf}
+            GROUP BY store_id, store_name, channel
+        """, params)
+        stores = cur_db.fetchall()
+    business = [r for r in stores if r[2] in ("розница", "опт", "ресторан")]
+    revenue = sum(int(r[3] or 0) for r in business)
+    purchase_cost = sum(int(by_store.get(r[0], {}).get("pc", 0)) for r in business)
+    gross = revenue - purchase_cost
+    expenses = int(get_operational_expenses(conn, d_from, d_to)["total"] or 0)
+    losses = int(_get_losses_by_store(
+        conn, d_from, d_to, discount_pids=discount_pids,
+    ).get("__total__", 0))
+    checks = sum(int(r[4] or 0) for r in business)
+    before_losses = gross - expenses
+    return {
+        "rev": revenue,
+        "profit": gross,
+        "before": before_losses,
+        "result": before_losses - losses,
+        "loss": losses,
+        "op_expenses": expenses,
+        "checks": checks,
+        "avg_check": revenue // checks if checks else 0,
+    }
+
+
+def _append_period_comparisons(
+    pdf: pk.HermesPDF, conn, report_from: date, report_to: date,
+    store_name: str | None,
+) -> None:
+    """Сравнения: день, неделя, месяц и год к дате конца отчёта."""
+    import calendar
+    from datetime import timedelta
+
+    anchor = report_to
+    month_current_from = anchor.replace(day=1)
+    previous_month_last = month_current_from - timedelta(days=1)
+    previous_month_from = previous_month_last.replace(day=1)
+    previous_month_day = min(anchor.day, previous_month_last.day)
+    previous_month_to = previous_month_from.replace(day=previous_month_day)
+
+    def _year_back(value: date) -> date:
+        day = min(value.day, calendar.monthrange(value.year - 1, value.month)[1])
+        return value.replace(year=value.year - 1, day=day)
+
+    comparisons = [
+        ("ДЕНЬ", anchor, anchor,
+         anchor - timedelta(days=1), anchor - timedelta(days=1)),
+        ("НЕДЕЛЯ", anchor - timedelta(days=6), anchor,
+         anchor - timedelta(days=13), anchor - timedelta(days=7)),
+        ("МЕСЯЦ", month_current_from, anchor,
+         previous_month_from, previous_month_to),
+        ("ГОД К ГОДУ", report_from, report_to,
+         _year_back(report_from), _year_back(report_to)),
+    ]
+    discount_pids = calc.discount_product_ids(conn)
+
+    def _label(a: date, b: date) -> str:
+        return a.strftime("%d.%m.%Y") if a == b else f"{a:%d.%m.%Y} - {b:%d.%m.%Y}"
+
+    def _delta(value: int, old: int) -> str:
+        return "—" if not old else f"{(value - old) / abs(old) * 100:+.0f}%"
+
+    for horizon, cur_from, cur_to, prev_from, prev_to in comparisons:
+        cur = _period_metrics(conn, cur_from, cur_to, store_name, discount_pids)
+        prev = _period_metrics(conn, prev_from, prev_to, store_name, discount_pids)
+        cur_label = _label(cur_from, cur_to)
+        prev_label = _label(prev_from, prev_to)
+
+        pdf.add_page()
+        pk.cover(pdf, f"СРАВНЕНИЕ  ·  {horizon}")
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu", size=9)
+        pdf.set_text_color(*pk.INK)
+        pdf.multi_cell(
+            pk._INNER_W, 5,
+            f"Текущий: {cur_label}\nПредыдущий: {prev_label}\n"
+            f"Расчёт привязан к дате окончания отчёта: {anchor:%d.%m.%Y}.",
+            align="L", new_x="LMARGIN", new_y="NEXT",
+        )
+        pdf.ln(3)
+        pk.kpi_row(pdf, [
+            ("Выручка", _rub(cur["rev"]), "₽", _delta(cur["rev"], prev["rev"])),
+            ("Вал. прибыль", _rub(cur["profit"]), "₽", _delta(cur["profit"], prev["profit"])),
+            ("До списаний", _rub(cur["before"]), "₽", _delta(cur["before"], prev["before"])),
+            ("После списаний", _rub(cur["result"]), "₽", _delta(cur["result"], prev["result"])),
+        ])
+        pdf.ln(4)
+        pk.section_header(pdf, "Сравнение показателей")
+        metric_defs = [
+            ("Выручка", "rev", True),
+            ("Валовая прибыль", "profit", True),
+            ("Прибыль до списаний", "before", True),
+            ("Прибыль после списаний", "result", True),
+            ("Списания", "loss", True),
+            ("Операционные расходы", "op_expenses", True),
+            ("Чеки", "checks", False),
+            ("Средний чек", "avg_check", True),
+        ]
+        table_rows = []
+        for title, key, money in metric_defs:
+            value, old = int(cur[key] or 0), int(prev[key] or 0)
+            value_s = _rub(value) + " ₽" if money else f"{value:,}".replace(",", " ")
+            old_s = _rub(old) + " ₽" if money else f"{old:,}".replace(",", " ")
+            diff = value - old
+            diff_s = (_rub(diff) + " ₽" if money
+                      else f"{diff:+,}".replace(",", " "))
+            table_rows.append([title, value_s, old_s, diff_s, _delta(value, old)])
+        pk.table(
+            pdf,
+            headers=["Показатель", "Текущий", "Предыдущий", "Разница", "Изм., %"],
+            rows=table_rows,
+            col_widths=[54, 36, 36, 28, 20],
+            aligns=["L", "R", "R", "R", "R"],
+            font_size=8.0,
+        )
+        pdf.ln(3)
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu", size=7.5)
+        pdf.set_text_color(*pk.SAGE)
+        pdf.multi_cell(
+            pk._INNER_W, 4,
+            "Разница = текущий - предыдущий. Плюс означает рост, минус - снижение.",
+            align="L", new_x="LMARGIN", new_y="NEXT",
+        )
+        pdf.set_text_color(*pk.INK)
 def build_sales_pdf(
-    conn, d_from: date, d_to: date, store_name: str | None = None
+    conn, d_from: date, d_to: date, store_name: str | None = None,
+    include_management_sections: bool = False,
+    client=None,
 ) -> bytes:
     """PDF-отчёт по продажам с тремя уровнями прибыли. Возвращает bytes."""
     days = (d_to - d_from).days + 1
@@ -344,24 +706,29 @@ def build_sales_pdf(
     grand_net      = grand_prof - exp["total"]
     grand_after    = grand_net - losses_total
 
-    # -- Топ-20 по выручке -----------------------------------------------------
-    sf2 = "AND spd.store_id = %s" if store_id_f else ""
-    p2  = [d_from, d_to] + ([store_id_f] if store_id_f else [])
+    # -- Отдельный топ-40 по каждому складу -----------------------------------
+    top_by_store: list[tuple[str, list[tuple]]] = []
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT spd.product_name, SUM(spd.sell_qty), SUM(spd.revenue_kop),
-                   SUM({_PCOST}),
-                   {_UNCOV}
-            FROM sales_by_product_day spd {_ASOF}
-            WHERE spd.day BETWEEN %s AND %s {sf2}
-              AND spd.assortment_id IN (
-                  SELECT DISTINCT product_id FROM stock_snapshot
-                  WHERE folder_path LIKE %s
-              )
-            GROUP BY spd.product_name
-            ORDER BY SUM(spd.revenue_kop) DESC LIMIT 20
-        """, p2 + ["Ассортимент/%"])
-        top_rev = cur.fetchall()
+        for sid, sn, _channel, rev_s, _checks in _biz:
+            if not rev_s:
+                continue
+            cur.execute(f"""
+                SELECT spd.product_name, SUM(spd.sell_qty), SUM(spd.revenue_kop),
+                       SUM({_PCOST}),
+                       {_UNCOV}
+                FROM sales_by_product_day spd {_ASOF}
+                WHERE spd.day BETWEEN %s AND %s
+                  AND spd.store_id = %s
+                  AND spd.assortment_id IN (
+                      SELECT DISTINCT product_id FROM stock_snapshot
+                      WHERE folder_path LIKE %s
+                  )
+                GROUP BY spd.product_name
+                ORDER BY SUM(spd.revenue_kop) DESC LIMIT 40
+            """, [d_from, d_to, sid, "Ассортимент/%"])
+            store_top = cur.fetchall()
+            if store_top:
+                top_by_store.append((sn, store_top))
 
     # -- Строим PDF ------------------------------------------------------------
     pdf = pk.HermesPDF(
@@ -448,10 +815,10 @@ def build_sales_pdf(
     # -- Таблица: каналы и склады (6 колонок, % inline) ------------------------
     pk.section_header(pdf, "Итоги по каналам и складам")
 
-    # [Склад, Выручка, Вал.прибыль·%, До списаний·%] = 174мм
-    hdrs = ["Склад / Канал", "Выручка", "Вал.прибыль · %", "До списаний · %"]
-    cws  = [60, 30, 42, 42]
-    alns = ["L", "R", "R", "R"]
+    # Полная цепочка: выручка -> валовая -> до списаний -> после списаний.
+    hdrs = ["Склад / Канал", "Выручка", "Вал. приб.", "До спис.", "После спис."]
+    cws  = [58, 28, 30, 29, 29]
+    alns = ["L", "R", "R", "R", "R"]
 
     mixed = set(config.MIXED_CHANNEL_STORES or [])
     chan_rows: list[list[str]] = []
@@ -465,12 +832,14 @@ def build_sales_pdf(
             continue
         c_gross = sum(_gross(r[0], r[3]) for r in chan)
         c_net   = sum(_net(r[0], r[1], r[3]) for r in chan)
+        c_after = sum(_net(r[0], r[1], r[3]) - losses.get(r[1], 0) for r in chan)
 
         for sid, sn, _, rev_s, _chk in chan:
             if rev_s == 0:
                 continue
             gp  = _gross(sid, rev_s)
             np_ = _net(sid, sn, rev_s)
+            ap_ = np_ - losses.get(sn, 0)
             marker = " †" if sn in mixed else ""
             if sn in mixed:
                 mixed_in_table.append(sn)
@@ -480,6 +849,7 @@ def build_sales_pdf(
                 _rub(rev_s) + " ₽",
                 _rub_pct(gp, rev_s),
                 _rub_pct(np_, rev_s),
+                _rub_pct(ap_, rev_s),
             ])
             chan_styles.append(None)
             ball_rev = balls_by_store.get(sn, 0)
@@ -487,7 +857,7 @@ def build_sales_pdf(
                 ball_lbl = ("в т.ч. шары (Коля)"
                             if sn in _KOLA_BALL_STORES
                             else "в т.ч. шары (совместное)")
-                chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽", "", ""])
+                chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽", "", "", ""])
                 chan_styles.append("detail")
 
         chan_rows.append([
@@ -495,6 +865,7 @@ def build_sales_pdf(
             _rub(c_rev)   + " ₽",
             _rub_pct(c_gross, c_rev),
             _rub_pct(c_net, c_rev),
+            _rub_pct(c_after, c_rev),
         ])
         chan_styles.append(None)
 
@@ -503,11 +874,12 @@ def build_sales_pdf(
         _rub(grand_rev)  + " ₽",
         _rub_pct(grand_prof, grand_rev),
         _rub_pct(grand_net, grand_rev),
+        _rub_pct(grand_after, grand_rev),
     ])
     chan_styles.append(None)
 
     pk.table(pdf, headers=hdrs, rows=chan_rows, col_widths=cws, aligns=alns,
-             font_size=8.5, row_styles=chan_styles)
+             font_size=7.6, row_styles=chan_styles)
 
     # Сноски под таблицей
     pdf.set_x(pk._MARGIN)
@@ -515,6 +887,7 @@ def build_sales_pdf(
     pdf.set_text_color(*pk.SAGE)
     footnotes = [
         "«До списаний»: прямые расходы склада + доля общих расходов пропорционально выручке — оценка.",
+        "«После списаний» = прибыль до списаний - списания по точке.",
     ]
     if mixed_in_table:
         footnotes.append("† Смешанная касса — точка обслуживает несколько каналов.")
@@ -617,7 +990,7 @@ def build_sales_pdf(
     # -- Списания по складам ---------------------------------------------------
     store_losses = {k: v for k, v in losses.items() if k != "__total__"}
     if store_losses:
-        pk.section_header(pdf, "Списания и чистая прибыль по складам")
+        pk.section_header(pdf, "Списания и прибыль по складам")
         loss_tbl_rows = []
         sum_net = 0; sum_after = 0
         for sid, sn, ch, rev_s, _ in stores:
@@ -641,11 +1014,11 @@ def build_sales_pdf(
         ])
         pk.table(
             pdf,
-            headers=["Склад", "Списания", "До списаний", "Чистая после спис."],
+            headers=["Склад", "Списания", "До списаний", "После списаний"],
             rows=loss_tbl_rows,
-            col_widths=[86, 28, 30, 30],
+            col_widths=[76, 28, 35, 35],
             aligns=["L", "R", "R", "R"],
-            font_size=8.5,
+            font_size=7.8,
         )
         convergence_ok = abs(sum_after - grand_after) < 500
         if not convergence_ok:
@@ -657,9 +1030,21 @@ def build_sales_pdf(
             )
         pdf.ln(1)
 
-    # -- Топ-20 по выручке -----------------------------------------------------
-    if top_rev:
-        pk.section_header(pdf, f"Топ-{len(top_rev)} товаров по выручке")
+    # -- Топ товаров: отдельный лист A4 для каждого склада ---------------------
+    for top_store_name, top_rev in top_by_store:
+        pdf.add_page()
+        pdf.set_x(pk._MARGIN)
+        # Названия складов длинные. Разделяем заголовок и склад на две строки,
+        # чтобы текст не уезжал за левое поле на A4.
+        pk.cover(pdf, f"ТОП-{len(top_rev)} ТОВАРОВ")
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu", size=7.2)
+        pdf.set_text_color(*pk.SAGE)
+        pdf.cell(
+            pk._INNER_W, 4, top_store_name,
+            new_x="LMARGIN", new_y="NEXT",
+        )
+        pdf.ln(2)
         top_rows = []
         any_miss = False
         for i, (name, qty, rev_p, pcost, uncov) in enumerate(top_rev, 1):
@@ -683,7 +1068,7 @@ def build_sales_pdf(
             col_widths=[8, 82, 14, 28, 42],
             aligns=["R", "L", "R", "R", "R"],
             font_size=8,
-            max_rows=20,
+            max_rows=40,
         )
         if any_miss:
             pdf.set_x(pk._MARGIN)
@@ -713,5 +1098,60 @@ def build_sales_pdf(
                 )
     if flags:
         pk.callout(pdf, "Требует внимания:\n" + "\n".join(flags), kind="warn")
+
+    if include_management_sections:
+        from .report_cashflow import build_expenses_report
+        from .report_move import build_move_report
+        from .report_clients import (
+            build_clients_report, get_churn_clients, get_top_clients,
+        )
+        from .report_audit import build_audit_report
+
+        _append_text_section(
+            pdf, "Расходы",
+            build_expenses_report(conn, d_from, d_to, store_name, max_items=12),
+        )
+        _append_text_section(
+            pdf, "Перемещения",
+            build_move_report(conn, d_from, d_to, store_name, max_docs=10),
+        )
+        _append_text_section(
+            pdf, "Клиенты",
+            build_clients_report(
+                conn, d_from, d_to, store_name,
+                include_top=False, include_churn=False,
+            ),
+        )
+        base_store = "База Воровского 107/1"
+        _append_top_clients(
+            pdf,
+            get_top_clients(conn, d_from, d_to, base_store, limit=40),
+            base_store,
+        )
+        _append_churn_clients(
+            pdf,
+            get_churn_clients(
+                conn, limit=None, store_name=base_store, inactive_days=10,
+                min_avg_check_kop=1_000_000,
+            ),
+        )
+        _append_text_section(
+            pdf, "Изменённые и удалённые документы",
+            build_audit_report(client, d_from, d_to),
+        )
+        current_metrics = {
+            "rev": grand_rev,
+            "profit": grand_prof,
+            "before": grand_net,
+            "result": grand_after,
+            "loss": losses_total,
+            "op_expenses": int(exp["total"] or 0),
+            "checks": sum(int(r[4] or 0) for r in _biz),
+        }
+        current_metrics["avg_check"] = (
+            grand_rev // current_metrics["checks"]
+            if current_metrics["checks"] else 0
+        )
+        _append_period_comparisons(pdf, conn, d_from, d_to, store_name)
 
     return bytes(pdf.output())

@@ -45,6 +45,12 @@ def _owner(doc: dict) -> str:
     return "—"
 
 
+def _number(doc: dict) -> str:
+    """Номер документа МойСклад; ID используем только как последний фолбэк."""
+    value = doc.get("name") or doc.get("externalCode") or doc.get("id") or "—"
+    return str(value)
+
+
 def _rub(sum_kop) -> str:
     try:
         return f"{float(sum_kop) / 100:,.0f}".replace(",", " ") + " ₽"
@@ -79,7 +85,7 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
         f"deletedMoment>={d_from.isoformat()} 00:00:00;"
         f"deletedMoment<={d_to.isoformat()} 23:59:59"
     )
-    deleted: list[tuple] = []   # (day, label, loc, sum_kop, who)
+    deleted: list[tuple] = []   # (sort, day, label, number, loc, sum_kop, who)
     for doc_type, label in _DOC_TYPES.items():
         try:
             resp = client._get(f"/entity/{doc_type}/deleted", {
@@ -95,14 +101,17 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
             d_dt = _dt(str(r.get("deletedMoment") or r.get("moment", "")))
             day = d_dt.strftime("%d.%m.%Y") if d_dt else "—"
             sort_key = d_dt.isoformat() if d_dt else ""
-            deleted.append((sort_key, day, label, _location(r), r.get("sum"), _owner(r)))
+            deleted.append((
+                sort_key, day, label, _number(r), _location(r),
+                r.get("sum"), _owner(r),
+            ))
 
     # ── Изменённые (updated позже moment на _EDIT_GAP) ──────────────────────────
     doc_flt = (
         f"moment>={d_from.isoformat()} 00:00:00;"
         f"moment<={d_to.isoformat()} 23:59:59"
     )
-    modified: list[tuple] = []   # (moment_day, updated_day, label, loc, sum_kop, who)
+    modified: list[tuple] = []   # (moment_day, updated_day, label, number, loc, sum_kop, who)
     for doc_type, label in _DOC_TYPES.items():
         try:
             rows: list[dict] = []
@@ -129,7 +138,7 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
             if m_dt and u_dt and (u_dt - m_dt) >= _EDIT_GAP:
                 modified.append((
                     m_dt.strftime("%d.%m.%Y"), u_dt.strftime("%d.%m.%Y"),
-                    label, _location(r), r.get("sum"), _owner(r),
+                    label, _number(r), _location(r), r.get("sum"), _owner(r),
                 ))
 
     if not deleted and not modified:
@@ -139,16 +148,18 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     if deleted:
         deleted.sort(key=lambda x: x[0])
         lines.append(f"🗑 УДАЛЁННЫЕ ({len(deleted)}):")
-        for _sort, day, label, loc, sum_kop, who in deleted:
-            lines.append(f"  • {label} · {day} · {loc} · {_rub(sum_kop)} · {who}")
+        for _sort, day, label, number, loc, sum_kop, who in deleted:
+            lines.append(
+                f"  • {label} № {number} · {day} · {loc} · {_rub(sum_kop)} · {who}"
+            )
         lines.append("")
 
     if modified:
         modified.sort(key=lambda x: x[0])
         lines.append(f"✏️ ИЗМЕНЁННЫЕ ({len(modified)}):")
-        for m_day, u_day, label, loc, sum_kop, who in modified:
+        for m_day, u_day, label, number, loc, sum_kop, who in modified:
             lines.append(
-                f"  • {label} · {m_day} · {loc} · {_rub(sum_kop)} · {who} "
+                f"  • {label} № {number} · {m_day} · {loc} · {_rub(sum_kop)} · {who} "
                 f"(изм. {u_day})"
             )
 

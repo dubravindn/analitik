@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import io
 import re
-from datetime import date
+from datetime import date, timedelta
 
 _FONT      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -225,7 +225,8 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
 
 
 def build_pdf(
-    conn, client, d_from: date, d_to: date, store_name: str | None = None
+    conn, client, d_from: date, d_to: date, store_name: str | None = None,
+    include_forecast: bool = True,
 ) -> bytes:
     """Сформировать PDF-отчёт. Возвращает bytes."""
     try:
@@ -506,24 +507,117 @@ def build_pdf(
     from .report_clients import build_clients_report
     _section("6. КЛИЕНТЫ", build_clients_report(conn, d_from, d_to, store_name))
 
-    # ── Секция 7: Прогноз ─────────────────────────────────────────────────────
-    from .report_forecast import build_forecast_report
+    # ── Секция 7: Прогноз (NEW engine) ────────────────────────────────────────
+    class _SkipForecast(Exception):
+        pass
+
     try:
-        forecast_text = build_forecast_report(client, conn)
-    except Exception as e:
-        forecast_text = f"Не удалось построить прогноз: {e}"
+        if not include_forecast:
+            raise _SkipForecast()
+        from .calc_forecast import build_forecast_new, SREZKA_STORE_CONFIGS
+        from hermes import config as _cfg
+        _cutoff  = d_to
+        _weekday = d_to.weekday()
+        _next_mon = d_to - timedelta(days=_weekday) + timedelta(days=7)
+        _next_sun = _next_mon + timedelta(days=6)
+        _token    = _cfg.MOYSKLAD_TOKEN()
+        _fc = build_forecast_new(
+            conn, _token, SREZKA_STORE_CONFIGS,
+            cutoff_date=_cutoff,
+            horizon_from=_next_mon,
+            horizon_to=_next_sun,
+        )
+        _fc_order = sorted(
+            (r for r in _fc if (r.recommended_order_qty or 0) > 0),
+            key=lambda r: -(r.recommended_order_qty or 0),
+        )
+        _fc_lines = [
+            f"Горизонт: {_next_mon.strftime('%d.%m')}–{_next_sun.strftime('%d.%m.%Y')}",
+            f"Движок: NEW  ·  К заказу: {len(_fc_order)} SKU / "
+            f"{int(sum(r.recommended_order_qty or 0 for r in _fc_order))} шт.",
+            "",
+        ]
+        for _r in _fc_order[:50]:
+            _fc_lines.append(
+                f"  {_r.store_name or _r.store_id:<22}  "
+                f"{_r.product_name[:38]:<38}  "
+                f"{int(_r.recommended_order_qty or 0):>5} шт."
+            )
+        if len(_fc_order) > 50:
+            _fc_lines.append(f"  … ещё {len(_fc_order) - 50} позиций")
+        forecast_text = "\n".join(_fc_lines)
+    except _SkipForecast:
+        forecast_text = (
+            "Прогноз закупки находится в отдельном PDF "
+            "«Состояние на сегодня»."
+        )
+    except Exception as _e:
+        forecast_text = f"Не удалось построить прогноз: {_e}"
     _section("7. ПРОГНОЗ", forecast_text)
 
     # ── Секция 8: Перемещения ─────────────────────────────────────────────────
     from .report_move import build_move_report
     _section("8. ПЕРЕМЕЩЕНИЯ", build_move_report(conn, d_from, d_to, store_name, max_docs=15))
 
-    # ── Секция 9: Изменения ───────────────────────────────────────────────────
-    from .report_audit import build_audit_report
+    # ── Секция 9: Сравнение периодов ──────────────────────────────────────────
     try:
-        audit_text = build_audit_report(client, d_from, d_to)
-    except Exception as e:
-        audit_text = f"Не удалось получить аудит изменений: {e}"
-    _section("9. ИЗМЕНЕНИЯ И УДАЛЕНИЯ", audit_text)
+        _period_len = (d_to - d_from).days + 1
+        _prev_to    = d_from - timedelta(days=1)
+        _prev_from  = _prev_to - timedelta(days=_period_len - 1)
+        _sc = summary  # текущий период уже посчитан выше
+        _sp = _pdf_summary(conn, _prev_from, _prev_to, store_name)
+
+        def _pct(cur, prv):
+            try:
+                d = (cur - prv) / abs(prv) * 100
+                return f"{d:+.0f}%"
+            except (ZeroDivisionError, TypeError):
+                return "—"
+
+        def _rub(kop):
+            r = abs(int(kop or 0)) // 100
+            s = "-" if int(kop or 0) < 0 else ""
+            return s + f"{r:,}".replace(",", " ") + " ₽"
+
+        _profit_before_c = _sc["profit"] - _sc["op_expenses"]
+        _profit_before_p = _sp["profit"] - _sp["op_expenses"]
+
+        _metrics = [
+            ("Выручка",                  "rev",         None),
+            ("Валовая прибыль",           "profit",      None),
+            ("Прибыль до списаний",       None,          (_profit_before_c, _profit_before_p)),
+            ("Прибыль после списаний",    "result",      None),
+            ("Списания",                  "loss",        None),
+            ("Операционные расходы",      "op_expenses", None),
+            ("Чеков",                     "checks",      None),
+            ("Средний чек",               "avg_check",   None),
+        ]
+        _hdr = f"{'Показатель':<28}  {'Текущий':>14}  {'Пред. период':>14}  {'Δ':>10}  {'Δ%':>6}"
+        _sep = "-" * 78
+        _rows_str = [
+            f"Текущий:  {d_from.strftime('%d.%m')}–{d_to.strftime('%d.%m.%Y')}",
+            f"Пред.:    {_prev_from.strftime('%d.%m')}–{_prev_to.strftime('%d.%m.%Y')}",
+            "",
+            _hdr,
+            _sep,
+        ]
+        for _label, _key, _override in _metrics:
+            if _override is not None:
+                _cur, _prv = _override
+            else:
+                _cur = _sc[_key]
+                _prv = _sp[_key]
+            _delta = _cur - _prv
+            if _key == "checks":
+                _cv, _pv, _dv = str(_cur), str(_prv), f"{_delta:+d}"
+            else:
+                _cv, _pv, _dv = _rub(_cur), _rub(_prv), _rub(_delta)
+            _rows_str.append(
+                f"{_label:<28}  {_cv:>14}  {_pv:>14}  {_dv:>10}  {_pct(_cur, _prv):>6}"
+            )
+        audit_text = "\n".join(_rows_str)
+    except Exception as _e:
+        audit_text = f"Не удалось построить сравнение периодов: {_e}"
+    _section("9. ЧТО ИЗМЕНИЛОСЬ", audit_text)
 
     return bytes(pdf.output())

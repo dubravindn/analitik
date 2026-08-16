@@ -18,27 +18,27 @@ def _qty(q: float) -> str:
     return f"{q:,.1f}".replace(",", " ")
 
 
-# Суммы перемещений — в закупочных ценах из приёмок (методика E), на дату документа.
-# Фолбэк на cost_kop МойСклад для позиций без приёмки.
+# Суммы перемещений — только по цене «Наличка» на дату документа.
 _MV_JOIN = """
     FROM move_doc d
     JOIN move_item i ON i.doc_id = d.doc_id
     LEFT JOIN LATERAL (
-        SELECT price_kop FROM purchase_price_asof p
-        WHERE p.product_id = i.product_id AND p.priced_from <= d.day
-        ORDER BY p.priced_from DESC LIMIT 1
-    ) pp ON true
+        SELECT price_kop FROM nal_price_asof n
+        WHERE n.product_id = i.product_id AND n.priced_from <= d.day
+        ORDER BY n.priced_from DESC LIMIT 1
+    ) np ON true
 """
-# Закупочная стоимость позиции (фолбэк на total_kop МойСклад).
-_MV_TOTAL = ("CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
-             "THEN round(i.qty * pp.price_kop) ELSE i.total_kop END")
-# Выручка-покрытие: total_kop только по покрытым приёмками позициям.
-_MV_COVERED = "CASE WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 THEN i.total_kop ELSE 0 END"
+_MV_TOTAL = ("CASE WHEN np.price_kop IS NOT NULL AND np.price_kop > 0 "
+             "THEN round(i.qty * np.price_kop) ELSE 0 END")
 
 # I8: фильтр «Ассортимент» — в перемещениях учитываем только товар (не ленты,
 # упаковку, услуги). По product_id через product_dim, как в списаниях.
 _MV_ASSORT = ("i.product_id IN (SELECT product_id FROM product_dim "
               "WHERE folder_path LIKE 'Ассортимент/%%')")
+
+def _nal_price(nal_unit) -> str:
+    """Цена перемещения «Наличка» или явный прочерк."""
+    return f"нал {_rub(nal_unit)} ₽" if nal_unit else "нал —"
 
 
 def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = None,
@@ -57,8 +57,8 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     store_label = f" · {store_name}" if store_name else " · Все склады"
     lines: list[str] = []
     lines.append(f"🔄 Перемещения {period_str}{store_label}")
-    lines.append("Суммы в закупочных ценах из карточки товара.")
-    lines.append("* себестоимость МойСклад — нет закупочной цены в карточке")
+    lines.append("Цена и сумма перемещения рассчитаны по цене «Наличка» на дату документа.")
+    lines.append("* нет цены «Наличка» — сумма позиции не включена")
 
     # Сводка (учитываем документ, если он касается выбранного склада как источник ИЛИ приёмник)
     store_cond = ""
@@ -72,20 +72,28 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
             SELECT COUNT(DISTINCT d.doc_id),
                    COALESCE(SUM(i.qty), 0),
                    COALESCE(SUM({_MV_TOTAL}), 0),
-                   COALESCE(SUM({_MV_COVERED}), 0),
-                   COALESCE(SUM(i.total_kop), 0)
+                   COUNT(*) FILTER (WHERE np.price_kop IS NOT NULL AND np.price_kop > 0),
+                   COUNT(*)
             {_MV_JOIN}
             WHERE d.day BETWEEN %s AND %s {store_cond} AND {_MV_ASSORT}
         """, base_params)
-        cnt, total_qty, total_kop, covered_ms, all_ms = cur.fetchone()
+        cnt, total_qty, total_kop, nal_pos, all_pos = cur.fetchone()
 
     if not cnt:
         lines.append("Данных о перемещениях за этот период нет.")
         return "\n".join(lines)
 
-    coverage = (float(covered_ms) / float(all_ms) * 100) if all_ms else 0.0
-    lines.append(f"По закупочным ценам: {coverage:.0f}% стоимости · МойСклад: {100 - coverage:.0f}% (нет закупочной в карточке)")
-    lines.append(f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. · Сумма: {_rub(float(total_kop))} ₽")
+    if int(all_pos or 0):
+        _pct = int(nal_pos or 0) / int(all_pos) * 100
+        _pfx = "⚠️ " if _pct < 90 else ""
+        lines.append(
+            f"{_pfx}Цена «Наличка» известна для {int(nal_pos or 0)} "
+            f"из {int(all_pos)} поз. ({_pct:.0f}% позиций)"
+        )
+    lines.append(
+        f"📋 Документов: {cnt} · Позиций: {_qty(float(total_qty))} ед. "
+        f"· Сумма по «Наличке»: {_rub(float(total_kop))} ₽"
+    )
     lines.append("")
 
     if store_name:
@@ -169,7 +177,8 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
         hidden_ids  = [d[0] for d in hidden_docs]
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(SUM(total_kop), 0) FROM move_item WHERE doc_id = ANY(%s)",
+                f"SELECT COALESCE(SUM({_MV_TOTAL}), 0) {_MV_JOIN} "
+                "WHERE i.doc_id = ANY(%s)",
                 [hidden_ids],
             )
             hidden_kop = float(cur.fetchone()[0] or 0)
@@ -188,33 +197,30 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
             header += f" · {description}"
         lines.append(header)
 
-        # I8: закупочная цена позиции на дату; только товар «Ассортимент».
+        # Только цена «Наличка» на дату документа; только товар «Ассортимент».
         with conn.cursor() as cur:
             cur.execute(f"""
-                SELECT i.product_name, i.qty, i.cost_kop, i.total_kop,
-                       pp.price_kop
+                SELECT i.product_name, i.qty, np.price_kop
                 FROM move_item i
                 LEFT JOIN LATERAL (
-                    SELECT price_kop FROM purchase_price_asof p
-                    WHERE p.product_id = i.product_id AND p.priced_from <= %s
-                    ORDER BY p.priced_from DESC LIMIT 1
-                ) pp ON true
+                    SELECT price_kop FROM nal_price_asof n
+                    WHERE n.product_id = i.product_id AND n.priced_from <= %s
+                    ORDER BY n.priced_from DESC LIMIT 1
+                ) np ON true
                 WHERE i.doc_id = %s AND {_MV_ASSORT}
                 ORDER BY i.total_kop DESC
             """, [doc_day, doc_id])
             positions = cur.fetchall()
 
         doc_total = 0.0
-        for pname, qty, ms_cost, ms_total, purch_price in positions:
-            covered = purch_price is not None and purch_price > 0
-            unit = int(purch_price) if covered else int(ms_cost or 0)
-            pos_total = round(float(qty) * unit) if covered else float(ms_total)
+        for pname, qty, nal in positions:
+            nal_unit = int(nal) if nal else 0
+            pos_total = round(float(qty) * nal_unit) if nal_unit else 0
             doc_total += float(pos_total)
-            star = "" if covered else " *"
-            any_star = any_star or not covered
-            price_str = f"закуп {_rub(unit)} ₽" if unit else "закуп —"
+            star = "" if nal_unit else " *"
+            any_star = any_star or not nal_unit
             lines.append(
-                f"  • {pname}: {_qty(float(qty))} ед. · {price_str} · "
+                f"  • {pname}: {_qty(float(qty))} ед. · {_nal_price(nal_unit)} · "
                 f"{_rub(float(pos_total))} ₽{star}"
             )
         lines.append(f"  Итого: {_qty(float(sum(p[1] for p in positions)))} ед. · {_rub(doc_total)} ₽")
@@ -223,5 +229,5 @@ def build_move_report(conn, d_from: date, d_to: date, store_name: str | None = N
     # total_qty/total_kop — из сводного запроса (не затирать переменной цикла!)
     lines.append(f"═══ ИТОГО: {_qty(float(total_qty))} ед. · {_rub(float(total_kop))} ₽ ═══")
     if any_star:
-        lines.append("* себестоимость МойСклад — нет закупочной цены в карточке")
+        lines.append("* нет цены «Наличка» на дату перемещения — сумма позиции не включена")
     return "\n".join(lines)

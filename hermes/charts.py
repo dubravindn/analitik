@@ -349,3 +349,262 @@ def chart_losses_vs_revenue(
               framealpha=0.95, facecolor=_CREAM, edgecolor=_GRID)
 
     return _save(fig)
+
+
+def chart_forecast_summary(results, subgroups_by_pid: dict) -> "bytes | None":
+    """
+    4 панели на одном PNG — управленческий обзор прогноза закупки СРЕЗКИ.
+
+    results          — list[ForecastResult]
+    subgroups_by_pid — {product_id: subgroup_str}  (из OLD engine / product_dim)
+    """
+    if not _MPL_OK or not results:
+        return None
+
+    # ── агрегация ─────────────────────────────────────────────────────────────
+    group_orders: dict[str, float] = {}
+    store_data:   dict[str, dict]  = {}
+    deficit_items: list[tuple[str, float]] = []
+    n_order = n_zero = n_ok = 0
+
+    for r in results:
+        sg    = subgroups_by_pid.get(r.product_id, "Другое")
+        order = r.recommended_order_qty or 0.0
+        avail = r.available_stock or 0.0
+        dem   = r.expected_demand or 0.0
+
+        if order > 0:
+            group_orders[sg] = group_orders.get(sg, 0.0) + order
+            n_order += 1
+        elif avail <= 0:
+            n_zero += 1
+        else:
+            n_ok += 1
+
+        sname = r.store_name or r.store_id
+        if sname not in store_data:
+            store_data[sname] = {"demand": 0.0, "stock": 0.0, "order": 0.0}
+        store_data[sname]["demand"] += dem
+        store_data[sname]["stock"]  += max(avail, 0.0)
+        store_data[sname]["order"]  += order
+
+        deficit = dem - max(avail, 0.0)
+        if deficit > 0 and order > 0:
+            deficit_items.append((r.product_name, deficit))
+
+    top_groups  = sorted(group_orders.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_deficit = sorted(deficit_items,        key=lambda x: x[1], reverse=True)[:10]
+
+    # ── фигура 2×2 ────────────────────────────────────────────────────────────
+    with plt.rc_context(_base_rcparams()):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=_DPI)
+    fig.patch.set_facecolor(_CREAM)
+    fig.suptitle("Прогноз закупки СРЕЗКИ — управленческий обзор",
+                 fontsize=13, fontweight="bold", color=_INK, y=0.99)
+
+    # ── панель 1: К заказу по группам ─────────────────────────────────────────
+    ax1 = axes[0, 0]
+    ax1.set_facecolor(_CREAM)
+    if top_groups:
+        names, vals = zip(*reversed(top_groups))
+        names = [n[:28] for n in names]
+        bars = ax1.barh(names, vals, color=_SAGE, edgecolor="none", height=0.6)
+        mx = max(vals)
+        for bar, v in zip(bars, vals):
+            ax1.text(v + mx * 0.02, bar.get_y() + bar.get_height() / 2,
+                     f"{int(v)}", va="center", fontsize=8, color=_INK)
+        ax1.set_xlim(0, mx * 1.18)
+        ax1.set_xlabel("шт.", fontsize=9)
+        ax1.xaxis.grid(True, color=_GRID, linewidth=0.6)
+        ax1.yaxis.grid(False)
+        ax1.tick_params(axis="y", labelsize=8)
+    ax1.set_title("К заказу по группам (топ-10)", fontsize=11, fontweight="bold", pad=8)
+    ax1.spines["top"].set_visible(False)
+    ax1.spines["right"].set_visible(False)
+
+    # ── панель 2: по магазинам ─────────────────────────────────────────────────
+    ax2 = axes[0, 1]
+    ax2.set_facecolor(_CREAM)
+    if store_data:
+        stores = list(store_data.keys())
+        short  = [s[:18] for s in stores]
+        xs     = range(len(stores))
+        w      = 0.26
+        ax2.bar([i - w for i in xs], [store_data[s]["demand"] for s in stores],
+                width=w, label="Спрос", color=_INK, alpha=0.65)
+        ax2.bar(list(xs), [store_data[s]["stock"] for s in stores],
+                width=w, label="Остаток", color=_SAGE_L)
+        ax2.bar([i + w for i in xs], [store_data[s]["order"] for s in stores],
+                width=w, label="К заказу", color=_SAGE)
+        ax2.set_xticks(list(xs))
+        ax2.set_xticklabels(short, rotation=18, ha="right", fontsize=8)
+        ax2.set_ylabel("шт.", fontsize=9)
+        ax2.yaxis.grid(True, color=_GRID, linewidth=0.6)
+        ax2.legend(fontsize=8, loc="upper right")
+    ax2.set_title("По магазинам", fontsize=11, fontweight="bold", pad=8)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_visible(False)
+
+    # ── панель 3: статус ассортимента ─────────────────────────────────────────
+    ax3 = axes[1, 0]
+    ax3.set_facecolor(_CREAM)
+    labels_p = ["К заказу", "Нулевой остаток", "Достаточно"]
+    sizes_p  = [n_order, n_zero, n_ok]
+    colors_p = [_SAGE, _TERRA, _SAGE_L]
+    non_zero = [(l, s, c) for l, s, c in zip(labels_p, sizes_p, colors_p) if s > 0]
+    if non_zero:
+        lp, sp, cp = zip(*non_zero)
+        _, _, autotexts = ax3.pie(
+            sp, labels=lp, colors=cp, autopct="%1.0f%%",
+            startangle=90, textprops={"fontsize": 9},
+            wedgeprops={"edgecolor": _CREAM, "linewidth": 1.5},
+        )
+        for at in autotexts:
+            at.set_fontsize(8)
+        ax3.text(0, -1.35, f"Всего SKU: {n_order + n_zero + n_ok}",
+                 ha="center", fontsize=9, color=_INK)
+    ax3.set_title("Статус ассортимента", fontsize=11, fontweight="bold", pad=8)
+
+    # ── панель 4: топ дефицит ─────────────────────────────────────────────────
+    ax4 = axes[1, 1]
+    ax4.set_facecolor(_CREAM)
+    if top_deficit:
+        dnames, dvals = zip(*reversed(top_deficit))
+        dnames = [n[:32] for n in dnames]
+        bars = ax4.barh(dnames, dvals, color=_TERRA, edgecolor="none", height=0.6)
+        mx = max(dvals)
+        for bar, v in zip(bars, dvals):
+            ax4.text(v + mx * 0.02, bar.get_y() + bar.get_height() / 2,
+                     f"{int(v)}", va="center", fontsize=8, color=_INK)
+        ax4.set_xlim(0, mx * 1.18)
+        ax4.set_xlabel("шт. (спрос − остаток)", fontsize=9)
+        ax4.xaxis.grid(True, color=_GRID, linewidth=0.6)
+        ax4.yaxis.grid(False)
+        ax4.tick_params(axis="y", labelsize=8)
+    ax4.set_title("Топ-10 дефицит", fontsize=11, fontweight="bold", pad=8)
+    ax4.spines["top"].set_visible(False)
+    ax4.spines["right"].set_visible(False)
+
+    return _save(fig)
+
+
+def chart_forecast_history(history_rows: list) -> "bytes | None":
+    """
+    Динамика прогноза за последние N запусков.
+
+    history_rows — [(horizon_from, total_order, total_demand, total_stock), ...]
+                   хронологически (старые → новые).
+    """
+    if not _MPL_OK or len(history_rows) < 2:
+        return None
+
+    dates   = [r[0] for r in history_rows]
+    orders  = [float(r[1] or 0) for r in history_rows]
+    demands = [float(r[2] or 0) for r in history_rows]
+    stocks  = [float(r[3] or 0) for r in history_rows]
+    labels  = [d.strftime("%d.%m") if hasattr(d, "strftime") else str(d) for d in dates]
+
+    with plt.rc_context(_base_rcparams()):
+        fig, ax = plt.subplots(figsize=(_W_IN, _H_IN), dpi=_DPI)
+    ax.set_facecolor(_CREAM)
+    fig.patch.set_facecolor(_CREAM)
+
+    xs = range(len(labels))
+    ax.plot(xs, demands, "o-", color=_INK,    label="Спрос",    linewidth=2,   markersize=5)
+    ax.plot(xs, orders,  "s-", color=_SAGE,   label="К заказу", linewidth=2,   markersize=5)
+    ax.plot(xs, stocks,  "^-", color=_SAGE_L, label="Остаток",  linewidth=1.5, markersize=4,
+            linestyle="--")
+
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+    ax.set_ylabel("шт.", fontsize=10)
+    ax.set_title("Динамика прогноза (по неделям)", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9, loc="upper left")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, color=_GRID, linewidth=0.8)
+
+    return _save(fig)
+
+
+def chart_period_summary(
+    curr: dict,
+    prev: dict,
+    label_curr: str = "Текущий",
+    label_prev: str = "Предыдущий",
+) -> bytes | None:
+    """Горизонтальный chart сравнения двух периодов.
+
+    curr / prev — словари из _pdf_summary (ключи: rev, profit, op_expenses,
+    loss, loss_spoil, result). Все значения в копейках.
+    Читабелен на телефоне: горизонтальные бары, 6 метрик.
+    """
+    if not _MPL_OK:
+        return None
+
+    with _MPL_LOCK:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        plt.rcParams.update(_BASE_RCPARAMS)
+
+        def _kk(kop) -> float:
+            return float(kop or 0) / 100 / 1000  # тыс. ₽
+
+        profit_before_c = _kk(curr["profit"]) - _kk(curr["op_expenses"])
+        profit_before_p = _kk(prev["profit"]) - _kk(prev["op_expenses"])
+
+        metrics = [
+            ("Выручка",               _kk(curr["rev"]),      _kk(prev["rev"])),
+            ("Валовая прибыль",        _kk(curr["profit"]),   _kk(prev["profit"])),
+            ("Прибыль до списаний",    profit_before_c,       profit_before_p),
+            ("Прибыль после списаний", _kk(curr["result"]),   _kk(prev["result"])),
+            ("Списания",               _kk(curr["loss"]),     _kk(prev["loss"])),
+            ("Расходы",                _kk(curr["op_expenses"]), _kk(prev["op_expenses"])),
+        ]
+
+        labels = [m[0] for m in metrics]
+        vals_c = [m[1] for m in metrics]
+        vals_p = [m[2] for m in metrics]
+
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=_DPI)
+        fig.patch.set_facecolor(_BASE_RCPARAMS["figure.facecolor"])
+        ax.set_facecolor(_BASE_RCPARAMS["axes.facecolor"])
+
+        x = np.arange(len(labels))
+        w = 0.36
+
+        bars_c = ax.barh(x + w / 2, vals_c, w, color=_SAGE,   label=label_curr, zorder=3)
+        bars_p = ax.barh(x - w / 2, vals_p, w, color=_SAGE_L, label=label_prev, zorder=3)
+
+        ax.set_yticks(x)
+        ax.set_yticklabels(labels, fontsize=11)
+        ax.set_xlabel("тыс. ₽", fontsize=9, color=_INK)
+        ax.grid(axis="x", color=_GRID, linewidth=0.5, zorder=0)
+        ax.legend(fontsize=9, loc="lower right")
+        ax.set_title("Сравнение периодов", fontsize=14, fontweight="bold",
+                     color=_INK, pad=12)
+        ax.invert_yaxis()
+
+        # подписи бар
+        max_val = max((abs(v) for v in vals_c + vals_p if v), default=1)
+        offset  = max_val * 0.015 + 0.3
+        for bar, val in zip(list(bars_c) + list(bars_p),
+                            vals_c + vals_p):
+            if abs(val) < 0.3:
+                continue
+            clr = _SAGE if bar in bars_c else _SAGE_L
+            ax.text(
+                val + (offset if val >= 0 else -offset),
+                bar.get_y() + bar.get_height() / 2,
+                f"{val:.0f}к",
+                va="center",
+                ha="left" if val >= 0 else "right",
+                fontsize=8,
+                color=clr,
+            )
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout(pad=1.2)
+        return _save(fig)
