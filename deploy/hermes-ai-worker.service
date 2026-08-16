@@ -12,6 +12,7 @@ StateDirectory=hermes-ai
 StateDirectoryMode=0770
 UMask=0007
 Environment=CODEX_HOME=/var/lib/hermes-ai/.codex
+Environment=CODEX_BIN=/var/lib/hermes-ai/.local/bin/codex
 Environment=AI_SPOOL_DIR=/var/lib/hermes-ai/spool
 Environment=AI_CODEX_WORKDIR=/tmp
 Environment=AI_CODEX_TIMEOUT=300
