@@ -24,6 +24,12 @@ def ensure_spool() -> tuple[Path, Path, Path]:
     results = root / "results"
     for path in (jobs, processing, results):
         path.mkdir(parents=True, exist_ok=True)
+        # setgid: файлы от бота (hermes) наследуют группу hermes-ai, поэтому
+        # worker читает задания без расширения доступа к основному приложению.
+        try:
+            os.chmod(path, 0o2770)
+        except PermissionError:
+            pass
     return jobs, processing, results
 
 
