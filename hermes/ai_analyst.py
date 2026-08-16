@@ -36,7 +36,8 @@ def _compact_payload(payload: dict[str, Any], rules: dict[str, Any]) -> dict[str
         category = fact.get("category")
         if fid in mandatory or category in {
             "financial", "comparison", "history", "store", "client_churn",
-            "stock", "stock_issue", "zero_stock", "document_audit", "data_quality",
+            "stock", "stock_issue", "zero_stock", "stale_stock",
+            "document_audit", "data_quality",
         }:
             selected.append(fact)
         elif category == "forecast_product":

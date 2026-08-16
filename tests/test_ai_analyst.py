@@ -37,6 +37,12 @@ def test_rules_flag_negative_stock_and_client_churn():
     assert "base_client_churn" in ids
 
 
+def test_rules_include_stale_stock():
+    payload = _payload([_fact("stale.1", "stale_stock", 8, days_on_stock=12)])
+    ids = {item["id"] for item in evaluate_payload(payload)["signals"]}
+    assert "stale_stock" in ids
+
+
 def test_rules_flag_uncovered_customer_order():
     payload = _payload([{
         **_fact("forecast.row.1", "forecast_product", 0),

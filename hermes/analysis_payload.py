@@ -251,13 +251,16 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
 def build_current_state_analysis_payload(conn, token: str | None = None) -> dict:
     """Факты PDF «Состояние на сегодня» без OCR и без новых формул."""
     from .report_current_state import (
-        _latest_day, _stock_rows, _stores_with_data, _zero_order_rows,
-        _zero_order_rows_db,
+        _STALE_DAYS, _last_receipts, _last_sales, _latest_day, _stock_rows,
+        _stores_with_data, _zero_order_rows, _zero_order_rows_db,
     )
 
     snap_day = _latest_day(conn)
     facts: list[dict[str, Any]] = []
-    for store_idx, store_name in enumerate(_stores_with_data(conn, snap_day), 1):
+    last_sales = _last_sales(conn)
+    last_receipts = _last_receipts(conn)
+    stores = _stores_with_data(conn, snap_day)
+    for store_idx, store_name in enumerate(stores, 1):
         rows = _stock_rows(conn, snap_day, store_name)
         total_physical = sum(float(r[3] or 0) for r in rows)
         total_reserve = sum(float(r[4] or 0) for r in rows)
@@ -285,6 +288,23 @@ def build_current_state_analysis_payload(conn, token: str | None = None) -> dict
                         "physical": physical, "reserve": reserve,
                     },
                 ))
+            if float(physical or 0) > 0:
+                last_sale = last_sales.get(pid)
+                days_idle = (snap_day - last_sale).days if last_sale else 9999
+                if days_idle > _STALE_DAYS:
+                    receipt = last_receipts.get(pid)
+                    days_on_stock = (snap_day - receipt).days if receipt else None
+                    facts.append(_fact(
+                        f"stale.{store_idx}.{idx}", "stale_stock", "Дней без продаж",
+                        days_idle if days_idle < 9999 else None, "days",
+                        store=store_name, period=snap_day.isoformat(),
+                        details={
+                            "product_id": pid, "product": name, "group": group,
+                            "physical": physical, "last_sale": last_sale,
+                            "last_receipt": receipt, "days_on_stock": days_on_stock,
+                            "threshold_days": _STALE_DAYS,
+                        },
+                    ))
         zero_rows = (
             _zero_order_rows(conn, token, snap_day, store_name)
             if token else _zero_order_rows_db(conn, snap_day, store_name)
@@ -298,6 +318,34 @@ def build_current_state_analysis_payload(conn, token: str | None = None) -> dict
                     "product_id": pid, "product": name, "group": group,
                     "physical": physical, "reserve": reserve,
                 },
+            ))
+
+    # Тот же NEW engine и тот же горизонт, что в PDF «Состояние на сегодня».
+    if token:
+        try:
+            from . import config
+            from .calc_forecast import SREZKA_STORE_CONFIGS, build_forecast_new
+            today = config.msk_today()
+            monday = today - timedelta(days=today.weekday())
+            horizon_from = monday + timedelta(days=7)
+            horizon_to = horizon_from + timedelta(days=6)
+            forecast_rows = build_forecast_new(
+                conn, token, SREZKA_STORE_CONFIGS,
+                cutoff_date=today, horizon_from=horizon_from, horizon_to=horizon_to,
+            )
+            forecast_payload = build_forecast_analysis_payload(
+                [row for row in forecast_rows if row.store_name in stores],
+                horizon_from, horizon_to,
+            )
+            for fact in forecast_payload["facts"]:
+                cloned = dict(fact)
+                cloned["id"] = f"current.{fact['id']}"
+                facts.append(cloned)
+        except Exception as exc:
+            facts.append(_fact(
+                "data.current_forecast.unavailable", "data_quality",
+                "NEW-прогноз недоступен для AI", 1, "count",
+                period=snap_day.isoformat(), details={"error_type": type(exc).__name__},
             ))
     return _payload(
         "current_state", f"current-state-{snap_day:%Y%m%d}",

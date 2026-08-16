@@ -45,6 +45,14 @@ def evaluate_payload(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             "Позиции входят в утверждённые группы контроля заказа.",
         ))
 
+    stale = [f for f in facts if f.get("category") == "stale_stock"]
+    if stale:
+        signals.append(_signal(
+            "stale_stock", "warning", "Есть залежалые позиции СРЕЗКИ",
+            [f["id"] for f in stale[:5]],
+            "Позиции превысили утверждённый порог дней без продаж; дни на складе считаются отдельно.",
+        ))
+
     audit = [f for f in facts if f.get("category") == "document_audit"]
     if audit:
         signals.append(_signal(
