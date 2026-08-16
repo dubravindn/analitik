@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes — ежедневный PDF и AI-анализ прошлого дня
+After=network-online.target postgresql.service hermes-ai-worker.service
+Wants=network-online.target hermes-ai-worker.service
+
+[Service]
+Type=oneshot
+User=hermes
+WorkingDirectory=/opt/hermes/app
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/opt/hermes/venv/bin/python -m hermes ai-daily
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-ai-daily

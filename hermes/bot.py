@@ -150,6 +150,12 @@ def _clear_state(chat_id: str) -> None:
 
 def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
     log.info("Бот запущен (long-polling)")
+    try:
+        from .ai_queue import start_result_monitor
+        start_result_monitor(conn_factory, bot_token)
+    except Exception as exc:
+        # AI — необязательный слой. Его сбой не имеет права остановить PDF-бота.
+        log.warning("AI result monitor не запущен: %s", exc)
     # При старте диалоги пусты (in-memory). Помечаем, что был рестарт — первое
     # «висячее» нажатие в несуществующий диалог получит понятный ответ.
     _dialog.clear()
@@ -174,6 +180,30 @@ def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
 # ─── диспетчер ────────────────────────────────────────────────────────────────
 
 def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
+    if "callback_query" in upd:
+        callback = upd["callback_query"]
+        from_chat = str(callback.get("from", {}).get("id", ""))
+        allowed_chats = {
+            value.strip() for value in str(chat_id).split(",") if value.strip()
+        }
+        data = str(callback.get("data") or "")
+        if from_chat in allowed_chats and data.startswith("ai_feedback:"):
+            try:
+                _prefix, run_id, value = data.split(":", 2)
+                from .ai_queue import store_feedback
+                conn = conn_factory()
+                ok = store_feedback(conn, run_id, from_chat, value)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                tg.answer_callback_query(
+                    bot_token, str(callback.get("id") or ""),
+                    "Спасибо, учту при настройке приоритетов." if ok else "Не удалось сохранить оценку.",
+                )
+            except Exception as exc:
+                log.warning("AI feedback failed: %s", exc)
+            return
     if "message" not in upd:
         return
     msg = upd["message"]
@@ -543,6 +573,34 @@ def _run_reserves(conn_factory, client_factory, snap_date, store_name, bot_token
     return build_reserve_report(conn, snap_date, store_name)
 
 
+def _queue_ai_background(conn_factory, chat_id: str, payload_builder, report_type: str) -> None:
+    """Собрать факты после PDF и поставить AI-задачу, не блокируя Telegram."""
+    import threading
+
+    def _worker() -> None:
+        conn = None
+        try:
+            from .ai_queue import enqueue_analysis, mode
+            if mode() == "off":
+                return
+            conn = conn_factory()
+            payload = payload_builder(conn)
+            enqueue_analysis(conn, payload, chat_id)
+        except Exception as exc:
+            # Основной документ уже отправлен; AI не влияет на его корректность.
+            log.exception("AI enqueue %s failed: %s", report_type, exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    threading.Thread(
+        target=_worker, name=f"hermes-ai-enqueue-{report_type}", daemon=True,
+    ).start()
+
+
 def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
     import datetime as _dt
     from .calc_forecast import (
@@ -629,6 +687,13 @@ def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
         tg.send_document(bot_token, chat_id, pdf_bytes,
                          f"forecast_{period_safe}.pdf",
                          f"Прогноз закупки {period_label}")
+        _queue_ai_background(
+            conn_factory, chat_id,
+            lambda _conn: __import__(
+                "hermes.analysis_payload", fromlist=["build_forecast_analysis_payload"]
+            ).build_forecast_analysis_payload(results_new, next_mon, next_sun),
+            "forecast",
+        )
     except Exception as e:
         log.exception("Ошибка PDF прогноза: %s", e)
         tg.send_message(bot_token, chat_id, f"⚠️ PDF не сгенерирован: {e}")
@@ -740,6 +805,13 @@ def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, 
         bot_token, chat_id, result[0], f"period_report_{period_safe}.pdf",
         f"Отчёт за {_fmt_period(d_from, d_to)}",
     )
+    _queue_ai_background(
+        conn_factory, chat_id,
+        lambda conn: __import__(
+            "hermes.analysis_payload", fromlist=["build_period_analysis_payload"]
+        ).build_period_analysis_payload(conn, d_from, d_to, client_factory()),
+        "period",
+    )
 
 
 def _run_current_state_pdf_only(conn_factory, bot_token, chat_id):
@@ -775,6 +847,13 @@ def _run_current_state_pdf_only(conn_factory, bot_token, chat_id):
         bot_token, chat_id, result[0],
         f"current_state_{snap_day[0].strftime('%Y%m%d')}.pdf",
         f"Состояние на {snap_day[0].strftime('%d.%m.%Y')}",
+    )
+    _queue_ai_background(
+        conn_factory, chat_id,
+        lambda conn: __import__(
+            "hermes.analysis_payload", fromlist=["build_current_state_analysis_payload"]
+        ).build_current_state_analysis_payload(conn, config.MOYSKLAD_TOKEN()),
+        "current_state",
     )
 
 

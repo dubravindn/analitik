@@ -1,0 +1,31 @@
+[Unit]
+Description=Hermes AI analyst worker (Codex subscription)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes-ai
+Group=hermes-ai
+WorkingDirectory=/opt/hermes/app
+StateDirectory=hermes-ai
+StateDirectoryMode=0770
+UMask=0007
+Environment=CODEX_HOME=/var/lib/hermes-ai/.codex
+Environment=AI_SPOOL_DIR=/var/lib/hermes-ai/spool
+Environment=AI_CODEX_WORKDIR=/tmp
+Environment=AI_CODEX_TIMEOUT=300
+ExecStart=/opt/hermes/venv/bin/python -m hermes ai-worker
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hermes-ai
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-ai-worker
+
+[Install]
+WantedBy=multi-user.target

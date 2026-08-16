@@ -133,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
                             help="За сколько месяцев назад грузить (по умолчанию 12)")
 
     sub.add_parser("bot", help="Запустить Telegram-бот (long-polling, блокирующий)")
+    sub.add_parser("ai-worker", help="Изолированный worker AI-аналитика")
+    sub.add_parser("ai-daily", help="Ежедневные PDF и AI-анализ прошлого дня")
 
     args = parser.parse_args(argv)
 
@@ -296,6 +298,59 @@ def main(argv: list[str] | None = None) -> int:
             bot_token=config.TELEGRAM_BOT_TOKEN(),
             chat_id=config.TELEGRAM_CHAT_ID(),
         )
+        return 0
+
+    if args.cmd == "ai-worker":
+        from .ai_worker import run_forever
+        run_forever()
+        return 0
+
+    if args.cmd == "ai-daily":
+        from .analysis_payload import (
+            build_current_state_analysis_payload,
+            build_period_analysis_payload,
+            combine_daily_payload,
+        )
+        from .ai_queue import enqueue_analysis
+        from .report_current_state import build_current_state_pdf, _latest_day
+        from .report_sales_pdf import build_sales_pdf
+        from .telegram import send_document
+
+        today = config.msk_today()
+        yesterday = today - timedelta(days=1)
+        conn = db.connect(config.DATABASE_URL())
+        client = MoyskladClient(config.MOYSKLAD_TOKEN())
+        chat_ids = [
+            value.strip() for value in str(config.TELEGRAM_CHAT_ID() or "").split(",")
+            if value.strip()
+        ]
+        if not chat_ids:
+            raise RuntimeError("TELEGRAM_CHAT_ID не задан для ai-daily")
+
+        # Те же PDF, что формируют кнопки. ИИ не участвует в их расчёте.
+        period_pdf = build_sales_pdf(
+            conn, yesterday, yesterday, None,
+            include_management_sections=True, client=client,
+        )
+        state_pdf = build_current_state_pdf(conn, config.MOYSKLAD_TOKEN())
+        snap_day = _latest_day(conn)
+        for target in chat_ids:
+            send_document(
+                config.TELEGRAM_BOT_TOKEN(), target, period_pdf,
+                f"period_report_{yesterday:%Y%m%d}.pdf",
+                f"Ежедневный отчёт за {yesterday:%d.%m.%Y}",
+            )
+            send_document(
+                config.TELEGRAM_BOT_TOKEN(), target, state_pdf,
+                f"current_state_{snap_day:%Y%m%d}.pdf",
+                f"Состояние на {snap_day:%d.%m.%Y}",
+            )
+
+        period_payload = build_period_analysis_payload(conn, yesterday, yesterday, client)
+        state_payload = build_current_state_analysis_payload(conn, config.MOYSKLAD_TOKEN())
+        daily_payload = combine_daily_payload(period_payload, state_payload)
+        enqueue_analysis(conn, daily_payload, ",".join(chat_ids))
+        log.info("ai-daily: PDF отправлены, AI job поставлен в очередь")
         return 0
 
     if args.cmd == "daily":

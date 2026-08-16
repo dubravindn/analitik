@@ -333,3 +333,39 @@ CREATE TABLE IF NOT EXISTS enter_item (
 CREATE INDEX IF NOT EXISTS ix_enter_doc_day     ON enter_doc (day);
 CREATE INDEX IF NOT EXISTS ix_enter_doc_store   ON enter_doc (store_id, day);
 CREATE INDEX IF NOT EXISTS ix_enter_item_pid    ON enter_item (product_id);
+
+-- ── Независимый AI-анализ отчётов ──────────────────────────────────────────
+-- В payload хранятся только структурированные факты отчёта. Токены МойСклад,
+-- Telegram и данные авторизации Codex сюда никогда не записываются.
+CREATE TABLE IF NOT EXISTS ai_analysis_run (
+    id              text        PRIMARY KEY,
+    report_type     text        NOT NULL,
+    report_id       text        NOT NULL,
+    chat_id         text        NOT NULL,
+    payload_hash    text        NOT NULL,
+    prompt_version  text        NOT NULL,
+    model           text        NOT NULL,
+    mode            text        NOT NULL CHECK (mode IN ('shadow', 'live')),
+    status          text        NOT NULL,
+    payload_json    jsonb       NOT NULL,
+    raw_response    text,
+    validated_json  jsonb,
+    error           text,
+    duration_ms     integer,
+    attempts        integer,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    completed_at    timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS ix_ai_analysis_report
+    ON ai_analysis_run (report_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_ai_analysis_status
+    ON ai_analysis_run (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ai_feedback (
+    run_id      text        NOT NULL REFERENCES ai_analysis_run(id) ON DELETE CASCADE,
+    chat_id     text        NOT NULL,
+    value       text        NOT NULL CHECK (value IN ('up', 'down')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, chat_id)
+);

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hermes — ежедневный AI-анализ в 08:30 МСК
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Europe/Moscow
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
