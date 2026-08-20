@@ -47,6 +47,7 @@ def main_reply_keyboard() -> dict:
         "keyboard": [
             [{"text": "📊 Отчёт за период"}],
             [{"text": "📦 Состояние на сегодня"}],
+            [{"text": "🧠 Спросить ИИ"}],
             [{"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,

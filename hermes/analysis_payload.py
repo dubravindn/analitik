@@ -19,6 +19,7 @@ _BASE_STORE = "База Воровского 107/1"
 _METRICS = (
     ("rev", "Выручка", "kop"),
     ("profit", "Валовая прибыль", "kop"),
+    ("before", "Прибыль до списаний", "kop"),
     ("op_expenses", "Операционные расходы", "kop"),
     ("loss", "Списания", "kop"),
     ("result", "Прибыль после списаний", "kop"),
@@ -29,6 +30,8 @@ _METRICS = (
 _MONTH_HISTORY_METRICS = (
     ("rev", "Выручка", "kop"),
     ("profit", "Валовая прибыль", "kop"),
+    ("before", "Прибыль до списаний", "kop"),
+    ("result", "Прибыль после списаний", "kop"),
     ("checks", "Чеки", "count"),
     ("avg_check", "Средний чек", "kop"),
 )
@@ -137,11 +140,18 @@ def _payload(report_type: str, report_id: str, period: dict[str, str], facts: li
 
 def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -> dict:
     """Факты управленческого отчёта и четыре понятных сравнения."""
-    from .report_pdf import _pdf_summary
+    from . import calc
+    from .report_sales_pdf import _period_metrics
     from .report_clients import get_churn_clients
 
     facts: list[dict[str, Any]] = []
-    selected = _pdf_summary(conn, d_from, d_to, None)
+    discount_pids = calc.discount_product_ids(conn)
+
+    def summary(a: date, b: date, store: str | None = None) -> dict:
+        # Ровно та же функция и та же скидка поставщика, что в принятом PDF.
+        return _period_metrics(conn, a, b, store, discount_pids)
+
+    selected = summary(d_from, d_to)
     selected_label = f"{d_from:%d.%m.%Y}–{d_to:%d.%m.%Y}"
     for key, label, unit in _METRICS:
         facts.append(_fact(
@@ -151,8 +161,8 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
 
     # Сравнения день/неделя/месяц/год используют одинаковую методику отчёта.
     for window, cur_from, cur_to, prev_from, prev_to in _comparison_windows(d_to):
-        current = _pdf_summary(conn, cur_from, cur_to, None)
-        previous = _pdf_summary(conn, prev_from, prev_to, None)
+        current = summary(cur_from, cur_to)
+        previous = summary(prev_from, prev_to)
         cur_label = f"{cur_from:%d.%m.%Y}–{cur_to:%d.%m.%Y}"
         prev_label = f"{prev_from:%d.%m.%Y}–{prev_to:%d.%m.%Y}"
         for key, label, unit in _METRICS:
@@ -217,20 +227,23 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
             covered_days = int((cur.fetchone() or (0,))[0])
 
         hist_label = f"{hist_from:%d.%m.%Y}–{hist_to:%d.%m.%Y}"
+        complete = covered_days >= expected_days
         facts.append(_fact(
             f"history.month_{offset:02d}.coverage", "data_quality",
             "Покрытие исторического месяца", covered_days, "days",
             period=hist_label,
             details={
                 "expected_days": expected_days,
-                "complete": covered_days >= expected_days,
+                "complete": complete,
                 "months_back": offset,
             },
         ))
-        if covered_days < expected_days:
+        if not complete:
             continue
 
-        historical = _pdf_summary(conn, hist_from, hist_to, None)
+        # Полное покрытие — это статус источника, а не предупреждение.
+        facts[-1]["category"] = "source_status"
+        historical = summary(hist_from, hist_to)
         for key, label, unit in _MONTH_HISTORY_METRICS:
             facts.append(_fact(
                 f"history.month_{offset:02d}.{key}", "history",

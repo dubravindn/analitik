@@ -10,7 +10,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .ai_analyst import PROMPT_VERSION, render_telegram_summary
+from .ai_analyst import (
+    PROMPT_VERSION,
+    QUESTION_PROMPT_VERSION,
+    render_telegram_answer,
+    render_telegram_summary,
+)
 from .ai_worker import ensure_spool
 
 
@@ -37,6 +42,10 @@ def enqueue_analysis(conn, payload: dict[str, Any], chat_id: str, *, force_mode:
         return None
     run_id = str(uuid.uuid4())
     jobs, _processing, _results = ensure_spool()
+    prompt_version = (
+        QUESTION_PROMPT_VERSION if payload.get("report_type") == "question"
+        else PROMPT_VERSION
+    )
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO ai_analysis_run
@@ -45,7 +54,7 @@ def enqueue_analysis(conn, payload: dict[str, Any], chat_id: str, *, force_mode:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s::jsonb, now())
         """, (
             run_id, payload.get("report_type"), payload.get("report_id"), str(chat_id),
-            payload.get("payload_hash"), PROMPT_VERSION,
+            payload.get("payload_hash"), prompt_version,
             os.environ.get("AI_CODEX_MODEL", "subscription-default"), run_mode,
             json.dumps(payload, ensure_ascii=False, default=str),
         ))
@@ -117,7 +126,10 @@ def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
             for target in str(result.get("chat_id") or "").split(","):
                 if target.strip():
                     tg.send_message(
-                        bot_token, target.strip(), render_telegram_summary(result),
+                        bot_token, target.strip(),
+                        render_telegram_answer(result)
+                        if result.get("report_type") == "question"
+                        else render_telegram_summary(result),
                         _feedback_markup(run_id),
                     )
             log.info("AI live result delivered: %s", run_id)
@@ -126,7 +138,9 @@ def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
                 if target.strip():
                     tg.send_message(
                         bot_token, target.strip(),
-                        "⚠️ ИИ-анализ временно недоступен. Основной PDF сформирован корректно.",
+                        "⚠️ ИИ временно не смог подготовить ответ. Попробуйте повторить вопрос."
+                        if result.get("report_type") == "question"
+                        else "⚠️ ИИ-анализ временно недоступен. Основной PDF сформирован корректно.",
                     )
     finally:
         try:

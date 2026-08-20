@@ -5,7 +5,13 @@ from datetime import date
 
 import pytest
 
-from hermes.ai_analyst import AIValidationError, validate_response
+from hermes.ai_analyst import (
+    AIValidationError,
+    render_telegram_answer,
+    validate_question_response,
+    validate_response,
+)
+from hermes.ai_question import parse_question_period
 from hermes.analysis_payload import (
     _month_start_back,
     build_forecast_analysis_payload,
@@ -142,3 +148,55 @@ def test_daily_payload_prefixes_fact_ids():
 def test_month_start_back_crosses_year_boundary():
     assert _month_start_back(date(2026, 1, 16), 1) == date(2025, 12, 1)
     assert _month_start_back(date(2026, 8, 16), 12) == date(2025, 8, 1)
+
+
+def test_question_periods_in_russian_and_follow_up_context():
+    today = date(2026, 8, 20)
+    assert parse_question_period("что было вчера?", today) == (
+        date(2026, 8, 19), date(2026, 8, 19),
+    )
+    assert parse_question_period("за прошлую неделю", today) == (
+        date(2026, 8, 10), date(2026, 8, 16),
+    )
+    assert parse_question_period("за июль 2026", today) == (
+        date(2026, 7, 1), date(2026, 7, 31),
+    )
+    assert parse_question_period(
+        "а по БАЗЕ?", today, (date(2026, 7, 1), date(2026, 7, 31)),
+    ) == (date(2026, 7, 1), date(2026, 7, 31))
+
+
+def test_question_validator_rebuilds_evidence_and_rejects_invented_number():
+    payload = {
+        "report_id": "question-1", "report_type": "question",
+        "period": {"from": "2026-08-01", "to": "2026-08-20"},
+        "facts": [{
+            **_fact("period.selected.rev", "financial", 1_500_000),
+            "evidence": "Выручка: 15 000 ₽ · 01.08.2026–20.08.2026",
+        }, {
+            **_fact("period.selected.loss", "financial", 9_999_900),
+            "evidence": "Списания: 99 999 ₽ · 01.08.2026–20.08.2026",
+        }],
+    }
+    response = {
+        "status": "ok", "report_id": "question-1", "report_type": "question",
+        "answer": "Выручка составила 15 000 ₽.",
+        "fact_ids": ["period.selected.rev"],
+        "caveats": ["Период неполный. [period.selected.rev]"], "follow_up": "",
+    }
+    validated = validate_question_response(response, payload)
+    assert validated["evidence"] == ["Выручка: 15 000 ₽ · 01.08.2026–20.08.2026"]
+    assert validated["caveats"] == ["Период неполный."]
+    bad = {**response, "answer": "Выручка составила 99 999 ₽."}
+    with pytest.raises(AIValidationError):
+        validate_question_response(bad, payload)
+
+
+def test_question_renderer_is_compact_and_fact_backed():
+    text = render_telegram_answer({"validated": {
+        "answer": "Выручка выросла.", "evidence": ["Выручка: 15 000 ₽"],
+        "caveats": [], "follow_up": "Сравнить по складам?",
+    }})
+    assert text.startswith("🧠 Ответ")
+    assert "Подтверждение:" in text
+    assert "Сравнить по складам?" in text

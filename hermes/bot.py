@@ -97,7 +97,7 @@ _PERIOD_BUTTONS: dict[str, str] = {
 _HELP_TEXT = """\
 📋 Hermes — аналитика цветочной базы
 
-Две кнопки:
+Основные возможности:
 
 📊 Отчёт за период
   Выбираешь период → получаешь PDF:
@@ -106,6 +106,14 @@ _HELP_TEXT = """\
 📦 Состояние на сегодня
   Без выбора периода → PDF по каждому складу:
   прогноз закупки, остатки, залежалые, резервы.
+
+🧠 Спросить ИИ
+  Напишите вопрос обычным сообщением, например:
+  «Почему снизилась прибыль за эту неделю?»
+  «Какой склад просел и за счёт чего?»
+  «Что с клиентами БАЗЫ без заказов?»
+
+ИИ отвечает только по фактам из базы, указывает период и подтверждение.
 
 Клавиатуру можно скрыть стрелкой ↓ внизу
 и вернуть касанием иконки клавиатуры.
@@ -246,6 +254,17 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     if norm in ("❓ помощь", "/помощь", "/help", "помощь"):
         _clear_state(chat_id)
         tg.send_message(bot_token, chat_id, _HELP_TEXT, tg.main_reply_keyboard())
+        return
+
+    if norm in ("🧠 спросить ии", "спросить ии", "/спросить", "/ask"):
+        _clear_state(chat_id)
+        tg.send_message(
+            bot_token, chat_id,
+            "🧠 Напишите вопрос обычным сообщением. Можно спрашивать о продажах, "
+            "прибыли, расходах, списаниях, складах, товарах, клиентах, остатках, "
+            "закупках и прогнозе.",
+            tg.main_reply_keyboard(),
+        )
         return
 
     # ── Кнопка главного меню → начать диалог (или выполнить сразу) ──
@@ -1309,9 +1328,82 @@ def _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id):
         d_from, d_to = _parse_last_n(args)
         _exec_employees(client_factory, d_from, d_to, bot_token, chat_id)
     else:
-        tg.send_message(bot_token, chat_id,
-                        "Нажмите кнопку меню или отправьте /помощь.",
-                        tg.main_reply_keyboard())
+        question = text.strip()
+        if cmd in ("ask", "спросить"):
+            question = " ".join(args).strip()
+        if question:
+            _run_ai_question(conn_factory, question, bot_token, chat_id)
+        else:
+            tg.send_message(bot_token, chat_id,
+                            "Напишите вопрос после команды или обычным сообщением.",
+                            tg.main_reply_keyboard())
+
+
+def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) -> None:
+    """Build a read-only fact pack and enqueue one conversational AI answer."""
+    import threading
+
+    from .ai_queue import enqueue_analysis, mode
+
+    if mode() != "live":
+        tg.send_message(
+            bot_token, chat_id,
+            "⚠️ Диалог с ИИ сейчас выключен. PDF-отчёты продолжают работать.",
+            tg.main_reply_keyboard(),
+        )
+        return
+
+    conn = conn_factory()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM ai_analysis_run
+                WHERE report_type='question' AND chat_id=%s AND status='queued'
+                  AND created_at > now() - interval '7 minutes'
+                """,
+                (str(chat_id),),
+            )
+            pending = int((cur.fetchone() or (0,))[0])
+    finally:
+        conn.close()
+    if pending:
+        tg.send_message(bot_token, chat_id, "⏳ Предыдущий вопрос ещё анализируется.")
+        return
+
+    tg.send_message(
+        bot_token, chat_id,
+        "🧠 Проверяю цифры и источники. Обычно ответ занимает до минуты.",
+    )
+
+    def _worker() -> None:
+        work_conn = None
+        try:
+            from .ai_question import build_question_analysis_payload
+            work_conn = conn_factory()
+            payload = build_question_analysis_payload(work_conn, question, chat_id)
+            run_id = enqueue_analysis(work_conn, payload, chat_id, force_mode="live")
+            log.info("AI question queued: %s chat=%s", run_id, chat_id)
+        except Exception as exc:
+            log.exception("AI question enqueue failed: %s", exc)
+            try:
+                tg.send_message(
+                    bot_token, chat_id,
+                    "⚠️ Не удалось подготовить данные для ответа. Попробуйте ещё раз чуть позже.",
+                    tg.main_reply_keyboard(),
+                )
+            except Exception:
+                pass
+        finally:
+            if work_conn is not None:
+                try:
+                    work_conn.close()
+                except Exception:
+                    pass
+
+    threading.Thread(
+        target=_worker, name="hermes-ai-question", daemon=True,
+    ).start()
 
 
 def _exec_cashflow(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
@@ -1439,7 +1531,7 @@ def _get_updates(bot_token: str, offset: int, timeout: int = 30) -> list[dict]:
     url = (
         f"https://api.telegram.org/bot{bot_token}/getUpdates"
         f"?offset={offset}&timeout={timeout}"
-        f"&allowed_updates=%5B%22message%22%5D"
+        f"&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D"
     )
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout + 10) as resp:

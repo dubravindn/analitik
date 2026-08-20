@@ -1,5 +1,5 @@
 """Тесты разбиения длинных сообщений Telegram по границам строк (пункт 1.4)."""
-from hermes.telegram import _split
+from hermes.telegram import _split, main_reply_keyboard
 
 
 def test_short_text_single_chunk():
@@ -29,3 +29,8 @@ def test_mixed_normal_and_oversized():
     text = "aaa\n" + "Y" * 250 + "\nbbb"
     parts = _split(text, 100)
     assert all(len(p) <= 100 for p in parts)
+
+
+def test_main_keyboard_exposes_ai_conversation():
+    labels = [button["text"] for row in main_reply_keyboard()["keyboard"] for button in row]
+    assert "🧠 Спросить ИИ" in labels

@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from .ai_analyst import run_codex_analysis
+from .ai_analyst import run_codex_analysis, run_codex_question
 
 
 log = logging.getLogger("hermes.ai_worker")
@@ -56,7 +56,10 @@ def process_one() -> bool:
     try:
         job = json.loads(active.read_text(encoding="utf-8"))
         run_id = str(job["run_id"])
-        result = run_codex_analysis(job["payload"])
+        if job["payload"].get("report_type") == "question":
+            result = run_codex_question(job["payload"])
+        else:
+            result = run_codex_analysis(job["payload"])
         result.update({
             "run_id": run_id,
             "chat_id": str(job.get("chat_id") or ""),
