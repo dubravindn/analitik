@@ -254,20 +254,33 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
 
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT store_name, COALESCE(SUM(revenue_kop), 0), COALESCE(SUM(checks), 0)
+            SELECT store_name
             FROM sales_by_store_day
             WHERE day BETWEEN %s AND %s
+              AND channel = ANY(%s)
             GROUP BY store_name ORDER BY SUM(revenue_kop) DESC
-        """, (d_from, d_to))
-        for idx, (store_name, revenue, checks) in enumerate(cur.fetchall(), 1):
+        """, (d_from, d_to, ["розница", "опт", "ресторан"]))
+        store_names = [row[0] for row in cur.fetchall()]
+    for idx, store_name in enumerate(store_names, 1):
+        store_metrics = summary(d_from, d_to, store_name)
+        for key, label, unit in (
+            ("rev", "Выручка склада", "kop"),
+            ("profit", "Валовая прибыль склада", "kop"),
+            ("checks", "Чеки склада", "count"),
+            ("avg_check", "Средний чек склада", "kop"),
+        ):
             facts.append(_fact(
-                f"store.{idx}.revenue", "store", "Выручка склада", revenue,
-                "kop", store=store_name, period=selected_label,
+                f"store.{idx}.{key}", "store", label, store_metrics[key], unit,
+                store=store_name, period=selected_label,
             ))
-            facts.append(_fact(
-                f"store.{idx}.checks", "store", "Чеки склада", checks,
-                "count", store=store_name, period=selected_label,
-            ))
+        margin = (
+            float(store_metrics["profit"]) / float(store_metrics["rev"]) * 100
+            if store_metrics["rev"] else 0
+        )
+        facts.append(_fact(
+            f"store.{idx}.gross_margin", "store", "Валовая маржа склада",
+            round(margin, 2), "pct", store=store_name, period=selected_label,
+        ))
 
     for idx, row in enumerate(get_churn_clients(
         conn, limit=None, store_name=_BASE_STORE, inactive_days=10,
