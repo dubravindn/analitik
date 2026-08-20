@@ -1374,6 +1374,7 @@ def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) 
     tg.send_message(
         bot_token, chat_id,
         "🧠 Проверяю цифры и источники. Обычно ответ занимает до минуты.",
+        tg.main_reply_keyboard(),
     )
 
     def _worker() -> None:
