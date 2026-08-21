@@ -40,10 +40,24 @@ def test_other_group_is_rejected():
 
 
 def test_group_menu_names_both_bots():
-    assert "@CBDOt4et_bot" in bot._GROUP_MENU_TEXT
-    assert "@CBDanalitik_bot" in bot._GROUP_MENU_TEXT
-    assert "/period@CBDanalitik_bot" in bot._GROUP_MENU_TEXT
+    assert "📊 Аналитика" in bot._GROUP_MENU_TEXT
+    assert "👥 Работа сотрудников" in bot._GROUP_MENU_TEXT
 
 
 def test_addressed_command_is_normalized():
     assert bot._command_name("/ask@CBDanalitik_bot Кто просел?") == "ask"
+
+
+def test_command_target_routes_only_to_addressed_bot():
+    assert bot._command_target("/ask@CBDanalitik_bot Кто просел?") == "cbdanalitik_bot"
+    assert bot._command_target("/menu@CBDOt4et_bot") == "cbdot4et_bot"
+    assert bot._command_target("/menu") == ""
+
+
+def test_reply_is_routed_only_to_analytics_bot():
+    message = _message(-5228125278, 1914630610, "Почему просела выручка?")
+    message["reply_to_message"] = {
+        "from": {"username": "CBDanalitik_bot"},
+    }
+    assert bot._is_reply_to_bot(message, "CBDanalitik_bot") is True
+    assert bot._is_reply_to_bot(message, "CBDOt4et_bot") is False

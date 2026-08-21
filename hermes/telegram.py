@@ -72,6 +72,35 @@ def main_reply_keyboard() -> dict:
     }
 
 
+def shared_group_keyboard() -> dict:
+    """Первый уровень общего меню двух ботов в закрытой группе."""
+    return {
+        "keyboard": [
+            [{"text": "📊 Аналитика"}, {"text": "👥 Работа сотрудников"}],
+            [{"text": "🏠 Общее меню"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def analytics_group_keyboard() -> dict:
+    """Второй уровень общего меню — действия бизнес-аналитика."""
+    return {
+        "keyboard": [
+            [{"text": "📊 Отчёт за период"}],
+            [
+                {"text": "📦 Состояние на сегодня"},
+                {"text": "🛒 Прогноз"},
+            ],
+            [{"text": "🧠 Задать вопрос аналитику"}],
+            [{"text": "⬅️ Общее меню"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
 def legacy_reply_keyboard() -> dict:
     """Старое меню — rollback, не показывается пользователю."""
     return {

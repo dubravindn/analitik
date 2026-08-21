@@ -128,18 +128,16 @@ _HELP_TEXT = """\
 _GROUP_MENU_TEXT = """\
 🏠 ОБЩЕЕ МЕНЮ РУКОВОДИТЕЛЕЙ
 
-👥 Работа сотрудников · @CBDOt4et_bot
-/ask@CBDOt4et_bot Кто сейчас на смене?
-/group_status@CBDOt4et_bot — статус закрытой группы
+Выберите раздел кнопкой ниже:
 
-📊 Бизнес-аналитика · @CBDanalitik_bot
-/ask@CBDanalitik_bot Почему снизилась прибыль за неделю?
-/period@CBDanalitik_bot — PDF за период
-/today@CBDanalitik_bot — состояние БАЗЫ сегодня
-/forecast@CBDanalitik_bot — прогноз закупки
-
-Можно отвечать на сообщение нужного бота обычным текстом.\
+📊 Аналитика — отчёты, период, прогноз и вопросы по бизнесу.
+👥 Работа сотрудников — смены, сотрудники, нарушения и выплаты.\
 """
+
+_ANALYTICS_BUTTON = "📊 аналитика"
+_EMPLOYEES_BUTTON = "👥 работа сотрудников"
+_ROOT_MENU_BUTTONS = {"🏠 общее меню", "⬅️ общее меню"}
+_ANALYTICS_QUESTION_BUTTON = "🧠 задать вопрос аналитику"
 
 # ─── состояние диалога (in-memory, один пользователь) ────────────────────────
 
@@ -187,6 +185,14 @@ def _command_name(text: str) -> str:
     return first[1:].split("@", 1)[0].casefold()
 
 
+def _command_target(text: str) -> str:
+    """Username из адресной команды ``/name@bot`` или пустая строка."""
+    first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+    if not first.startswith("/") or "@" not in first:
+        return ""
+    return first.split("@", 1)[1].casefold()
+
+
 def _message_access(msg: dict, configured: str) -> tuple[bool, str, str, bool]:
     """(разрешено, chat_id, user_id, группа) для Telegram message."""
     chat = msg.get("chat") or {}
@@ -197,6 +203,19 @@ def _message_access(msg: dict, configured: str) -> tuple[bool, str, str, bool]:
     if is_group:
         return chat_id in allowed and user_id in _leader_ids(allowed), chat_id, user_id, True
     return chat_id in allowed, chat_id, user_id or chat_id, False
+
+
+def _is_reply_to_bot(msg: dict, username: str) -> bool:
+    sender = ((msg.get("reply_to_message") or {}).get("from") or {})
+    return str(sender.get("username") or "").casefold() == username.casefold()
+
+
+def _main_keyboard(chat_id: str) -> dict:
+    return (
+        tg.analytics_group_keyboard()
+        if str(chat_id).startswith("-")
+        else tg.main_reply_keyboard()
+    )
 
 
 # ─── главный цикл ─────────────────────────────────────────────────────────────
@@ -292,27 +311,49 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     log.info("Сообщение: %s", text[:80])
     norm = text.lower().strip()
     command = _command_name(text)
+    if is_group:
+        target_bot = _command_target(text)
+        if target_bot and target_bot != "cbdanalitik_bot":
+            return
 
     # ── Отмена диалога ──
     if norm in ("🚫 отмена", "/отмена", "отмена"):
         _clear_state(state_key)
-        tg.send_message(bot_token, chat_id, "❌ Отменено.", tg.main_reply_keyboard())
+        tg.send_message(bot_token, chat_id, "❌ Отменено.", _main_keyboard(chat_id))
         return
 
-    if norm == "меню" or command in ("menu", "меню", "start"):
+    if (
+        norm == "меню" or norm in _ROOT_MENU_BUTTONS
+        or command in ("menu", "меню", "start")
+    ):
         _clear_state(state_key)
         if is_group:
-            tg.send_message(bot_token, chat_id, _GROUP_MENU_TEXT)
+            tg.send_message(
+                bot_token, chat_id, _GROUP_MENU_TEXT, tg.shared_group_keyboard(),
+            )
         else:
             tg.send_message(bot_token, chat_id,
                             "📋 Меню восстановлено.", tg.main_reply_keyboard())
+        return
+
+    if is_group and norm == _EMPLOYEES_BUTTON:
+        # Эту кнопку обработает @CBDOt4et_bot. Аналитик молчит.
+        return
+
+    if is_group and norm == _ANALYTICS_BUTTON:
+        _clear_state(state_key)
+        tg.send_message(
+            bot_token, chat_id,
+            "📊 АНАЛИТИКА\n\nВыберите отчёт или задайте вопрос.",
+            tg.analytics_group_keyboard(),
+        )
         return
 
     # ── Снять залипший флаг выгрузки вручную ──
     if norm in ("/unlock", "/разблокировать"):
         synclock.clear()
         tg.send_message(bot_token, chat_id,
-                        "🔓 Флаг выгрузки снят. Отчёты доступны.", tg.main_reply_keyboard())
+                        "🔓 Флаг выгрузки снят. Отчёты доступны.", _main_keyboard(chat_id))
         return
 
     # ── Помощь ──
@@ -321,20 +362,22 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         tg.send_message(
             bot_token, chat_id,
             _GROUP_MENU_TEXT if is_group else _HELP_TEXT,
-            None if is_group else tg.main_reply_keyboard(),
+            tg.shared_group_keyboard() if is_group else tg.main_reply_keyboard(),
         )
         return
 
-    if norm in ("🧠 спросить ии", "спросить ии") or (
+    if norm in ("🧠 спросить ии", "спросить ии", _ANALYTICS_QUESTION_BUTTON) or (
         command in ("спросить", "ask") and len(text.split(maxsplit=1)) == 1
     ):
         _clear_state(state_key)
+        if is_group:
+            _set_state(state_key, "ai_question", "question", {})
         tg.send_message(
             bot_token, chat_id,
             "🧠 Напишите вопрос обычным сообщением. Можно спрашивать о продажах, "
             "прибыли, расходах, списаниях, складах, товарах, клиентах, остатках, "
             "закупках и прогнозе.",
-            tg.main_reply_keyboard(),
+            _main_keyboard(chat_id),
         )
         return
 
@@ -357,6 +400,21 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
             "Доступ есть только у двух разрешённых руководителей.",
         )
         return
+
+
+    state = _get_state(state_key)
+    if state and state.get("section") == "ai_question":
+        _clear_state(state_key)
+        _run_ai_question(conn_factory, text, bot_token, chat_id)
+        return
+
+    if is_group and not command and not state:
+        allowed_button = norm in _BUTTON_TO_SECTION
+        direct_reply = _is_reply_to_bot(msg, "CBDanalitik_bot")
+        if not allowed_button and not direct_reply:
+            # При выключенной Group Privacy оба бота видят общий чат. Всё, что
+            # не адресовано аналитику, он обязан молча пропустить.
+            return
 
     # ── Кнопка главного меню → начать диалог (или выполнить сразу) ──
     section = _BUTTON_TO_SECTION.get(norm)
@@ -384,7 +442,7 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         globals()["_restarted"] = False
         tg.send_message(bot_token, chat_id,
                         f"⚠️ Сессия сброшена{note}. Начни заново — выбери раздел из меню.",
-                        tg.main_reply_keyboard())
+                        _main_keyboard(chat_id))
         return
 
     # ── Прямые команды (без диалога) ──
@@ -539,7 +597,7 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
                 f"⏳ Идёт перевыгрузка данных ({name}, уже ~{mins} мин). "
                 f"«{section}» пока не собираю, чтобы не зависнуть — повтори чуть позже "
                 f"(или /unlock, если синк точно завершён).",
-                tg.main_reply_keyboard(),
+                _main_keyboard(chat_id),
             )
             return
         tg.send_message(
@@ -618,7 +676,7 @@ def _execute(section, params, chat_id, conn_factory, client_factory, bot_token):
         log.exception("Ошибка при формировании отчёта %s: %s", section, e)
         text = f"⚠️ Ошибка при формировании отчёта: {e}"
 
-    tg.send_message(bot_token, chat_id, text, tg.main_reply_keyboard())
+    tg.send_message(bot_token, chat_id, text, _main_keyboard(chat_id))
 
 
 # ─── выполнение конкретных секций ────────────────────────────────────────────
@@ -641,11 +699,11 @@ def _run_sales(conn_factory, client_factory, d_from, d_to, store_name, bot_token
         if store_name:
             caption += f" | {store_name}"
         tg.send_document(bot_token, chat_id, pdf_bytes, filename, caption)
-        tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
+        tg.send_message(bot_token, chat_id, "✅ PDF готов.", _main_keyboard(chat_id))
     except Exception as e:
         log.exception("Ошибка PDF продаж: %s", e)
         tg.send_message(bot_token, chat_id,
-                        f"⚠️ Ошибка при генерации PDF: {e}", tg.main_reply_keyboard())
+                        f"⚠️ Ошибка при генерации PDF: {e}", _main_keyboard(chat_id))
 
 
 def _run_stock(conn_factory, client_factory, snap_date, store_name, folder_group,
@@ -817,7 +875,7 @@ def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
         log.exception("Ошибка PDF прогноза: %s", e)
         tg.send_message(bot_token, chat_id, f"⚠️ PDF не сгенерирован: {e}")
 
-    tg.send_message(bot_token, chat_id, "✅ Прогноз готов.", tg.main_reply_keyboard())
+    tg.send_message(bot_token, chat_id, "✅ Прогноз готов.", _main_keyboard(chat_id))
 
 
 def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
@@ -1133,7 +1191,7 @@ def _run_current_state(conn_factory, client_factory, bot_token, chat_id):
         tg.send_message(
             bot_token, chat_id,
             "⏳ PDF формируется дольше 6 минут, попробуй позже.",
-            tg.main_reply_keyboard(),
+            _main_keyboard(chat_id),
         )
         return
 
@@ -1142,7 +1200,7 @@ def _run_current_state(conn_factory, client_factory, bot_token, chat_id):
         tg.send_message(
             bot_token, chat_id,
             f"⚠️ Ошибка PDF: {pdf_error[0]}",
-            tg.main_reply_keyboard(),
+            _main_keyboard(chat_id),
         )
         return
 
@@ -1152,7 +1210,7 @@ def _run_current_state(conn_factory, client_factory, bot_token, chat_id):
         f"current_state_{snap_day.strftime('%Y%m%d')}.pdf",
         f"Состояние на {snap_day.strftime('%d.%m.%Y')}",
     )
-    tg.send_message(bot_token, chat_id, "✅ Готово.", tg.main_reply_keyboard())
+    tg.send_message(bot_token, chat_id, "✅ Готово.", _main_keyboard(chat_id))
 
 
 def _save_forecast_run(conn, results, horizon_from, horizon_to):
@@ -1279,7 +1337,7 @@ def _run_pdf(conn_factory, client_factory, d_from, d_to, store_name, bot_token, 
             bot_token, chat_id,
             "⏳ Сборка PDF заняла дольше 3 минут (возможно, идёт перевыгрузка данных). "
             "Если файл так и не пришёл — повтори позже.",
-            tg.main_reply_keyboard(),
+            _main_keyboard(chat_id),
         )
 
 
@@ -1383,11 +1441,11 @@ def _build_and_send_pdf(conn_factory, client_factory, d_from, d_to, store_name, 
         except Exception as _ex:
             log.warning("Ошибка импорта charts: %s", _ex)
 
-        tg.send_message(bot_token, chat_id, "✅ PDF готов.", tg.main_reply_keyboard())
+        tg.send_message(bot_token, chat_id, "✅ PDF готов.", _main_keyboard(chat_id))
     except Exception as e:
         log.exception("Ошибка PDF: %s", e)
         tg.send_message(bot_token, chat_id,
-                        f"⚠️ Ошибка при генерации PDF: {e}", tg.main_reply_keyboard())
+                        f"⚠️ Ошибка при генерации PDF: {e}", _main_keyboard(chat_id))
 
 
 def _run_loss(conn_factory, client_factory, d_from, d_to, store_name, bot_token, chat_id):
@@ -1436,7 +1494,7 @@ def _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id):
         else:
             tg.send_message(bot_token, chat_id,
                             "Напишите вопрос после команды или обычным сообщением.",
-                            tg.main_reply_keyboard())
+                            _main_keyboard(chat_id))
 
 
 def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) -> None:
@@ -1449,7 +1507,7 @@ def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) 
         tg.send_message(
             bot_token, chat_id,
             "⚠️ Диалог с ИИ сейчас выключен. PDF-отчёты продолжают работать.",
-            tg.main_reply_keyboard(),
+            _main_keyboard(chat_id),
         )
         return
 
@@ -1474,7 +1532,7 @@ def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) 
     tg.send_message(
         bot_token, chat_id,
         "🧠 Проверяю цифры и источники. Обычно ответ занимает до минуты.",
-        tg.main_reply_keyboard(),
+        _main_keyboard(chat_id),
     )
 
     def _worker() -> None:
@@ -1491,7 +1549,7 @@ def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) 
                 tg.send_message(
                     bot_token, chat_id,
                     "⚠️ Не удалось подготовить данные для ответа. Попробуйте ещё раз чуть позже.",
-                    tg.main_reply_keyboard(),
+                    _main_keyboard(chat_id),
                 )
             except Exception:
                 pass
@@ -1518,7 +1576,7 @@ def _exec_cashflow(conn_factory, client_factory, d_from, d_to, bot_token, chat_i
             tg.send_message(bot_token, chat_id, "⏳ Подгружаю платежи…")
             etl_cashflow(client, conn, d_from, d_to)
     tg.send_message(bot_token, chat_id,
-                    build_cashflow_report(conn, d_from, d_to), tg.main_reply_keyboard())
+                    build_cashflow_report(conn, d_from, d_to), _main_keyboard(chat_id))
 
 
 def _exec_supply(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
@@ -1532,14 +1590,14 @@ def _exec_supply(conn_factory, client_factory, d_from, d_to, bot_token, chat_id)
             tg.send_message(bot_token, chat_id, "⏳ Подгружаю поставки…")
             etl_supply(client, conn, d_from, d_to)
     tg.send_message(bot_token, chat_id,
-                    build_supply_report(conn, d_from, d_to), tg.main_reply_keyboard())
+                    build_supply_report(conn, d_from, d_to), _main_keyboard(chat_id))
 
 
 def _exec_employees(client_factory, d_from, d_to, bot_token, chat_id):
     from .report_employees import build_employee_report
     client = client_factory()
     tg.send_message(bot_token, chat_id,
-                    build_employee_report(client, d_from, d_to), tg.main_reply_keyboard())
+                    build_employee_report(client, d_from, d_to), _main_keyboard(chat_id))
 
 
 # ─── вспомогательные ─────────────────────────────────────────────────────────
