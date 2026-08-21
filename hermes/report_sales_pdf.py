@@ -308,6 +308,9 @@ def _append_loss_position_table(
             pdf.add_page()
             pk.section_header(pdf, f"Списания - {_trunc(store_name, 58)} (продолжение)")
             _header()
+        # section_header/_header используют жирный шрифт; каждая строка данных
+        # должна начинаться с обычного независимо от разрыва страницы.
+        pdf.set_font("DejaVu", size=7.5)
 
         y0 = pdf.get_y()
         if row_idx % 2 == 0:
