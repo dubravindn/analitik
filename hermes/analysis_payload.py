@@ -354,7 +354,7 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
                 if stripped.startswith("•"):
                     facts.append(_fact(
                         f"audit.{audit_kind}.{idx}", "document_audit",
-                        "Удалённый документ" if audit_kind == "deleted" else "Важное изменение заказа или отгрузки",
+                        "Удалённый документ" if audit_kind == "deleted" else "Изменённый документ",
                         1, "count", period=selected_label,
                         details={"document": stripped.lstrip("• ")},
                     ))

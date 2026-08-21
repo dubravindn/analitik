@@ -5,7 +5,7 @@ from hermes import report_audit
 
 
 class _FakeClient:
-    """Проверяет, что общий аудит документов больше не запрашивается."""
+    """Пустой общий аудит с фиксацией запрошенных endpoint."""
 
     def __init__(self, deleted_rows=None, doc_rows=None):
         self.deleted_rows = deleted_rows or []
@@ -16,25 +16,54 @@ class _FakeClient:
         self.paths.append(path)
         if path == "/audit":
             return {"meta": {"size": 0}, "rows": []}
-        raise AssertionError(f"Лишний запрос общего аудита: {path}")
+        return {"meta": {"size": 0}, "rows": []}
 
 
 def test_audit_empty_message():
     text = report_audit.build_audit_report(
         _FakeClient(), date(2026, 8, 5), date(2026, 8, 5),
     )
-    assert "нет изменений дат и снижений цены ниже «Налички»" in text
+    assert "важных изменений и удалений документов нет" in text
     assert "УДАЛЁННЫЕ" not in text and "ИЗМЕНЁННЫЕ" not in text
 
 
-def test_loss_and_other_general_documents_are_not_requested_or_rendered():
-    client = _FakeClient()
+def test_receipts_and_payments_remain_but_loss_is_not_requested_or_rendered():
+    class Client(_FakeClient):
+        def _get(self, path, params):
+            self.paths.append(path)
+            if path == "/audit":
+                return {"meta": {"size": 0}, "rows": []}
+            if path.startswith("/entity/loss"):
+                raise AssertionError("Документы списания запрашивать нельзя")
+            if path == "/entity/supply/deleted":
+                return {"rows": [{
+                    "deletedMoment": "2026-08-05 10:00:00",
+                    "sum": 1_250_000,
+                    "store": {"name": "База Воровского 107/1"},
+                    "owner": {"name": "Иванов"},
+                    "name": "ПР-00123",
+                }]}
+            if path == "/entity/paymentout":
+                return {"meta": {"size": 1}, "rows": [{
+                    "moment": "2026-08-05 09:00:00",
+                    "updated": "2026-08-05 09:05:00",
+                    "sum": 34_000_000,
+                    "project": {"name": "База Воровского 107/1"},
+                    "owner": {"name": "Петров"},
+                    "name": "ПЛ-00456",
+                }]}
+            return {"meta": {"size": 0}, "rows": []}
+
+    client = Client()
     text = report_audit.build_audit_report(
         client, date(2026, 8, 5), date(2026, 8, 5),
     )
-    assert all(path == "/audit" for path in client.paths)
+    assert "Приёмки № ПР-00123" in text
+    assert "Исходящие платежи № ПЛ-00456" in text
+    assert any(path.startswith("/entity/supply") for path in client.paths)
+    assert any(path.startswith("/entity/paymentout") for path in client.paths)
+    assert not any(path.startswith("/entity/loss") for path in client.paths)
     assert "Списания" not in text
-    assert "Поставки" not in text
 
 
 def _position(name, product_id, price, discount=0, quantity=1):

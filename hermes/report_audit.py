@@ -1,9 +1,12 @@
-"""Точечный аудит заказов покупателей и отгрузок из МойСклад.
+"""Аудит важных изменений документов из МойСклад.
 
-Показываются только управленчески значимые события из настоящего ``/audit``:
-изменение даты документа и снижение фактической цены позиции ниже действующей
-цены «Наличка». Списания, приёмки, платежи и остальные документы сюда не входят.
-Количество, резерв, статус и добавление/удаление позиций намеренно скрыты.
+Приёмки, платежи, расходные ордера и торговые документы остаются в общем
+контроле изменений и удалений. Документы списания намеренно исключены.
+
+Для заказов покупателей и отгрузок используется настоящий журнал ``/audit``.
+Показываются только изменение даты документа и снижение фактической цены позиции
+ниже действующей цены «Наличка». Количество, резерв, статус и добавление/удаление
+позиций намеренно скрыты.
 """
 from __future__ import annotations
 
@@ -11,6 +14,14 @@ from datetime import date, datetime, timedelta
 import time
 
 from .moysklad import MoyskladClient
+
+_DOC_TYPES = {
+    "retaildemand": "Розничные продажи",
+    "salesreturn":  "Возвраты покупателей",
+    "supply":       "Приёмки",
+    "cashout":      "Расходные ордера",
+    "paymentout":   "Исходящие платежи",
+}
 
 _CUSTOMER_ORDER = "customerorder"
 _DEMAND = "demand"
@@ -32,6 +43,42 @@ _AUDIT_REQUEST_PAUSE_SECONDS = 0.15
 # В служебных карточках встречается sentinel 99 999 999 999 ₽.
 # Цена товара выше миллиона рублей не считается валидной «Наличкой».
 _MAX_CASH_PRICE_RUB = 1_000_000
+
+_NO_STORE = "(без склада)"
+# updated считается «изменением», если он позже moment минимум на столько
+# (МойСклад ставит updated ≈ moment при создании; правки — позже на минуты).
+_EDIT_GAP = timedelta(minutes=2)
+
+
+def _location(doc: dict) -> str:
+    """Склад документа: store.name → project.name → «(без склада)»."""
+    store = doc.get("store")
+    if isinstance(store, dict) and store.get("name"):
+        return store["name"]
+    project = doc.get("project")
+    if isinstance(project, dict) and project.get("name"):
+        return project["name"]
+    return _NO_STORE
+
+
+def _owner(doc: dict) -> str:
+    owner = doc.get("owner")
+    if isinstance(owner, dict) and owner.get("name"):
+        return owner["name"]
+    return "—"
+
+
+def _number(doc: dict) -> str:
+    """Номер документа МойСклад; ID используем только как последний фолбэк."""
+    value = doc.get("name") or doc.get("externalCode") or doc.get("id") or "—"
+    return str(value)
+
+
+def _rub(sum_kop) -> str:
+    try:
+        return f"{float(sum_kop) / 100:,.0f}".replace(",", " ") + " ₽"
+    except (TypeError, ValueError):
+        return "—"
 
 def _dt(s: str) -> datetime | None:
     """Разобрать момент МойСклад «YYYY-MM-DD HH:MM:SS[.ms]» в datetime."""
@@ -390,7 +437,7 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
         d_from.strftime("%d.%m.%Y") if d_from == d_to
         else f"{d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')}"
     )
-    lines = [f"🔍 Изменения заказов и отгрузок за {period_str}", ""]
+    lines = [f"🔍 Изменения документов за {period_str}", ""]
 
     if client is None:
         lines.append("⚠️ МойСклад недоступен — данные об изменениях не получены.")
@@ -409,21 +456,106 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
         # без diff нельзя доказать ни изменение даты, ни низкую цену.
         sales_audit_error = type(exc).__name__
 
-    if not sales_audit:
+    # Общий контроль документов. Списаний в _DOC_TYPES нет: endpoint loss не
+    # запрашивается и документ не может попасть в отчёт.
+    del_flt = (
+        f"deletedMoment>={d_from.isoformat()} 00:00:00;"
+        f"deletedMoment<={d_to.isoformat()} 23:59:59"
+    )
+    deleted: list[tuple] = []
+    for doc_type, label in _DOC_TYPES.items():
+        try:
+            resp = client._get(f"/entity/{doc_type}/deleted", {
+                "filter": del_flt,
+                "limit": 100,
+                "order": "deletedMoment,asc",
+                "expand": "store,project,owner",
+            })
+            rows = resp.get("rows", [])
+        except Exception:
+            continue
+        for row in rows:
+            deleted_dt = _dt(str(row.get("deletedMoment") or row.get("moment", "")))
+            deleted.append((
+                deleted_dt.isoformat() if deleted_dt else "",
+                deleted_dt.strftime("%d.%m.%Y") if deleted_dt else "—",
+                label, _number(row), _location(row), row.get("sum"), _owner(row),
+            ))
+
+    doc_flt = (
+        f"moment>={d_from.isoformat()} 00:00:00;"
+        f"moment<={d_to.isoformat()} 23:59:59"
+    )
+    modified: list[tuple] = []
+    for doc_type, label in _DOC_TYPES.items():
+        try:
+            rows: list[dict] = []
+            offset = 0
+            while True:
+                resp = client._get(f"/entity/{doc_type}", {
+                    "filter": doc_flt,
+                    "limit": 100,
+                    "offset": offset,
+                    "order": "moment,asc",
+                    "expand": "store,project,owner",
+                })
+                batch = resp.get("rows", [])
+                rows.extend(batch)
+                size = resp.get("meta", {}).get("size", 0)
+                offset += len(batch)
+                if not batch or offset >= size:
+                    break
+        except Exception:
+            continue
+        for row in rows:
+            moment_dt = _dt(str(row.get("moment", "")))
+            updated_dt = _dt(str(row.get("updated", "")))
+            if moment_dt and updated_dt and (updated_dt - moment_dt) >= _EDIT_GAP:
+                modified.append((
+                    moment_dt.strftime("%d.%m.%Y"),
+                    updated_dt.strftime("%d.%m.%Y"),
+                    label, _number(row), _location(row), row.get("sum"), _owner(row),
+                ))
+
+    if not sales_audit and not deleted and not modified:
         if sales_audit_error:
             lines.append(
                 "⚠️ Детализация заказов и отгрузок временно недоступна "
                 f"({sales_audit_error})."
             )
             return "\n".join(lines)
-        lines.append(
-            "✅ За период нет изменений дат и снижений цены ниже «Налички» "
-            "в заказах покупателей и отгрузках."
-        )
+        lines.append("✅ За период важных изменений и удалений документов нет.")
         return "\n".join(lines)
 
-    lines.extend(_render_sales_document_audit(
-        sales_audit, sales_audit_total, sales_audit_truncated,
-    ))
+    if sales_audit:
+        lines.extend(_render_sales_document_audit(
+            sales_audit, sales_audit_total, sales_audit_truncated,
+        ))
+        lines.append("")
+    elif sales_audit_error:
+        lines.append(
+            "⚠️ Детализация заказов и отгрузок временно недоступна "
+            f"({sales_audit_error})."
+        )
+        lines.append("")
+
+    if deleted:
+        deleted.sort(key=lambda item: item[0])
+        lines.append(f"🗑 УДАЛЁННЫЕ ({len(deleted)}):")
+        for _sort, day, label, number, location, sum_kop, who in deleted:
+            lines.append(
+                f"  • {label} № {number} · {day} · {location} · "
+                f"{_rub(sum_kop)} · {who}"
+            )
+        lines.append("")
+
+    if modified:
+        modified.sort(key=lambda item: item[0])
+        lines.append(f"✏️ ИЗМЕНЁННЫЕ ({len(modified)}):")
+        for moment_day, updated_day, label, number, location, sum_kop, who in modified:
+            lines.append(
+                f"  • {label} № {number} · {moment_day} · {location} · "
+                f"{_rub(sum_kop)} · {who} (изм. {updated_day})"
+            )
 
     return "\n".join(lines).rstrip()
