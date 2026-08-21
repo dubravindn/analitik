@@ -63,7 +63,9 @@ _ASOF = """
 _PCOST = (
     "CASE "
     "WHEN pp.price_kop IS NOT NULL AND pp.price_kop > 0 "
-    "THEN round(spd.sell_qty * pp.price_kop) "
+    "THEN round(spd.sell_qty * pp.price_kop * "
+    "CASE WHEN spd.assortment_id = ANY(%s::text[]) "
+    f"THEN {config.SUPPLIER_DISCOUNT_MULTIPLIER}::numeric ELSE 1.0 END) "
     "ELSE round(spd.revenue_kop * 0.6) END"
 )
 _UNCOV = "bool_or(pp.price_kop IS NULL OR pp.price_kop <= 0)"
@@ -725,7 +727,7 @@ def build_sales_pdf(
                   )
                 GROUP BY spd.product_name
                 ORDER BY SUM(spd.revenue_kop) DESC LIMIT 40
-            """, [d_from, d_to, sid, "Ассортимент/%"])
+            """, [sorted(discount_pids), d_from, d_to, sid, "Ассортимент/%"])
             store_top = cur.fetchall()
             if store_top:
                 top_by_store.append((sn, store_top))
