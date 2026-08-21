@@ -39,6 +39,23 @@ def answer_callback_query(
     })
 
 
+def set_my_commands(
+    bot_token: str,
+    commands: list[tuple[str, str]],
+    scope: dict | None = None,
+) -> dict:
+    """Зарегистрировать команды Telegram для меню ``/``."""
+    payload: dict = {
+        "commands": [
+            {"command": command, "description": description}
+            for command, description in commands
+        ],
+    }
+    if scope:
+        payload["scope"] = scope
+    return _post(bot_token, "setMyCommands", payload)
+
+
 # ─── клавиатуры ───────────────────────────────────────────────────────────────
 
 def main_reply_keyboard() -> dict:

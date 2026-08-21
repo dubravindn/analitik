@@ -72,6 +72,7 @@ MOYSKLAD_TOKEN = lambda: get("MOYSKLAD_TOKEN", required=True)  # noqa: E731
 DATABASE_URL = lambda: get("DATABASE_URL", required=True)      # noqa: E731
 TELEGRAM_BOT_TOKEN = lambda: get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = lambda: get("TELEGRAM_CHAT_ID")
+TELEGRAM_GROUP_CHAT_ID = lambda: get("TELEGRAM_GROUP_CHAT_ID")
 
 
 # --- Список складов для меню бота и фильтрации ---

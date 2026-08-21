@@ -125,6 +125,22 @@ _HELP_TEXT = """\
   /меню                   — показать клавиатуру\
 """
 
+_GROUP_MENU_TEXT = """\
+🏠 ОБЩЕЕ МЕНЮ РУКОВОДИТЕЛЕЙ
+
+👥 Работа сотрудников · @CBDOt4et_bot
+/ask@CBDOt4et_bot Кто сейчас на смене?
+/group_status@CBDOt4et_bot — статус закрытой группы
+
+📊 Бизнес-аналитика · @CBDanalitik_bot
+/ask@CBDanalitik_bot Почему снизилась прибыль за неделю?
+/period@CBDanalitik_bot — PDF за период
+/today@CBDanalitik_bot — состояние БАЗЫ сегодня
+/forecast@CBDanalitik_bot — прогноз закупки
+
+Можно отвечать на сообщение нужного бота обычным текстом.\
+"""
+
 # ─── состояние диалога (in-memory, один пользователь) ────────────────────────
 
 _dialog: dict[str, dict] = {}  # chat_id → state
@@ -154,10 +170,52 @@ def _clear_state(chat_id: str) -> None:
     _dialog.pop(chat_id, None)
 
 
+def _configured_chats(value: str) -> set[str]:
+    return {item.strip() for item in str(value).split(",") if item.strip()}
+
+
+def _leader_ids(allowed_chats: set[str]) -> set[str]:
+    """Положительные ID в конфигурации — личные аккаунты руководителей."""
+    return {item for item in allowed_chats if not item.startswith("-")}
+
+
+def _command_name(text: str) -> str:
+    """Имя команды без ``/`` и ``@bot``; пустая строка для обычного текста."""
+    first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+    if not first.startswith("/"):
+        return ""
+    return first[1:].split("@", 1)[0].casefold()
+
+
+def _message_access(msg: dict, configured: str) -> tuple[bool, str, str, bool]:
+    """(разрешено, chat_id, user_id, группа) для Telegram message."""
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id", ""))
+    user_id = str((msg.get("from") or {}).get("id", ""))
+    is_group = chat.get("type") in {"group", "supergroup"} or chat_id.startswith("-")
+    allowed = _configured_chats(configured)
+    if is_group:
+        return chat_id in allowed and user_id in _leader_ids(allowed), chat_id, user_id, True
+    return chat_id in allowed, chat_id, user_id or chat_id, False
+
+
 # ─── главный цикл ─────────────────────────────────────────────────────────────
 
 def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
     log.info("Бот запущен (long-polling)")
+    try:
+        commands = [
+            ("menu", "Общее меню двух ботов"),
+            ("ask", "Задать вопрос бизнес-аналитику"),
+            ("period", "Сформировать PDF за период"),
+            ("today", "Состояние БАЗЫ на сегодня"),
+            ("forecast", "Прогноз закупки"),
+            ("help", "Помощь"),
+        ]
+        tg.set_my_commands(bot_token, commands)
+        tg.set_my_commands(bot_token, commands, {"type": "all_group_chats"})
+    except Exception as exc:
+        log.warning("Не удалось обновить меню команд Telegram: %s", exc)
     try:
         from .ai_queue import start_result_monitor
         start_result_monitor(conn_factory, bot_token)
@@ -190,17 +248,23 @@ def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
 def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     if "callback_query" in upd:
         callback = upd["callback_query"]
-        from_chat = str(callback.get("from", {}).get("id", ""))
-        allowed_chats = {
-            value.strip() for value in str(chat_id).split(",") if value.strip()
-        }
+        actor_id = str(callback.get("from", {}).get("id", ""))
+        callback_chat = str(
+            ((callback.get("message") or {}).get("chat") or {}).get("id", actor_id)
+        )
+        allowed_chats = _configured_chats(chat_id)
+        is_group = callback_chat.startswith("-")
+        authorized = (
+            callback_chat in allowed_chats and actor_id in _leader_ids(allowed_chats)
+            if is_group else actor_id in allowed_chats
+        )
         data = str(callback.get("data") or "")
-        if from_chat in allowed_chats and data.startswith("ai_feedback:"):
+        if authorized and data.startswith("ai_feedback:"):
             try:
                 _prefix, run_id, value = data.split(":", 2)
                 from .ai_queue import store_feedback
                 conn = conn_factory()
-                ok = store_feedback(conn, run_id, from_chat, value)
+                ok = store_feedback(conn, run_id, callback_chat, value)
                 try:
                     conn.close()
                 except Exception:
@@ -215,32 +279,33 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     if "message" not in upd:
         return
     msg = upd["message"]
-    from_chat = str(msg.get("chat", {}).get("id", ""))
     text = (msg.get("text") or "").strip()
-    allowed_chats = {
-        value.strip()
-        for value in str(chat_id).split(",")
-        if value.strip()
-    }
-    if from_chat not in allowed_chats or not text:
+    authorized, target_chat, user_id, is_group = _message_access(msg, chat_id)
+    if not authorized or not text:
         return
 
-    # Отвечаем именно тому разрешённому пользователю, который отправил сообщение.
-    chat_id = from_chat
+    # В группе ответы идут в общий чат, а пошаговый диалог изолирован по
+    # руководителю. История AI при этом остаётся общей, потому что её ключ — chat_id.
+    chat_id = target_chat
+    state_key = f"{chat_id}:{user_id}" if is_group else chat_id
 
     log.info("Сообщение: %s", text[:80])
     norm = text.lower().strip()
+    command = _command_name(text)
 
     # ── Отмена диалога ──
     if norm in ("🚫 отмена", "/отмена", "отмена"):
-        _clear_state(chat_id)
+        _clear_state(state_key)
         tg.send_message(bot_token, chat_id, "❌ Отменено.", tg.main_reply_keyboard())
         return
 
-    if norm in ("/меню", "меню", "/start"):
-        _clear_state(chat_id)
-        tg.send_message(bot_token, chat_id,
-                        "📋 Меню восстановлено.", tg.main_reply_keyboard())
+    if norm == "меню" or command in ("menu", "меню", "start"):
+        _clear_state(state_key)
+        if is_group:
+            tg.send_message(bot_token, chat_id, _GROUP_MENU_TEXT)
+        else:
+            tg.send_message(bot_token, chat_id,
+                            "📋 Меню восстановлено.", tg.main_reply_keyboard())
         return
 
     # ── Снять залипший флаг выгрузки вручную ──
@@ -251,13 +316,19 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         return
 
     # ── Помощь ──
-    if norm in ("❓ помощь", "/помощь", "/help", "помощь"):
-        _clear_state(chat_id)
-        tg.send_message(bot_token, chat_id, _HELP_TEXT, tg.main_reply_keyboard())
+    if norm in ("❓ помощь", "помощь") or command in ("помощь", "help"):
+        _clear_state(state_key)
+        tg.send_message(
+            bot_token, chat_id,
+            _GROUP_MENU_TEXT if is_group else _HELP_TEXT,
+            None if is_group else tg.main_reply_keyboard(),
+        )
         return
 
-    if norm in ("🧠 спросить ии", "спросить ии", "/спросить", "/ask"):
-        _clear_state(chat_id)
+    if norm in ("🧠 спросить ии", "спросить ии") or (
+        command in ("спросить", "ask") and len(text.split(maxsplit=1)) == 1
+    ):
+        _clear_state(state_key)
         tg.send_message(
             bot_token, chat_id,
             "🧠 Напишите вопрос обычным сообщением. Можно спрашивать о продажах, "
@@ -267,21 +338,44 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         )
         return
 
+    if command == "period":
+        _clear_state(state_key)
+        _start_dialog("period_report", chat_id, bot_token, state_key)
+        return
+    if command == "today":
+        _clear_state(state_key)
+        _execute("current_state", {}, chat_id, conn_factory, client_factory, bot_token)
+        return
+    if command == "forecast":
+        _clear_state(state_key)
+        _execute("forecast", {}, chat_id, conn_factory, client_factory, bot_token)
+        return
+    if command in ("group_status", "bind_group") and is_group:
+        tg.send_message(
+            bot_token, chat_id,
+            f"✅ Закрытая группа подключена к @CBDanalitik_bot. ID: {chat_id}\n"
+            "Доступ есть только у двух разрешённых руководителей.",
+        )
+        return
+
     # ── Кнопка главного меню → начать диалог (или выполнить сразу) ──
     section = _BUTTON_TO_SECTION.get(norm)
     if section in _DIALOG_STEPS:
-        _clear_state(chat_id)
+        _clear_state(state_key)
         if not _DIALOG_STEPS[section]:
             # Секция без шагов — выполняем немедленно
             _execute(section, {}, chat_id, conn_factory, client_factory, bot_token)
         else:
-            _start_dialog(section, chat_id, bot_token)
+            _start_dialog(section, chat_id, bot_token, state_key)
         return
 
     # ── Продолжение диалога ──
-    state = _get_state(chat_id)
+    state = _get_state(state_key)
     if state:
-        _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, bot_token)
+        _continue_dialog(
+            state, text, norm, chat_id, conn_factory, client_factory, bot_token,
+            state_key,
+        )
         return
 
     # ── Висячее нажатие sub-кнопки без активного диалога (напр. бот перезапускался) ──
@@ -299,10 +393,12 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
 
 # ─── диалог: начало ───────────────────────────────────────────────────────────
 
-def _start_dialog(section: str, chat_id: str, bot_token: str) -> None:
+def _start_dialog(
+    section: str, chat_id: str, bot_token: str, state_key: str | None = None,
+) -> None:
     steps = _DIALOG_STEPS[section]
     first_step = steps[0]
-    _set_state(chat_id, section, first_step, {})
+    _set_state(state_key or chat_id, section, first_step, {})
     _ask_step(section, first_step, chat_id, bot_token, {})
 
 
@@ -337,7 +433,11 @@ def _ask_step(
 
 # ─── диалог: продолжение ─────────────────────────────────────────────────────
 
-def _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, bot_token):
+def _continue_dialog(
+    state, text, norm, chat_id, conn_factory, client_factory, bot_token,
+    state_key: str | None = None,
+):
+    state_key = state_key or chat_id
     section = state["section"]
     step    = state["step"]
     params  = state["params"]
@@ -356,10 +456,10 @@ def _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, b
                     params["_groups"] = fetch_groups(conn, snap_date) if snap_date else []
                 except Exception:
                     params["_groups"] = []
-            _set_state(chat_id, section, next_step, params)
+            _set_state(state_key, section, next_step, params)
             _ask_step(section, next_step, chat_id, bot_token, params)
         else:
-            _clear_state(chat_id)
+            _clear_state(state_key)
             _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
 
     # ── Шаг: период ──
@@ -407,11 +507,11 @@ def _continue_dialog(state, text, norm, chat_id, conn_factory, client_factory, b
         norm_map = {f"📁 {g}".lower(): g for g in groups}
         if norm == "📦 все группы":
             params["folder_group"] = None
-            _clear_state(chat_id)
+            _clear_state(state_key)
             _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
         elif norm in norm_map:
             params["folder_group"] = norm_map[norm]
-            _clear_state(chat_id)
+            _clear_state(state_key)
             _execute(section, params, chat_id, conn_factory, client_factory, bot_token)
         else:
             tg.send_message(bot_token, chat_id,

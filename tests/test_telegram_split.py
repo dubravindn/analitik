@@ -1,5 +1,5 @@
 """Тесты разбиения длинных сообщений Telegram по границам строк (пункт 1.4)."""
-from hermes.telegram import _split, main_reply_keyboard
+from hermes.telegram import _split, main_reply_keyboard, set_my_commands
 
 
 def test_short_text_single_chunk():
@@ -34,3 +34,22 @@ def test_mixed_normal_and_oversized():
 def test_main_keyboard_exposes_ai_conversation():
     labels = [button["text"] for row in main_reply_keyboard()["keyboard"] for button in row]
     assert "🧠 Спросить ИИ" in labels
+
+
+def test_set_my_commands_serializes_scope(monkeypatch):
+    captured = {}
+
+    def fake_post(_token, method, payload):
+        captured.update({"method": method, "payload": payload})
+        return {"ok": True}
+
+    monkeypatch.setattr("hermes.telegram._post", fake_post)
+    set_my_commands(
+        "token", [("menu", "Общее меню")], {"type": "all_group_chats"},
+    )
+
+    assert captured["method"] == "setMyCommands"
+    assert captured["payload"]["commands"] == [
+        {"command": "menu", "description": "Общее меню"},
+    ]
+    assert captured["payload"]["scope"] == {"type": "all_group_chats"}

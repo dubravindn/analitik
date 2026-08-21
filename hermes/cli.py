@@ -292,11 +292,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             log.warning("apply_schema при старте не удался (%s) — продолжаю, "
                         "схема, вероятно, уже применена; при изменениях запусти migrate", e)
+        allowed_chats = ",".join(
+            value for value in (
+                str(config.TELEGRAM_CHAT_ID() or "").strip(),
+                str(config.TELEGRAM_GROUP_CHAT_ID() or "").strip(),
+            ) if value
+        )
         run_bot(
             conn_factory=lambda: db.connect(config.DATABASE_URL()),
             client_factory=lambda: MoyskladClient(config.MOYSKLAD_TOKEN()),
             bot_token=config.TELEGRAM_BOT_TOKEN(),
-            chat_id=config.TELEGRAM_CHAT_ID(),
+            chat_id=allowed_chats,
         )
         return 0
 
