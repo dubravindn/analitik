@@ -38,6 +38,14 @@ def _rub(kop: int | float) -> str:
     return sign + f"{rub:,}".replace(",", " ")
 
 
+def _qty(value: int | float) -> str:
+    """Количество без лишнего нуля после запятой."""
+    number = float(value or 0)
+    if number.is_integer():
+        return f"{int(number):,}".replace(",", " ")
+    return f"{number:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+
+
 def _pct(a, b) -> str:
     return f"{a / b * 100:.0f}" if b else "0"
 
@@ -173,6 +181,195 @@ def _get_losses_by_store(
         total += v
     result["__total__"] = total
     return result
+
+
+def _get_loss_details_by_store(
+    conn, d_from: date, d_to: date,
+    discount_pids: frozenset | set[str] | None = None,
+) -> dict[str, list[tuple]]:
+    """Все позиции списаний, сгруппированные по отделу/складу.
+
+    В отличие от P&L-суммы здесь намеренно не исключаются склады
+    инвентаризационных корректировок: владелец просит видеть, что конкретно
+    списали в каждом отделе. Для ООО «Поставщик» используется та же скидка 7%,
+    что и в основной финансовой части отчёта.
+    """
+    disc_list = sorted(discount_pids or [])
+    has_disc = bool(disc_list)
+    multiplier = config.SUPPLIER_DISCOUNT_MULTIPLIER
+    disc_case = (
+        " * CASE WHEN i.product_id = ANY(%s::text[]) "
+        f"THEN {multiplier}::numeric ELSE 1.0 END"
+        if has_disc else ""
+    )
+    # disc_case используется дважды: в цене единицы и в сумме строки.
+    params: list = ([disc_list, disc_list] if has_disc else []) + [d_from, d_to]
+
+    unit_expr = f"""CASE
+        WHEN i.product_id IS NOT NULL
+             AND pp.price_kop IS NOT NULL AND pp.price_kop > 0
+            THEN round(pp.price_kop{disc_case})
+        ELSE i.cost_kop END"""
+    total_expr = f"""CASE
+        WHEN i.product_id IS NOT NULL
+             AND pp.price_kop IS NOT NULL AND pp.price_kop > 0
+            THEN round(i.qty * pp.price_kop{disc_case})
+        ELSE i.total_kop END"""
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT d.store_name, d.day, d.moment, d.doc_id,
+                   i.product_name, i.qty,
+                   COALESCE({unit_expr}, 0) AS unit_kop,
+                   COALESCE({total_expr}, 0) AS total_kop
+            FROM loss_doc d
+            JOIN loss_item i ON i.doc_id = d.doc_id
+            LEFT JOIN LATERAL (
+                SELECT price_kop FROM purchase_price_asof p
+                WHERE i.product_id IS NOT NULL
+                  AND p.product_id = i.product_id AND p.priced_from <= d.day
+                ORDER BY p.priced_from DESC LIMIT 1
+            ) pp ON true
+            WHERE d.day BETWEEN %s AND %s
+            ORDER BY d.store_name, d.moment, d.doc_id, i.product_name
+        """, params)
+        rows = cur.fetchall()
+
+    result: dict[str, list[tuple]] = {}
+    for store, day, moment, doc_id, product, qty, unit_kop, total_kop in rows:
+        result.setdefault(store or "(без отдела)", []).append((
+            day, moment, doc_id, product or "(без названия)",
+            float(qty or 0), int(unit_kop or 0), int(total_kop or 0),
+        ))
+    return result
+
+
+def _wrap_pdf_text(pdf: pk.HermesPDF, text: str, width: float) -> list[str]:
+    """Перенос текста по фактической ширине шрифта без обрезания названия."""
+    words: list[str] = []
+    for raw_word in str(text).split():
+        if pdf.get_string_width(raw_word) <= width:
+            words.append(raw_word)
+            continue
+        # Названия часто содержат длинные сочетания через «/» без пробелов.
+        # Делим такой фрагмент по символам, иначе он выйдет за правую границу.
+        part = ""
+        for char in raw_word:
+            if part and pdf.get_string_width(part + char) > width:
+                words.append(part)
+                part = char
+            else:
+                part += char
+        if part:
+            words.append(part)
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = current + " " + word
+        if pdf.get_string_width(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _append_loss_position_table(
+    pdf: pk.HermesPDF, store_name: str, rows: list[tuple],
+) -> None:
+    """Таблица всех строк списания с переносом длинных названий."""
+    headers = ["Дата", "Товар", "Кол-во", "Закупка/ед.", "Сумма"]
+    widths = [20.0, 78.0, 20.0, 28.0, 28.0]
+    aligns = ["L", "L", "R", "R", "R"]
+    line_h = 4.2
+
+    def _header() -> None:
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu_B", size=7.5)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_fill_color(*pk.INK)
+        for idx, (header, width, align) in enumerate(zip(headers, widths, aligns)):
+            pdf.cell(
+                width, 6.5, header, align=align, fill=True,
+                new_x="LMARGIN" if idx == len(headers) - 1 else "RIGHT",
+                new_y="NEXT" if idx == len(headers) - 1 else "TOP",
+            )
+        pdf.set_text_color(*pk.INK)
+
+    _header()
+    for row_idx, (day, _moment, _doc_id, product, qty, unit_kop, total_kop) in enumerate(rows):
+        pdf.set_font("DejaVu", size=7.5)
+        product_lines = _wrap_pdf_text(pdf, product, widths[1] - 2)
+        row_h = max(5.5, len(product_lines) * line_h + 1.2)
+        if pdf.get_y() + row_h > pdf.page_break_trigger:
+            pdf.add_page()
+            pk.section_header(pdf, f"Списания - {_trunc(store_name, 58)} (продолжение)")
+            _header()
+
+        y0 = pdf.get_y()
+        if row_idx % 2 == 0:
+            pdf.set_fill_color(*pk.CREAM)
+            pdf.rect(float(pk._MARGIN), y0, float(pk._INNER_W), row_h, style="F")
+
+        day_text = day.strftime("%d.%m.%Y") if hasattr(day, "strftime") else str(day)
+        values = [
+            day_text,
+            product_lines,
+            _qty(float(qty)),
+            _rub(unit_kop) + " ₽",
+            _rub(total_kop) + " ₽",
+        ]
+        x = float(pk._MARGIN)
+        pdf.set_text_color(*pk.INK)
+        for idx, (value, width, align) in enumerate(zip(values, widths, aligns)):
+            pdf.set_xy(x, y0 + 0.7)
+            if idx == 1:
+                for line_idx, line in enumerate(value):
+                    pdf.set_xy(x + 1, y0 + 0.7 + line_idx * line_h)
+                    pdf.cell(width - 2, line_h, line, align="L")
+            else:
+                pdf.cell(width - 1, line_h, str(value), align=align)
+            x += width
+        pdf.set_y(y0 + row_h)
+    pdf.ln(2)
+
+
+def _append_loss_details_by_store(
+    pdf: pk.HermesPDF, details: dict[str, list[tuple]],
+) -> None:
+    """Отдельная страница каждого отдела со всеми списанными позициями."""
+    adjustment_stores = set(config.ADJUSTMENT_STORES or [])
+    for store_name, rows in details.items():
+        pdf.add_page()
+        pk.cover(pdf, "СПИСАНИЯ ПО ОТДЕЛУ")
+        pdf.set_x(pk._MARGIN)
+        pdf.set_font("DejaVu_B", size=11)
+        pdf.set_text_color(*pk.INK)
+        pdf.multi_cell(pk._INNER_W, 6, store_name, align="L")
+        pdf.ln(2)
+
+        documents = len({row[2] for row in rows})
+        total_qty = sum(row[4] for row in rows)
+        total_kop = sum(row[6] for row in rows)
+        pk.kpi_row(pdf, [
+            ("Документов", str(documents), ""),
+            ("Позиций", str(len(rows)), ""),
+            ("Количество", _qty(total_qty), "ед."),
+            ("Сумма", _rub(total_kop), "₽"),
+        ])
+        if store_name in adjustment_stores:
+            pk.callout(
+                pdf,
+                "Этот отдел используется для корректировок инвентаризации. "
+                "Строки показаны полностью, но их сумма не считается порчей "
+                "и не вычитается повторно из прибыли.",
+                kind="info",
+            )
+        pk.section_header(pdf, "Все списанные позиции")
+        _append_loss_position_table(pdf, store_name, rows)
 
 
 def _render_income_split(
@@ -677,6 +874,12 @@ def build_sales_pdf(
     owner_kop = get_owner_withdrawals(conn, d_from, d_to)
     losses = _get_losses_by_store(conn, d_from, d_to, discount_pids=discount_pids)
     losses_total = losses.get("__total__", 0)
+    loss_details = (
+        _get_loss_details_by_store(
+            conn, d_from, d_to, discount_pids=discount_pids,
+        )
+        if include_management_sections else {}
+    )
     balls_data = _get_balls_by_store(conn, d_from, d_to)
     svoi = _get_svoi_purchases(conn, d_from, d_to)
 
@@ -1031,6 +1234,11 @@ def build_sales_pdf(
                 kind="warn",
             )
         pdf.ln(1)
+
+    # Полная детализация нужна в управленческом «Отчёте за период»:
+    # отдельный лист каждого отдела, без лимита строк и без исключения БАЗЫ.
+    if loss_details:
+        _append_loss_details_by_store(pdf, loss_details)
 
     # -- Топ товаров: отдельный лист A4 для каждого склада ---------------------
     for top_store_name, top_rev in top_by_store:
