@@ -6,14 +6,13 @@
 у расходных/платёжных — из project. Если ни того, ни другого нет — «(без склада)».
 «Кто» — ответственный сотрудник (owner) документа.
 
-Для заказов покупателей используется настоящий журнал ``/audit``: он отдаёт
-пользователя, время события и ``diff`` со значениями «было → стало». Поэтому
-для заказов показываем не косвенный признак ``updated``, а конкретные изменения
-даты, статуса, склада, проекта, суммы и состава позиций.
+Для заказов покупателей и отгрузок используется настоящий журнал ``/audit``.
+Показываются только управленчески значимые события: изменение даты документа и
+снижение цены позиции ниже действующей цены «Наличка». Количество, резерв, статус
+и добавление/удаление позиций намеренно скрыты.
 """
 from __future__ import annotations
 
-import json
 from datetime import date, datetime, timedelta
 
 from .moysklad import MoyskladClient
@@ -28,33 +27,19 @@ _DOC_TYPES = {
 }
 
 _CUSTOMER_ORDER = "customerorder"
+_DEMAND = "demand"
 _CUSTOMER_ORDER_LABEL = "Заказ покупателя"
-_MAX_ORDER_EVENTS = 100
+_DEMAND_LABEL = "Отгрузка"
+_AUDIT_ENTITY_LABELS = {
+    _CUSTOMER_ORDER: _CUSTOMER_ORDER_LABEL,
+    _DEMAND: _DEMAND_LABEL,
+}
+_MAX_AUDIT_EVENTS = 100
+_MAX_ORDER_EVENTS = _MAX_AUDIT_EVENTS  # совместимость со старыми тестами
 _MAX_POSITION_CHANGES = 12
-
-_FIELD_LABELS = {
-    "moment": "Дата заказа",
-    "deliveryPlannedMoment": "Плановая дата доставки",
-    "state": "Статус",
-    "store": "Склад",
-    "project": "Проект",
-    "agent": "Клиент",
-    "organization": "Организация",
-    "owner": "Владелец",
-    "sum": "Сумма",
-    "description": "Комментарий",
-    "applicable": "Проведён",
-    "shared": "Общий доступ",
-    "rate": "Курс",
-}
-
-_POSITION_FIELDS = {
-    "quantity": "количество",
-    "reserve": "резерв",
-    "price": "цена",
-    "discount": "скидка",
-    "vat": "НДС",
-}
+# В служебных карточках встречается sentinel 99 999 999 999 ₽.
+# Цена товара выше миллиона рублей не считается валидной «Наличкой».
+_MAX_CASH_PRICE_RUB = 1_000_000
 
 _NO_STORE = "(без склада)"
 # updated считается «изменением», если он позже moment минимум на столько
@@ -135,163 +120,239 @@ def _position_name(value: dict | None) -> str:
     return str(assortment.get("name") or "позиция без названия")
 
 
-def _position_diff_lines(changes: list[dict]) -> list[str]:
-    """Расшифровать изменения строк заказа, не раздувая PDF бесконечно."""
+def _money_rub(value: float) -> str:
+    """Короткая сумма в рублях без потери копеек."""
+    if abs(value - round(value)) < 0.005:
+        return f"{round(value):,}".replace(",", " ")
+    return f"{value:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def _effective_line_price(value: dict) -> float | None:
+    """Фактическая цена единицы с учётом скидки строки документа."""
+    try:
+        price = float(value.get("price"))
+        discount = float(value.get("discount") or 0)
+    except (TypeError, ValueError):
+        return None
+    return round(price * (1 - discount / 100), 2)
+
+
+def _cash_price_rub(
+    client: MoyskladClient, value: dict, cache: dict[str, float | None],
+) -> float | None:
+    """Текущая цена «Наличка» из карточки товара, в рублях."""
+    assortment = value.get("assortment") or {}
+    href = ((assortment.get("meta") or {}).get("href") or "").split("?")[0]
+    if not href:
+        return None
+    if href in cache:
+        return cache[href]
+
+    marker = "/api/remap/1.2"
+    path = href.split(marker, 1)[-1] if marker in href else ""
+    if not path.startswith("/"):
+        cache[href] = None
+        return None
+    try:
+        card = client._get(path, {})
+        value_kop = next(
+            (
+                float(price.get("value"))
+                for price in card.get("salePrices", []) or []
+                if (price.get("priceType") or {}).get("name") == "Наличка"
+                and price.get("value") is not None
+            ),
+            None,
+        )
+        result = round(value_kop / 100, 2) if value_kop and value_kop > 0 else None
+        if result is not None and result > _MAX_CASH_PRICE_RUB:
+            result = None
+    except Exception:
+        result = None
+    cache[href] = result
+    return result
+
+
+def _position_diff_lines(
+    changes: list[dict], client: MoyskladClient | None = None,
+    cash_cache: dict[str, float | None] | None = None,
+) -> list[str]:
+    """Показать только реальное снижение цены ниже «Налички»."""
+    if client is None:
+        return []
+    cache = cash_cache if cash_cache is not None else {}
     lines: list[str] = []
-    for item in changes[:_MAX_POSITION_CHANGES]:
+    for item in changes:
         old = item.get("oldValue")
         new = item.get("newValue")
-        if not old and new:
-            lines.append(
-                f"добавлена позиция «{_position_name(new)}» "
-                f"({_audit_value(new.get('quantity'))} шт.)"
-            )
+        # Добавление и удаление позиций намеренно не показываем.
+        if not old or not new:
             continue
-        if old and not new:
-            lines.append(
-                f"удалена позиция «{_position_name(old)}» "
-                f"({_audit_value(old.get('quantity'))} шт.)"
-            )
-            continue
-        old = old or {}
-        new = new or {}
-        product = _position_name(new or old)
-        parts = []
         old_name = _position_name(old)
         new_name = _position_name(new)
         if old_name != new_name:
-            parts.append(f"товар {old_name} → {new_name}")
-        for key, label in _POSITION_FIELDS.items():
-            if old.get(key) != new.get(key):
-                suffix = " ₽" if key == "price" else ("%" if key in {"discount", "vat"} else "")
-                parts.append(
-                    f"{label} {_audit_value(old.get(key))}{suffix} → "
-                    f"{_audit_value(new.get(key))}{suffix}"
-                )
-        lines.append(f"«{product}»: " + (", ".join(parts) or "изменена позиция"))
-    if len(changes) > _MAX_POSITION_CHANGES:
+            continue
+
+        old_price = _effective_line_price(old)
+        new_price = _effective_line_price(new)
+        if old_price is None or new_price is None or new_price >= old_price:
+            continue
+        cash_price = _cash_price_rub(client, new, cache)
+        if cash_price is None or new_price >= cash_price:
+            continue
+
+        discount_note = ""
+        if float(new.get("discount") or 0) > 0:
+            discount_note = f" после скидки {float(new['discount']):g}%"
         lines.append(
-            f"… ещё {len(changes) - _MAX_POSITION_CHANGES} изменений позиций"
+            f"«{new_name}»: цена{discount_note} снижена "
+            f"{_money_rub(old_price)} → {_money_rub(new_price)} ₽; "
+            f"«Наличка» {_money_rub(cash_price)} ₽ "
+            f"(ниже на {_money_rub(cash_price - new_price)} ₽)"
         )
+        if len(lines) >= _MAX_POSITION_CHANGES:
+            break
     return lines
 
 
-def _diff_lines(diff: dict, *, for_delete: bool = False) -> list[str]:
+def _diff_lines(
+    diff: dict, *, entity_type: str = _CUSTOMER_ORDER,
+    client: MoyskladClient | None = None,
+    cash_cache: dict[str, float | None] | None = None,
+) -> list[str]:
+    """Даты + снижение цены ниже «Налички»; остальной шум скрыт."""
     lines: list[str] = []
-    delete_fields = {
-        "moment", "deliveryPlannedMoment", "state", "store", "project",
-        "agent", "sum", "positions",
-    }
-    for field, change in diff.items():
-        if for_delete and field not in delete_fields:
-            continue
-        if field == "positions" and isinstance(change, list):
-            lines.extend(_position_diff_lines(change))
-            continue
-        if field not in _FIELD_LABELS:
-            # Технические поля (externalCode, group, vatIncluded и т.п.)
-            # не помогают управленческому контролю и перегружают страницу.
-            continue
+    date_fields = ["moment"]
+    if entity_type == _CUSTOMER_ORDER:
+        date_fields.append("deliveryPlannedMoment")
+    for field in date_fields:
+        change = diff.get(field)
         if not isinstance(change, dict):
             continue
         old = change.get("oldValue")
         new = change.get("newValue")
         if old == new:
             continue
-        label = _FIELD_LABELS.get(field, field)
+        if field == "moment":
+            label = "Дата отгрузки" if entity_type == _DEMAND else "Дата заказа"
+        else:
+            label = "Плановая дата доставки"
         lines.append(
             f"{label}: {_audit_value(old, field)} → {_audit_value(new, field)}"
         )
+    positions = diff.get("positions")
+    if isinstance(positions, list):
+        lines.extend(_position_diff_lines(positions, client, cash_cache))
     return lines
+
+
+def _load_sales_document_audit(
+    client: MoyskladClient, d_from: date, d_to: date,
+    entity_types: tuple[str, ...] = (_CUSTOMER_ORDER, _DEMAND),
+) -> tuple[list[dict], int, bool]:
+    """Получить важные update-события заказов и отгрузок.
+
+    Период фильтруется по ``audit.moment`` (времени изменения), а не по дате
+    самого документа. Поэтому изменённая сегодня отгрузка прошлой датой
+    обязательно попадёт в сегодняшний отчёт.
+    """
+    result: list[dict] = []
+    seen: set[tuple] = set()
+    event_pages: dict[str, list[dict]] = {}
+    cash_cache: dict[str, float | None] = {}
+    truncated = False
+
+    for entity_type in entity_types:
+        audit_filter = (
+            f"moment>={d_from.isoformat()} 00:00:00;"
+            f"moment<={d_to.isoformat()} 23:59:59;"
+            f"entityType={entity_type};eventType=update"
+        )
+        page = client._get("/audit", {
+            "filter": audit_filter,
+            "limit": _MAX_AUDIT_EVENTS,
+            "offset": 0,
+            "order": "moment,desc",
+        })
+        summaries = page.get("rows", [])[:_MAX_AUDIT_EVENTS]
+        if int(page.get("meta", {}).get("size", len(summaries)) or 0) > len(summaries):
+            truncated = True
+
+        for summary in summaries:
+            summary_id = str(summary.get("id") or "")
+            if not summary_id:
+                continue
+            if summary_id not in event_pages:
+                event_pages[summary_id] = client._get(
+                    f"/audit/{summary_id}/events", {"limit": 100},
+                ).get("rows", [])
+            for event in event_pages[summary_id]:
+                if event.get("entityType") != entity_type:
+                    continue
+                if (event.get("eventType") or summary.get("eventType")) != "update":
+                    continue
+                diff = event.get("diff") or {}
+                details = _diff_lines(
+                    diff, entity_type=entity_type,
+                    client=client, cash_cache=cash_cache,
+                )
+                if not details:
+                    continue
+                dedup_key = (
+                    entity_type,
+                    event.get("moment") or summary.get("moment") or "",
+                    event.get("uid") or summary.get("uid") or "—",
+                    event.get("name") or "—",
+                    tuple(details),
+                )
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                result.append({
+                    "event_type": "update",
+                    "entity_type": entity_type,
+                    "moment": event.get("moment") or summary.get("moment") or "",
+                    "uid": event.get("uid") or summary.get("uid") or "—",
+                    "number": event.get("name") or "—",
+                    "diff": diff,
+                    "details": details,
+                })
+
+    result.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
+    meaningful_total = len(result)
+    if meaningful_total > _MAX_AUDIT_EVENTS:
+        truncated = True
+    return result[:_MAX_AUDIT_EVENTS], meaningful_total, truncated
 
 
 def _load_customer_order_audit(
     client: MoyskladClient, d_from: date, d_to: date,
 ) -> tuple[list[dict], int, bool]:
-    """Получить update/delete заказов и раскрыть их auditevent.diff."""
-    base_filter = (
-        f"moment>={d_from.isoformat()} 00:00:00;"
-        f"moment<={d_to.isoformat()} 23:59:59;"
-        f"entityType={_CUSTOMER_ORDER}"
+    """Совместимая обёртка: только заказы покупателей."""
+    return _load_sales_document_audit(
+        client, d_from, d_to, entity_types=(_CUSTOMER_ORDER,),
     )
-    summaries: list[dict] = []
-    total_matching = 0
-    # eventType разрешено указывать в фильтре лишь один раз, поэтому update и
-    # delete читаем двумя короткими запросами. Так не выгружаем многочисленные
-    # create/print-события и не замедляем PDF.
-    for audit_event_type in ("update", "delete"):
-        page = client._get("/audit", {
-            "filter": f"{base_filter};eventType={audit_event_type}",
-            "limit": _MAX_ORDER_EVENTS,
-            "offset": 0,
-            "order": "moment,desc",
-        })
-        batch = page.get("rows", [])
-        total_matching += int(page.get("meta", {}).get("size", len(batch)) or 0)
-        summaries.extend(batch[:_MAX_ORDER_EVENTS])
-
-    summaries.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
-    summaries = summaries[:_MAX_ORDER_EVENTS]
-
-    result: list[dict] = []
-    seen: set[tuple] = set()
-    for summary in summaries:
-        event_page = client._get(
-            f"/audit/{summary['id']}/events", {"limit": 100},
-        )
-        for event in event_page.get("rows", []):
-            if event.get("entityType") != _CUSTOMER_ORDER:
-                continue
-            event_type = event.get("eventType") or summary.get("eventType")
-            if event_type not in {"update", "delete"}:
-                continue
-            diff = event.get("diff") or {}
-            if event_type == "update" and not _diff_lines(diff):
-                # МойСклад иногда регистрирует update без доступного diff.
-                # Такой факт нельзя объяснить владельцу — не показываем шум.
-                continue
-            dedup_key = (
-                event_type,
-                event.get("moment") or summary.get("moment") or "",
-                event.get("uid") or summary.get("uid") or "—",
-                event.get("name") or "—",
-                json.dumps(diff, ensure_ascii=False, sort_keys=True),
-            )
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            result.append({
-                "event_type": event_type,
-                "moment": event.get("moment") or summary.get("moment") or "",
-                "uid": event.get("uid") or summary.get("uid") or "—",
-                "number": event.get("name") or "—",
-                "diff": diff,
-            })
-    result.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
-    meaningful_total = len(result)
-    truncated = total_matching > len(summaries) or meaningful_total > _MAX_ORDER_EVENTS
-    return result[:_MAX_ORDER_EVENTS], meaningful_total, truncated
 
 
-def _render_customer_order_audit(
+def _render_sales_document_audit(
     rows: list[dict], total: int, truncated: bool = False,
 ) -> list[str]:
     if not rows:
         return []
     count_label = f"не менее {total}" if truncated else str(total)
-    lines = [f"🧾 ЗАКАЗЫ ПОКУПАТЕЛЕЙ — ИСТОРИЯ ({count_label}):"]
+    lines = [f"🧾 ЗАКАЗЫ И ОТГРУЗКИ — ВАЖНЫЕ ИЗМЕНЕНИЯ ({count_label}):"]
 
     prepared: list[tuple[dict, str, list[str], tuple]] = []
     groups: dict[tuple, list[tuple[dict, str, list[str], tuple]]] = {}
     for row in rows:
         event_dt = _dt(str(row.get("moment") or ""))
         event_label = event_dt.strftime("%d.%m.%Y %H:%M") if event_dt else "—"
-        details = _diff_lines(
-            row.get("diff") or {},
-            for_delete=row.get("event_type") == "delete",
+        entity_type = row.get("entity_type") or _CUSTOMER_ORDER
+        details = row.get("details") or _diff_lines(
+            row.get("diff") or {}, entity_type=entity_type,
         )
         key = (
-            row.get("event_type"), event_label, row.get("uid") or "—",
+            entity_type, event_label, row.get("uid") or "—",
             tuple(details),
         )
         item = (row, event_label, details, key)
@@ -305,9 +366,10 @@ def _render_customer_order_audit(
             if key in rendered_groups:
                 continue
             rendered_groups.add(key)
-            action = "удалены" if row.get("event_type") == "delete" else "изменены"
+            entity_type = row.get("entity_type") or _CUSTOMER_ORDER
+            plural = "отгрузок" if entity_type == _DEMAND else "заказов"
             lines.append(
-                f"  • Массовое изменение: {len(same)} заказов · {action} "
+                f"  • Массовое изменение: {len(same)} {plural} · изменены "
                 f"{event_label} · кто: {row.get('uid') or '—'}"
             )
             numbers = [str(item[0].get("number") or "—") for item in same]
@@ -317,22 +379,25 @@ def _render_customer_order_audit(
             lines.extend(f"      – {detail}" for detail in details)
             continue
 
-        action = "удалён" if row.get("event_type") == "delete" else "изменён"
+        entity_type = row.get("entity_type") or _CUSTOMER_ORDER
+        document_label = _AUDIT_ENTITY_LABELS.get(entity_type, "Документ")
         lines.append(
-            f"  • {_CUSTOMER_ORDER_LABEL} № {row.get('number') or '—'} · "
-            f"{action} {event_label} · кто: {row.get('uid') or '—'}"
+            f"  • {document_label} № {row.get('number') or '—'} · "
+            f"изменён {event_label} · кто: {row.get('uid') or '—'}"
         )
-        if details:
-            lines.extend(f"      – {detail}" for detail in details)
-        elif action == "удалён":
-            lines.append("      – документ удалён")
-        else:
-            lines.append("      – МойСклад не передал расшифровку полей")
+        lines.extend(f"      – {detail}" for detail in details)
     if truncated:
         lines.append(
-            f"  … показаны последние {_MAX_ORDER_EVENTS} значимых событий"
+            f"  … показаны последние {_MAX_AUDIT_EVENTS} значимых событий"
         )
     return lines
+
+
+def _render_customer_order_audit(
+    rows: list[dict], total: int, truncated: bool = False,
+) -> list[str]:
+    """Совместимая обёртка для старых вызовов."""
+    return _render_sales_document_audit(rows, total, truncated)
 
 
 def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
@@ -346,22 +411,20 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
         lines.append("⚠️ МойСклад недоступен — данные об изменениях не получены.")
         return "\n".join(lines)
 
-    order_audit: list[dict] = []
-    order_audit_total = 0
-    order_audit_truncated = False
-    order_audit_error = ""
+    sales_audit: list[dict] = []
+    sales_audit_total = 0
+    sales_audit_truncated = False
+    sales_audit_error = ""
     try:
-        order_audit, order_audit_total, order_audit_truncated = _load_customer_order_audit(
-            client, d_from, d_to,
+        sales_audit, sales_audit_total, sales_audit_truncated = (
+            _load_sales_document_audit(client, d_from, d_to)
         )
     except Exception as exc:
-        # Старый updated-механизм ниже остаётся безопасным fallback: заказы
-        # попадут хотя бы фактом изменения, даже если /audit временно недоступен.
-        order_audit_error = type(exc).__name__
+        # Шумный updated-fallback для заказов/отгрузок не используем:
+        # без diff нельзя доказать ни изменение даты, ни низкую цену.
+        sales_audit_error = type(exc).__name__
 
     doc_types = dict(_DOC_TYPES)
-    if order_audit_error:
-        doc_types[_CUSTOMER_ORDER] = "Заказы покупателей"
 
     # ── Удалённые (deletedMoment в периоде) ─────────────────────────────────────
     del_flt = (
@@ -424,25 +487,25 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
                     label, _number(r), _location(r), r.get("sum"), _owner(r),
                 ))
 
-    if not deleted and not modified and not order_audit:
-        if order_audit_error:
+    if not deleted and not modified and not sales_audit:
+        if sales_audit_error:
             lines.append(
-                "⚠️ Детализация заказов покупателей временно недоступна; "
-                f"использован резервный контроль updated ({order_audit_error})."
+                "⚠️ Детализация заказов и отгрузок временно недоступна "
+                f"({sales_audit_error})."
             )
             return "\n".join(lines)
         lines.append("✅ За период изменённых и удалённых документов нет.")
         return "\n".join(lines)
 
-    if order_audit:
-        lines.extend(_render_customer_order_audit(
-            order_audit, order_audit_total, order_audit_truncated,
+    if sales_audit:
+        lines.extend(_render_sales_document_audit(
+            sales_audit, sales_audit_total, sales_audit_truncated,
         ))
         lines.append("")
-    elif order_audit_error:
+    elif sales_audit_error:
         lines.append(
-            "⚠️ Детализация заказов покупателей временно недоступна; "
-            f"использован резервный контроль updated ({order_audit_error})."
+            "⚠️ Детализация заказов и отгрузок временно недоступна "
+            f"({sales_audit_error})."
         )
         lines.append("")
 
