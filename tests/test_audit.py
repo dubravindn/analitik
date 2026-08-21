@@ -27,7 +27,7 @@ def test_audit_empty_message():
     assert "УДАЛЁННЫЕ" not in text and "ИЗМЕНЁННЫЕ" not in text
 
 
-def test_receipts_and_payments_remain_but_loss_is_not_requested_or_rendered():
+def test_receipts_all_payments_and_orders_remain_but_loss_is_not_requested():
     class Client(_FakeClient):
         def _get(self, path, params):
             self.paths.append(path)
@@ -43,14 +43,21 @@ def test_receipts_and_payments_remain_but_loss_is_not_requested_or_rendered():
                     "owner": {"name": "Иванов"},
                     "name": "ПР-00123",
                 }]}
-            if path == "/entity/paymentout":
+            financial_docs = {
+                "/entity/paymentin": ("ВП-001", "Входящие платежи"),
+                "/entity/paymentout": ("ИП-002", "Исходящие платежи"),
+                "/entity/cashin": ("ПО-003", "Приходные ордера"),
+                "/entity/cashout": ("РО-004", "Расходные ордера"),
+            }
+            if path in financial_docs:
+                number, _label = financial_docs[path]
                 return {"meta": {"size": 1}, "rows": [{
                     "moment": "2026-08-05 09:00:00",
                     "updated": "2026-08-05 09:05:00",
                     "sum": 34_000_000,
                     "project": {"name": "База Воровского 107/1"},
                     "owner": {"name": "Петров"},
-                    "name": "ПЛ-00456",
+                    "name": number,
                 }]}
             return {"meta": {"size": 0}, "rows": []}
 
@@ -59,9 +66,15 @@ def test_receipts_and_payments_remain_but_loss_is_not_requested_or_rendered():
         client, date(2026, 8, 5), date(2026, 8, 5),
     )
     assert "Приёмки № ПР-00123" in text
-    assert "Исходящие платежи № ПЛ-00456" in text
+    assert "Входящие платежи № ВП-001" in text
+    assert "Исходящие платежи № ИП-002" in text
+    assert "Приходные ордера № ПО-003" in text
+    assert "Расходные ордера № РО-004" in text
     assert any(path.startswith("/entity/supply") for path in client.paths)
+    assert any(path.startswith("/entity/paymentin") for path in client.paths)
     assert any(path.startswith("/entity/paymentout") for path in client.paths)
+    assert any(path.startswith("/entity/cashin") for path in client.paths)
+    assert any(path.startswith("/entity/cashout") for path in client.paths)
     assert not any(path.startswith("/entity/loss") for path in client.paths)
     assert "Списания" not in text
 

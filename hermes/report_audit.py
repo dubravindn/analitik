@@ -19,8 +19,10 @@ _DOC_TYPES = {
     "retaildemand": "Розничные продажи",
     "salesreturn":  "Возвраты покупателей",
     "supply":       "Приёмки",
-    "cashout":      "Расходные ордера",
+    "paymentin":    "Входящие платежи",
     "paymentout":   "Исходящие платежи",
+    "cashin":       "Приходные ордера",
+    "cashout":      "Расходные ордера",
 }
 
 _CUSTOMER_ORDER = "customerorder"
