@@ -284,7 +284,7 @@ def _plain_report_text(text: str) -> str:
     for marker in (
         "💸", "📍", "📉", "📋", "📅", "📤", "📥", "👥", "🏆",
         "⚠️", "⚠", "✅", "⚙", "🏪", "📊", "🔄", "💰",
-        "🔍", "🗑️", "🗑", "✏️", "✏",
+        "🔍", "🗑️", "🗑", "✏️", "✏", "🧾",
     ):
         text = text.replace(marker, "")
     return text.replace("\ufe0f", "").strip()
