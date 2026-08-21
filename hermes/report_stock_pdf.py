@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from hermes import calc, pdf_kit as pk
+from hermes import calc, config, pdf_kit as pk
 from hermes.report_stock import (
     _ST_JOIN, _ST_UNIT, _ST_VALUE, _STORE_ORDER,
 )
@@ -11,8 +11,14 @@ from hermes.report_stock import (
 # Порог залежалости для PDF-отчёта (в тексте report_stock.py — 5 дней).
 _STALE_MIN_DAYS = 5
 
-# Розничные точки для залежалых (База — только хранение, не показываем).
-_RETAIL_STORES = frozenset(s for s in _STORE_ORDER if "База" not in s)
+# Залежалые показываем только по настоящим розничным точкам. Ресторанные
+# склады входят в остатки и перемещения, но не должны ошибочно считаться
+# розницей только потому, что в названии нет слова «База».
+_RETAIL_STORES = frozenset(
+    store["name"]
+    for store in config.STORES
+    if config.STORE_CHANNELS.get(store["id"]) == "розница"
+)
 
 
 def _rub(kop: float) -> str:

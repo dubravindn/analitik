@@ -4,16 +4,12 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 
+from hermes import config
+
 STALE_SREZKA_DAYS = 3
 STALE_OTHER_DAYS  = 30
 
-_STORE_ORDER = [
-    "Киров, Ленина 102А",
-    "Слободской, Советская 64",
-    "Розница Воровского 107/1",
-    "База Воровского 107/1",
-    "СОБРАНИЕ",
-]
+_STORE_ORDER = [store["name"] for store in config.STORES]
 
 
 def _rub(kop: float) -> str:

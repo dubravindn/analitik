@@ -51,7 +51,7 @@ def test_audit_lists_deleted_and_modified():
         _FakeClient(deleted, docs), date(2026, 8, 5), date(2026, 8, 5)
     )
     assert "🗑 УДАЛЁННЫЕ (1):" in text
-    assert "Списания · 05.08.2026 · Розница Воровского 107/1 · 12 500 ₽ · Иванов" in text
+    assert "Списания № 00123 · 05.08.2026 · Розница Воровского 107/1 · 12 500 ₽ · Иванов" in text
     assert "✏️ ИЗМЕНЁННЫЕ (1):" in text          # только один, не два
     assert "340 000 ₽ · Петров" in text
     assert "Сидоров" not in text                   # мгновенное создание не считается правкой
