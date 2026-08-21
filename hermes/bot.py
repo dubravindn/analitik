@@ -884,6 +884,7 @@ def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, 
     from .etl_sales import run as etl_sales
     from .etl_stock import run as etl_stock
     from .etl_loss import run as etl_loss
+    from .etl_enter import run as etl_enter
     from .etl_cashflow import run as etl_cashflow
     from .etl_clients import run as etl_clients
     from .etl_move import run as etl_move
@@ -908,6 +909,10 @@ def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, 
                 cur.execute("SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
                 if cur.fetchone()[0] == 0:
                     etl_loss(client, conn, d_from, d_to)
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM enter_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
+                if cur.fetchone()[0] == 0:
+                    etl_enter(client, conn, d_from, d_to)
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s", (d_from, d_to))
                 if cur.fetchone()[0] == 0:

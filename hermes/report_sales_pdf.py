@@ -1108,6 +1108,7 @@ def build_sales_pdf(
             build_clients_report, get_churn_clients, get_top_clients,
         )
         from .report_audit import build_audit_report
+        from .report_inventory import build_inventory_report
 
         _append_text_section(
             pdf, "Расходы",
@@ -1136,6 +1137,10 @@ def build_sales_pdf(
                 conn, limit=None, store_name=base_store, inactive_days=10,
                 min_avg_check_kop=1_000_000,
             ),
+        )
+        _append_text_section(
+            pdf, "Инвентаризации по точкам",
+            build_inventory_report(conn, d_from, d_to, client=client),
         )
         _append_text_section(
             pdf, "Изменённые и удалённые документы",

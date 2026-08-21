@@ -297,6 +297,47 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
             },
         ))
 
+    # Инвентаризация — отдельный проверяемый блок: обе стороны корректировки,
+    # документная дата и еженедельное покрытие каждой собственной точки.
+    from .report_inventory import inventory_fact_rows
+    inventory_rows = inventory_fact_rows(conn, d_from, d_to)
+    session_idx = coverage_idx = 0
+    for row in inventory_rows:
+        if "weekly_latest" in row:
+            coverage_idx += 1
+            latest = row["weekly_latest"]
+            category = "inventory_status" if latest else "inventory_missing"
+            facts.append(_fact(
+                f"inventory.coverage.{coverage_idx}", category,
+                "Последняя инвентаризация за 7 дней" if latest else "Инвентаризация за 7 дней не найдена",
+                latest or 0, "date" if latest else "count", store=row["store"],
+                period=f"{row['weekly_from']:%d.%m.%Y}–{row['weekly_to']:%d.%m.%Y}",
+                details={"completed": bool(latest)},
+            ))
+            continue
+        session_idx += 1
+        documents = [
+            {
+                "type": doc["kind"], "id": doc["doc_id"],
+                "positions": doc["positions"], "qty": doc["qty"],
+                "value_kop": doc["value_kop"],
+            }
+            for doc in row["documents"]
+        ]
+        facts.append(_fact(
+            f"inventory.session.{session_idx}", "inventory_adjustment",
+            "Итог инвентаризации (оприходовано минус списано)",
+            row["net_kop"], "kop", store=row["store"], period=row["day"].isoformat(),
+            details={
+                "loss_kop": row["loss_kop"], "enter_kop": row["enter_kop"],
+                "loss_qty": row["loss_qty"], "enter_qty": row["enter_qty"],
+                "missing_prices": row["missing_prices"], "documents": documents,
+                "quantity_anomalies": row["quantity_anomalies"],
+                "assessment": row["assessment"], "check": row["check"],
+                "stated_reasons": row["descriptions"],
+            },
+        ))
+
     if client is not None:
         try:
             from .report_audit import build_audit_report

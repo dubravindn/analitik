@@ -53,6 +53,24 @@ def test_rules_include_stale_stock():
     assert "stale_stock" in ids
 
 
+def test_rules_flag_inventory_shortage_and_missing_weekly_check():
+    payload = _payload([
+        _fact("inventory.1", "inventory_adjustment", -25_000),
+        _fact("inventory.missing", "inventory_missing", 0),
+    ], report_type="period")
+    ids = {item["id"] for item in evaluate_payload(payload)["signals"]}
+    assert "inventory_shortage" in ids
+    assert "inventory_missing" in ids
+
+
+def test_rules_prioritize_bad_inventory_input_over_false_shortage():
+    fact = _fact("inventory.bad", "inventory_adjustment", -3_200_000_000)
+    fact["details"]["quantity_anomalies"] = [{"product": "Лента", "qty": 499_972}]
+    ids = {item["id"] for item in evaluate_payload(_payload([fact]))["signals"]}
+    assert "inventory_input_anomaly" in ids
+    assert "inventory_shortage" not in ids
+
+
 def test_rules_flag_uncovered_customer_order():
     payload = _payload([{
         **_fact("forecast.row.1", "forecast_product", 0),

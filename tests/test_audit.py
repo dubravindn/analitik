@@ -211,3 +211,41 @@ def test_mass_same_date_change_is_grouped_but_keeps_order_numbers():
     assert "Массовое изменение: 3 заказов" in rendered
     assert "Номера: 12188, 12211, 12854" in rendered
     assert "Дата заказа: 05.08.2026 09:00 → 06.08.2026 09:00" in rendered
+
+
+def test_multiday_audit_reads_later_pages_without_losing_early_event(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.offsets = []
+
+        def _get(self, path, params):
+            if path == "/audit":
+                flt = params["filter"]
+                offset = params["offset"]
+                if "moment>=2026-08-20 00:00:00" in flt and "customerorder" in flt:
+                    self.offsets.append(offset)
+                    rows = (
+                        [{"id": "noise1"}, {"id": "noise2"}]
+                        if offset == 0 else [{"id": "wanted"}]
+                    )
+                    return {"meta": {"size": 3}, "rows": rows}
+                return {"meta": {"size": 0}, "rows": []}
+            if path == "/audit/wanted/events":
+                return {"rows": [{
+                    "eventType": "update", "entityType": "customerorder",
+                    "moment": "2026-08-20 12:00:00", "uid": "manager",
+                    "name": "13619", "diff": {"moment": {
+                        "oldValue": "2026-08-20 09:00:00",
+                        "newValue": "2026-08-21 09:00:00",
+                    }},
+                }]}
+            return {"rows": []}
+
+    monkeypatch.setattr(report_audit, "_AUDIT_PAGE_SIZE", 2)
+    client = Client()
+    text = report_audit.build_audit_report(
+        client, date(2026, 8, 16), date(2026, 8, 21),
+    )
+    assert client.offsets == [0, 2]
+    assert "Заказ покупателя № 13619" in text
+    assert "Дата заказа: 20.08.2026 09:00 → 21.08.2026 09:00" in text

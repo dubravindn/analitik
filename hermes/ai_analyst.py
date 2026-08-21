@@ -42,6 +42,7 @@ def _compact_payload(payload: dict[str, Any], rules: dict[str, Any]) -> dict[str
             "document_audit", "data_quality", "source_status", "definition",
             "product_sales", "loss_breakdown", "expense_breakdown", "supply",
             "movement", "entity_product", "entity_client",
+            "inventory_adjustment", "inventory_status", "inventory_missing",
         }:
             selected.append(fact)
         elif category == "forecast_product":
@@ -73,7 +74,8 @@ def _compact_question_payload(payload: dict[str, Any]) -> dict[str, Any]:
         {"financial", "comparison", "store", "definition"},
         {"loss_breakdown", "expense_breakdown", "supply", "movement", "product_sales"},
         {"stock_issue", "zero_stock", "catalog_zero_stock", "stale_stock", "stock"},
-        {"forecast", "forecast_product", "document_audit"},
+        {"forecast", "forecast_product", "document_audit", "inventory_adjustment",
+         "inventory_status", "inventory_missing"},
         {"history", "source_status", "data_quality", "client_churn"},
     )
     limits = {

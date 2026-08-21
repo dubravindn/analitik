@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import time
 
 from .moysklad import MoyskladClient
 
@@ -37,6 +38,12 @@ _AUDIT_ENTITY_LABELS = {
 _MAX_AUDIT_EVENTS = 100
 _MAX_ORDER_EVENTS = _MAX_AUDIT_EVENTS  # совместимость со старыми тестами
 _MAX_POSITION_CHANGES = 12
+_AUDIT_PAGE_SIZE = 100
+# Берём последние 100 записей КАЖДОГО дня и типа. Этого достаточно, чтобы
+# события начала недели не вытеснялись концом периода, и не создаёт сотни
+# параллельных запросов, на которые МойСклад отвечает 429.
+_MAX_AUDIT_SUMMARIES_PER_DAY = 100
+_AUDIT_REQUEST_PAUSE_SECONDS = 0.15
 # В служебных карточках встречается sentinel 99 999 999 999 ₽.
 # Цена товара выше миллиона рублей не считается валидной «Наличкой».
 _MAX_CASH_PRICE_RUB = 1_000_000
@@ -258,65 +265,95 @@ def _load_sales_document_audit(
     """
     result: list[dict] = []
     seen: set[tuple] = set()
-    event_pages: dict[str, list[dict]] = {}
     cash_cache: dict[str, float | None] = {}
     truncated = False
 
-    for entity_type in entity_types:
-        audit_filter = (
-            f"moment>={d_from.isoformat()} 00:00:00;"
-            f"moment<={d_to.isoformat()} 23:59:59;"
-            f"entityType={entity_type};eventType=update"
-        )
-        page = client._get("/audit", {
-            "filter": audit_filter,
-            "limit": _MAX_AUDIT_EVENTS,
-            "offset": 0,
-            "order": "moment,desc",
-        })
-        summaries = page.get("rows", [])[:_MAX_AUDIT_EVENTS]
-        if int(page.get("meta", {}).get("size", len(summaries)) or 0) > len(summaries):
+    # Не берём одни «последние 100» на весь период: насыщенный поздний день
+    # иначе вытесняет важную правку из начала недели. Читаем каждый день постранично.
+    summaries_by_id: dict[str, dict] = {}
+    day = d_from
+    while day <= d_to:
+        for entity_type in entity_types:
+            audit_filter = (
+                f"moment>={day.isoformat()} 00:00:00;"
+                f"moment<={day.isoformat()} 23:59:59;"
+                f"entityType={entity_type};eventType=update"
+            )
+            offset = 0
+            total_size = 0
+            while offset < _MAX_AUDIT_SUMMARIES_PER_DAY:
+                page = client._get("/audit", {
+                    "filter": audit_filter,
+                    "limit": _AUDIT_PAGE_SIZE,
+                    "offset": offset,
+                    "order": "moment,desc",
+                })
+                batch = page.get("rows", [])
+                total_size = int(page.get("meta", {}).get("size", len(batch)) or 0)
+                for summary in batch:
+                    summary_id = str(summary.get("id") or "")
+                    if summary_id:
+                        summaries_by_id[summary_id] = summary
+                offset += len(batch)
+                if not batch or offset >= total_size:
+                    break
+            if offset < total_size:
+                truncated = True
+        day += timedelta(days=1)
+
+    # Раскрытие audit/{id}/events — сетевой N+1. Читаем последовательно с
+    # ограничением частоты: параллельные запросы стабильно получают HTTP 429.
+    event_pages: dict[str, list[dict]] = {}
+
+    def _fetch_events(summary_id: str) -> tuple[str, list[dict]]:
+        rows = client._get(
+            f"/audit/{summary_id}/events", {"limit": 100},
+        ).get("rows", [])
+        # Лимит API общий для аккаунта; выдерживаем паузу даже в одном потоке.
+        time.sleep(_AUDIT_REQUEST_PAUSE_SECONDS)
+        return summary_id, rows
+
+    for summary_id in summaries_by_id:
+        try:
+            fetched_id, rows = _fetch_events(summary_id)
+            event_pages[fetched_id] = rows
+        except Exception:
             truncated = True
 
-        for summary in summaries:
-            summary_id = str(summary.get("id") or "")
-            if not summary_id:
+    allowed_entity_types = set(entity_types)
+    for summary_id, summary in summaries_by_id.items():
+        for event in event_pages.get(summary_id, []):
+            entity_type = event.get("entityType")
+            if entity_type not in allowed_entity_types:
                 continue
-            if summary_id not in event_pages:
-                event_pages[summary_id] = client._get(
-                    f"/audit/{summary_id}/events", {"limit": 100},
-                ).get("rows", [])
-            for event in event_pages[summary_id]:
-                if event.get("entityType") != entity_type:
-                    continue
-                if (event.get("eventType") or summary.get("eventType")) != "update":
-                    continue
-                diff = event.get("diff") or {}
-                details = _diff_lines(
-                    diff, entity_type=entity_type,
-                    client=client, cash_cache=cash_cache,
-                )
-                if not details:
-                    continue
-                dedup_key = (
-                    entity_type,
-                    event.get("moment") or summary.get("moment") or "",
-                    event.get("uid") or summary.get("uid") or "—",
-                    event.get("name") or "—",
-                    tuple(details),
-                )
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-                result.append({
-                    "event_type": "update",
-                    "entity_type": entity_type,
-                    "moment": event.get("moment") or summary.get("moment") or "",
-                    "uid": event.get("uid") or summary.get("uid") or "—",
-                    "number": event.get("name") or "—",
-                    "diff": diff,
-                    "details": details,
-                })
+            if (event.get("eventType") or summary.get("eventType")) != "update":
+                continue
+            diff = event.get("diff") or {}
+            details = _diff_lines(
+                diff, entity_type=entity_type,
+                client=client, cash_cache=cash_cache,
+            )
+            if not details:
+                continue
+            dedup_key = (
+                entity_type,
+                event.get("moment") or summary.get("moment") or "",
+                event.get("uid") or summary.get("uid") or "—",
+                event.get("name") or "—",
+                tuple(details),
+            )
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            result.append({
+                "event_type": "update",
+                "entity_type": entity_type,
+                "moment": event.get("moment") or summary.get("moment") or "",
+                "uid": event.get("uid") or summary.get("uid") or "—",
+                "number": event.get("name") or "—",
+                "diff": diff,
+                "details": details,
+            })
 
     result.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
     meaningful_total = len(result)

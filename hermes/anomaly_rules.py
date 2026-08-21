@@ -69,6 +69,35 @@ def evaluate_payload(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
             "Нет заказа более 10 дней при среднем чеке не ниже 10 000 ₽.",
         ))
 
+    inventory = [f for f in facts if f.get("category") == "inventory_adjustment"]
+    inventory_bad_data = [
+        f for f in inventory if (f.get("details") or {}).get("quantity_anomalies")
+    ]
+    shortage = [
+        f for f in inventory
+        if float(f.get("value") or 0) < 0
+        and not (f.get("details") or {}).get("quantity_anomalies")
+    ]
+    missing_inventory = [f for f in facts if f.get("category") == "inventory_missing"]
+    if shortage:
+        signals.append(_signal(
+            "inventory_shortage", "warning", "Инвентаризация выявила недостачу",
+            [f["id"] for f in shortage[:5]],
+            "Оприходование минус списание ниже нуля; причина требует проверки по первичным документам.",
+        ))
+    if inventory_bad_data:
+        signals.append(_signal(
+            "inventory_input_anomaly", "critical", "В документе инвентаризации аномальное количество",
+            [f["id"] for f in inventory_bad_data[:5]],
+            "Количество одной позиции превышает 100 000 единиц; денежный итог нельзя использовать до проверки документа.",
+        ))
+    if missing_inventory:
+        signals.append(_signal(
+            "inventory_missing", "warning", "Не по всем точкам найдена недельная инвентаризация",
+            [f["id"] for f in missing_inventory],
+            "Для каждой собственной товарной точки ожидается инвентаризация хотя бы раз за последние 7 дней.",
+        ))
+
     forecast_rows = [f for f in facts if f.get("category") == "forecast_product"]
     uncovered: list[dict] = []
     discrepancy: list[dict] = []
