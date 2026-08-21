@@ -5,51 +5,36 @@ from hermes import report_audit
 
 
 class _FakeClient:
-    """Отдаёт строки только для списаний, чтобы не задваивать общий аудит."""
+    """Проверяет, что общий аудит документов больше не запрашивается."""
 
     def __init__(self, deleted_rows=None, doc_rows=None):
         self.deleted_rows = deleted_rows or []
         self.doc_rows = doc_rows or []
+        self.paths = []
 
     def _get(self, path, params):
-        if not path.startswith("/entity/loss"):
-            return {"rows": []}
-        return {"rows": self.deleted_rows if path.endswith("/deleted") else self.doc_rows}
+        self.paths.append(path)
+        if path == "/audit":
+            return {"meta": {"size": 0}, "rows": []}
+        raise AssertionError(f"Лишний запрос общего аудита: {path}")
 
 
 def test_audit_empty_message():
     text = report_audit.build_audit_report(
         _FakeClient(), date(2026, 8, 5), date(2026, 8, 5),
     )
-    assert "изменённых и удалённых документов нет" in text
+    assert "нет изменений дат и снижений цены ниже «Налички»" in text
     assert "УДАЛЁННЫЕ" not in text and "ИЗМЕНЁННЫЕ" not in text
 
 
-def test_audit_lists_deleted_and_modified():
-    deleted = [{
-        "deletedMoment": "2026-08-05 10:00:00", "sum": 1_250_000,
-        "store": {"name": "Розница Воровского 107/1"},
-        "owner": {"name": "Иванов"}, "name": "00123",
-    }]
-    docs = [
-        {
-            "moment": "2026-08-05 09:00:00", "updated": "2026-08-05 09:05:00",
-            "sum": 34_000_000, "store": {"name": "База Воровского 107/1"},
-            "owner": {"name": "Петров"},
-        },
-        {
-            "moment": "2026-08-05 09:10:00", "updated": "2026-08-05 09:10:03",
-            "sum": 500, "store": {"name": "Ленина"}, "owner": {"name": "Сидоров"},
-        },
-    ]
+def test_loss_and_other_general_documents_are_not_requested_or_rendered():
+    client = _FakeClient()
     text = report_audit.build_audit_report(
-        _FakeClient(deleted, docs), date(2026, 8, 5), date(2026, 8, 5),
+        client, date(2026, 8, 5), date(2026, 8, 5),
     )
-    assert "🗑 УДАЛЁННЫЕ (1):" in text
-    assert "Списания № 00123 · 05.08.2026 · Розница Воровского 107/1 · 12 500 ₽ · Иванов" in text
-    assert "✏️ ИЗМЕНЁННЫЕ (1):" in text
-    assert "340 000 ₽ · Петров" in text
-    assert "Сидоров" not in text
+    assert all(path == "/audit" for path in client.paths)
+    assert "Списания" not in text
+    assert "Поставки" not in text
 
 
 def _position(name, product_id, price, discount=0, quantity=1):

@@ -56,9 +56,9 @@ def evaluate_payload(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
     audit = [f for f in facts if f.get("category") == "document_audit"]
     if audit:
         signals.append(_signal(
-            "document_audit", "critical", "Есть изменённые или удалённые документы",
+            "document_audit", "critical", "Есть важные изменения заказов или отгрузок",
             [f["id"] for f in audit[:5]],
-            "Документы изменялись после создания или были удалены; номера сохранены в фактах.",
+            "Изменена дата либо цена позиции снижена ниже «Налички»; номера документов сохранены в фактах.",
         ))
 
     churn = [f for f in facts if f.get("category") == "client_churn"]

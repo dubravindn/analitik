@@ -1143,7 +1143,7 @@ def build_sales_pdf(
             build_inventory_report(conn, d_from, d_to, client=client),
         )
         _append_text_section(
-            pdf, "Изменённые и удалённые документы",
+            pdf, "Изменения заказов и отгрузок",
             build_audit_report(client, d_from, d_to),
         )
         current_metrics = {
