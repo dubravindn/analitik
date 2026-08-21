@@ -55,3 +55,90 @@ def test_audit_lists_deleted_and_modified():
     assert "✏️ ИЗМЕНЁННЫЕ (1):" in text          # только один, не два
     assert "340 000 ₽ · Петров" in text
     assert "Сидоров" not in text                   # мгновенное создание не считается правкой
+
+
+class _CustomerOrderAuditClient:
+    def _get(self, path, params):
+        if path == "/audit":
+            event_type = "delete" if "eventType=delete" in params["filter"] else "update"
+            row = (
+                {
+                    "id": "a2", "eventType": "delete",
+                    "entityType": "customerorder",
+                    "moment": "2026-08-05 13:00:00",
+                }
+                if event_type == "delete"
+                else {
+                    "id": "a1", "eventType": "update",
+                    "entityType": "customerorder",
+                    "moment": "2026-08-05 12:00:00",
+                }
+            )
+            return {
+                "meta": {"size": 1},
+                "rows": [row],
+            }
+        if path == "/audit/a1/events":
+            return {"rows": [{
+                "eventType": "update", "entityType": "customerorder",
+                "moment": "2026-08-05 12:00:00", "uid": "manager@example",
+                "name": "13999",
+                "diff": {
+                    "state": {
+                        "oldValue": {"name": "Под заказ"},
+                        "newValue": {"name": "Выполнен"},
+                    },
+                    "deliveryPlannedMoment": {
+                        "oldValue": "2026-08-06 10:00:00",
+                        "newValue": "2026-08-07 11:00:00",
+                    },
+                    "positions": [{
+                        "oldValue": {
+                            "assortment": {"name": "Роза Эксплорер"},
+                            "quantity": 25.0, "reserve": 25.0,
+                        },
+                        "newValue": {
+                            "assortment": {"name": "Роза Эксплорер"},
+                            "quantity": 50.0, "reserve": 50.0,
+                        },
+                    }],
+                },
+            }]}
+        if path == "/audit/a2/events":
+            return {"rows": [{
+                "eventType": "delete", "entityType": "customerorder",
+                "moment": "2026-08-05 13:00:00", "uid": "owner@example",
+                "name": "14000", "diff": {},
+            }]}
+        return {"rows": []}
+
+
+def test_customer_orders_use_real_audit_diff():
+    text = report_audit.build_audit_report(
+        _CustomerOrderAuditClient(), date(2026, 8, 5), date(2026, 8, 5),
+    )
+    assert "ЗАКАЗЫ ПОКУПАТЕЛЕЙ — ИСТОРИЯ (2)" in text
+    assert "Заказ покупателя № 13999" in text
+    assert "кто: manager@example" in text
+    assert "Статус: Под заказ → Выполнен" in text
+    assert "Плановая дата доставки: 06.08.2026 10:00 → 07.08.2026 11:00" in text
+    assert "«Роза Эксплорер»: количество 25 → 50, резерв 25 → 50" in text
+    assert "Заказ покупателя № 14000 · удалён" in text
+
+
+def test_mass_same_change_is_grouped_but_keeps_order_numbers():
+    rows = [
+        {
+            "event_type": "update", "moment": "2026-08-05 08:07:01",
+            "uid": "manager@example", "number": number,
+            "diff": {"project": {
+                "oldValue": {"name": "1 сентября"},
+                "newValue": {"name": "Ближайшая поставка"},
+            }},
+        }
+        for number in ("12188", "12211", "12854")
+    ]
+    rendered = "\n".join(report_audit._render_customer_order_audit(rows, 3))
+    assert "Массовое изменение: 3 заказов" in rendered
+    assert "Номера: 12188, 12211, 12854" in rendered
+    assert "Проект: 1 сентября → Ближайшая поставка" in rendered
