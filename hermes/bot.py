@@ -377,7 +377,7 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
             "🧠 Напишите вопрос обычным сообщением. Можно спрашивать о продажах, "
             "прибыли, расходах, списаниях, складах, товарах, клиентах, остатках, "
             "закупках и прогнозе.",
-            _main_keyboard(chat_id),
+            tg.question_force_reply() if is_group else _main_keyboard(chat_id),
         )
         return
 

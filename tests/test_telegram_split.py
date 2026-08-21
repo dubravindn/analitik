@@ -3,6 +3,7 @@ from hermes.telegram import (
     _split,
     analytics_group_keyboard,
     main_reply_keyboard,
+    question_force_reply,
     set_my_commands,
     shared_group_keyboard,
 )
@@ -57,6 +58,13 @@ def test_two_level_group_keyboards():
     assert "📊 Отчёт за период" in analytics
     assert "🧠 Задать вопрос аналитику" in analytics
     assert "⬅️ Общее меню" in analytics
+
+
+def test_ai_question_uses_selective_force_reply():
+    markup = question_force_reply()
+    assert markup["force_reply"] is True
+    assert markup["selective"] is True
+    assert "аналитику" in markup["input_field_placeholder"]
 
 
 def test_set_my_commands_serializes_scope(monkeypatch):

@@ -101,6 +101,15 @@ def analytics_group_keyboard() -> dict:
     }
 
 
+def question_force_reply() -> dict:
+    """Заставить Telegram адресовать следующий текст именно аналитику."""
+    return {
+        "force_reply": True,
+        "selective": True,
+        "input_field_placeholder": "Введите вопрос аналитику",
+    }
+
+
 def legacy_reply_keyboard() -> dict:
     """Старое меню — rollback, не показывается пользователю."""
     return {
