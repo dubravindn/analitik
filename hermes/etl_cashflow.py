@@ -57,6 +57,7 @@ def _fetch_type(client: MoyskladClient, doc_type: str, d_from: date, d_to: date)
 def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
     """Синхронизировать движение денег за период. Возвращает число событий."""
     total = 0
+    seen_ids: list[str] = []
     for doc_type, direction in _DOC_TYPES:
         docs = _fetch_type(client, doc_type, d_from, d_to)
         log.info("  %s: %d документов", doc_type, len(docs))
@@ -64,6 +65,7 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         records = []
         for doc in docs:
             doc_id = doc["id"]
+            seen_ids.append(doc_id)
             moment_str = doc.get("moment", "")
             try:
                 moment = datetime.strptime(moment_str[:19], "%Y-%m-%d %H:%M:%S").replace(
@@ -106,6 +108,17 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 )
             conn.commit()
         total += len(records)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM cashflow_event
+            WHERE day BETWEEN %s AND %s
+              AND NOT (event_id = ANY(%s::text[]))
+            """,
+            (d_from, d_to, seen_ids),
+        )
+    conn.commit()
 
     log.info("ДДС %s..%s: загружено %d событий", d_from, d_to, total)
     return total

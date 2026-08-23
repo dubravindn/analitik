@@ -914,6 +914,32 @@ def build_sales_pdf(
     grand_net      = grand_prof - exp["total"]
     grand_after    = grand_net - losses_total
 
+    # Контрольная прибыль ровно по стандартной себестоимости отчёта МойСклад.
+    # Основной P&L ниже остаётся управленческим: закупочная цена из карточки,
+    # скидка поставщика 7% и фолбэк 60% для непокрытых позиций.
+    biz_store_ids = [r[0] for r in _biz]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT store_id,
+                   COALESCE(SUM(revenue_kop), 0),
+                   COALESCE(SUM(cost_kop), 0)
+            FROM sales_by_store_day
+            WHERE day BETWEEN %s AND %s
+              AND store_id = ANY(%s::text[])
+            GROUP BY store_id
+            """,
+            (d_from, d_to, biz_store_ids),
+        )
+        ms_by_store = {
+            sid: (int(revenue or 0), int(cost or 0))
+            for sid, revenue, cost in cur.fetchall()
+        }
+    ms_rev = sum(row[0] for row in ms_by_store.values())
+    ms_cost = sum(row[1] for row in ms_by_store.values())
+    ms_profit = ms_rev - ms_cost
+    management_adjustment = grand_prof - ms_profit
+
     # -- Отдельный топ-40 по каждому складу -----------------------------------
     top_by_store: list[tuple[str, list[tuple]]] = []
     with conn.cursor() as cur:
@@ -1004,7 +1030,18 @@ def build_sales_pdf(
         )
     pdf.multi_cell(pk._INNER_W, 4, cov_note, align="L")
     pdf.set_text_color(*pk.INK)
-    pdf.ln(3)
+    pk.callout(
+        pdf,
+        (
+            "Контроль МойСклад по всем торговым складам: "
+            f"выручка {_rub(ms_rev)} ₽; себестоимость {_rub(ms_cost)} ₽; "
+            f"прибыль {_rub(ms_profit)} ₽. Управленческая валовая прибыль выше "
+            f"на {_rub(management_adjustment)} ₽ из-за другой себестоимости "
+            "(цена закупки из карточки + скидка 7%). Это две разные методики, "
+            "а не потерянные склады. СОБРАНИЕ и ФАБРИКА учитываются в перемещениях."
+        ),
+        kind="info",
+    )
 
     # -- Графики ---------------------------------------------------------------
     try:
@@ -1198,6 +1235,9 @@ def build_sales_pdf(
     # -- Списания по складам ---------------------------------------------------
     store_losses = {k: v for k, v in losses.items() if k != "__total__"}
     if store_losses:
+        # Заголовок и таблица должны начинаться на одной странице.
+        if pdf.get_y() + 42 > pdf.page_break_trigger:
+            pdf.add_page()
         pk.section_header(pdf, "Списания и прибыль по складам")
         loss_tbl_rows = []
         sum_net = 0; sum_after = 0
@@ -1237,6 +1277,43 @@ def build_sales_pdf(
                 kind="warn",
             )
         pdf.ln(1)
+
+        if not store_name:
+            pk.section_header(pdf, "Контроль прибыли МойСклад по складам")
+            ms_rows = []
+            for sid, sn, _channel, _rev, _checks in _biz:
+                revenue, cost = ms_by_store.get(sid, (0, 0))
+                ms_rows.append([
+                    _trunc(sn, 34),
+                    _rub(revenue) + " ₽",
+                    _rub(cost) + " ₽",
+                    _rub(revenue - cost) + " ₽",
+                ])
+            ms_rows.append([
+                "ИТОГО",
+                _rub(ms_rev) + " ₽",
+                _rub(ms_cost) + " ₽",
+                _rub(ms_profit) + " ₽",
+            ])
+            pk.table(
+                pdf,
+                headers=["Склад", "Выручка", "Себест. МС", "Прибыль МС"],
+                rows=ms_rows,
+                col_widths=[72, 34, 34, 34],
+                aligns=["L", "R", "R", "R"],
+                font_size=7.8,
+            )
+            pdf.set_x(pk._MARGIN)
+            pdf.set_font("DejaVu", size=7.5)
+            pdf.set_text_color(*pk.SAGE)
+            pdf.multi_cell(
+                pk._INNER_W,
+                4,
+                "СОБРАНИЕ и ФАБРИКА показаны с нулевой продажей: "
+                "эти точки получают товар перемещениями, а не отгрузками.",
+                align="L",
+            )
+            pdf.set_text_color(*pk.INK)
 
     # Полная детализация нужна в управленческом «Отчёте за период»:
     # отдельный лист каждого отдела, без лимита строк и без исключения БАЗЫ.

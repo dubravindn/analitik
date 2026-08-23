@@ -103,6 +103,22 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
         _upsert(conn, doc, "salesreturn", -1)
         total += 1
 
+    # Полная синхронизация выбранного периода, а не только upsert. Документ
+    # могли удалить или перенести на другую дату после предыдущей выгрузки.
+    # В таком случае он больше не приходит из API и должен исчезнуть из БД,
+    # иначе суммы клиентов и блок «Продажи своим» остаются устаревшими.
+    seen_ids = [doc["id"] for doc in demands] + [doc["id"] for doc in returns]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM sales_doc
+            WHERE day BETWEEN %s AND %s
+              AND NOT (doc_id = ANY(%s::text[]))
+            """,
+            (d_from, d_to, seen_ids),
+        )
+    conn.commit()
+
     log.info("Клиентские документы %s..%s: загружено %d (отгрузки+возвраты)",
              d_from, d_to, total)
     return total

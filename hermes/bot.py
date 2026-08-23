@@ -919,33 +919,19 @@ def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, 
 
             conn = conn_factory()
             client = client_factory()
-            missing = _missing_days(conn, d_from, d_to)
-            if missing:
-                etl_sales(client, conn, min(missing), max(missing))
+            # Выбранный период всегда обновляем полностью. Проверка «есть хотя
+            # бы одна строка» оставляла старый снимок, если после выгрузки
+            # добавляли/меняли отгрузки, перемещения или платежи.
+            etl_sales(client, conn, d_from, d_to)
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM stock_snapshot WHERE day=%s", (d_to,))
                 if cur.fetchone()[0] == 0:
                     etl_stock(client, conn, d_to)
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM loss_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-                if cur.fetchone()[0] == 0:
-                    etl_loss(client, conn, d_from, d_to)
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM enter_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-                if cur.fetchone()[0] == 0:
-                    etl_enter(client, conn, d_from, d_to)
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM cashflow_event WHERE day BETWEEN %s AND %s", (d_from, d_to))
-                if cur.fetchone()[0] == 0:
-                    etl_cashflow(client, conn, d_from, d_to)
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM sales_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-                if cur.fetchone()[0] == 0:
-                    etl_clients(client, conn, d_from, d_to)
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM move_doc WHERE day BETWEEN %s AND %s", (d_from, d_to))
-                if cur.fetchone()[0] == 0:
-                    etl_move(client, conn, d_from, d_to)
+            etl_loss(client, conn, d_from, d_to)
+            etl_enter(client, conn, d_from, d_to)
+            etl_cashflow(client, conn, d_from, d_to)
+            etl_clients(client, conn, d_from, d_to)
+            etl_move(client, conn, d_from, d_to)
 
             # Данны для четырёх сравнений PDF: день, неделя, месяц, год к году.
             import calendar

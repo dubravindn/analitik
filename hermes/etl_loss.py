@@ -118,9 +118,9 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
             total = round(qty * price)
             pos_records.append((doc_id, pos_id, product_id, product_name, folder_path, qty, price, total))
 
-        if pos_records:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM loss_item WHERE doc_id = %s", (doc_id,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM loss_item WHERE doc_id = %s", (doc_id,))
+            if pos_records:
                 cur.executemany(
                     """
                     INSERT INTO loss_item
@@ -137,6 +137,18 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 )
         conn.commit()
         total_docs += 1
+
+    seen_ids = [doc["id"] for doc in docs]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM loss_doc
+            WHERE day BETWEEN %s AND %s
+              AND NOT (doc_id = ANY(%s::text[]))
+            """,
+            (d_from, d_to, seen_ids),
+        )
+    conn.commit()
 
     log.info("Списания %s..%s: загружено %d документов", d_from, d_to, total_docs)
     return total_docs

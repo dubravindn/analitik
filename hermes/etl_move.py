@@ -124,9 +124,11 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
             total = round(qty * cost)
             pos_records.append((doc_id, pos_id, product_id, product_name, qty, cost, total))
 
-        if pos_records:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM move_item WHERE doc_id = %s", (doc_id,))
+        # Сначала очищаем старые позиции: документ мог стать пустым либо позиции
+        # могли быть удалены после прошлой синхронизации.
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM move_item WHERE doc_id = %s", (doc_id,))
+            if pos_records:
                 cur.executemany(
                     """
                     INSERT INTO move_item
@@ -142,6 +144,20 @@ def run(client: MoyskladClient, conn, d_from: date, d_to: date) -> int:
                 )
         conn.commit()
         total_docs += 1
+
+    # Удаляем документы, которые были удалены в МойСклад или перенесены за
+    # пределы периода. move_item удалится каскадно.
+    seen_ids = [doc["id"] for doc in docs]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM move_doc
+            WHERE day BETWEEN %s AND %s
+              AND NOT (doc_id = ANY(%s::text[]))
+            """,
+            (d_from, d_to, seen_ids),
+        )
+    conn.commit()
 
     log.info("Перемещения %s..%s: загружено %d документов", d_from, d_to, total_docs)
     return total_docs
