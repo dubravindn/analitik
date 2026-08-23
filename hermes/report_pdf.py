@@ -95,15 +95,32 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
     sf_cf = "AND project_name = %s" if store_name else ""
     p_cf  = [d_from, d_to] + ([store_name] if store_name else [])
 
-    if own:
+    cashflow_writeoff_items = list(
+        getattr(_cfg, "CASHFLOW_WRITEOFF_ITEMS", ()) or ()
+    )
+    op_excluded = sorted({
+        name.strip().lower()
+        for name in own + cashflow_writeoff_items if name.strip()
+    })
+    if op_excluded:
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT COALESCE(SUM(amount_kop), 0)
                 FROM cashflow_event
                 WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
-                  AND (expense_item_name IS NULL OR expense_item_name != ALL(%s))
-            """, p_cf + [own])
+                  AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)
+            """, p_cf + [op_excluded])
             op_expenses = int((cur.fetchone() or (0,))[0])
+    else:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COALESCE(SUM(amount_kop), 0)
+                FROM cashflow_event
+                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
+            """, p_cf)
+            op_expenses = int((cur.fetchone() or (0,))[0])
+
+    if own:
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT COALESCE(SUM(amount_kop), 0)
@@ -113,13 +130,6 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             """, p_cf + [own])
             owner_kop = int((cur.fetchone() or (0,))[0])
     else:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT COALESCE(SUM(amount_kop), 0)
-                FROM cashflow_event
-                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
-            """, p_cf)
-            op_expenses = int((cur.fetchone() or (0,))[0])
         owner_kop = 0
 
     # 3. Списания: обычная порча отдельно от технических документов
@@ -139,6 +149,14 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
               AND NOT (d.doc_id = ANY(%s))
         """, p_ls + [inventory_ids])
         loss_spoil = int((cur.fetchone() or (0,))[0])
+
+    from .report_cashflow import get_cashflow_writeoffs
+    cashflow_writeoffs = get_cashflow_writeoffs(conn, d_from, d_to)
+    base_writeoff_store = getattr(
+        _cfg, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
+    )
+    if not store_name or store_name == base_writeoff_store:
+        loss_spoil += int(cashflow_writeoffs["total"] or 0)
 
     with conn.cursor() as cur:
         cur.execute(f"""

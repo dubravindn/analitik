@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date
 
 from . import calc, config, pdf_kit as pk
+from .report_cashflow import get_cashflow_writeoffs
 
 
 def _rub(kop: float) -> str:
@@ -72,6 +73,28 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
         """, _dp() + [date_from, date_to, excluded_docs])
         store_rows = cur.fetchall()
 
+    cashflow_writeoffs = get_cashflow_writeoffs(conn, date_from, date_to)
+    cashflow_total = int(cashflow_writeoffs["total"] or 0)
+    if cashflow_total:
+        base_store = getattr(
+            config, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
+        )
+        merged_rows = []
+        merged = False
+        for row_store, docs, kop in store_rows:
+            if row_store == base_store:
+                merged_rows.append((row_store, docs, int(kop or 0) + cashflow_total))
+                merged = True
+            else:
+                merged_rows.append((row_store, docs, kop))
+        if not merged:
+            merged_rows.append((
+                base_store,
+                sum(int(row[1] or 0) for row in cashflow_writeoffs["by_agent"]),
+                cashflow_total,
+            ))
+        store_rows = merged_rows
+
     grand_kop = sum(int(r[2] or 0) for r in store_rows)
     n_stores = len(store_rows)
 
@@ -123,7 +146,7 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
     pk.cover(pdf, f"Списания  ·  {period}")
 
     pk.kpi_row(pdf, [
-        ("Позиций списано",  str(grand_items),      ""),
+        ("Товарных позиций", str(grand_items),      ""),
         ("Сумма списаний",   _rub(grand_kop),       "₽"),
         ("Складов с порчей", str(n_stores),         ""),
         ("Ср. потеря/день",  _rub(avg_per_day),     "₽"),
@@ -156,9 +179,33 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
     else:
         pk.callout(pdf, "Нет данных по позициям за период.", kind="info")
 
+    if cashflow_writeoffs["by_agent"]:
+        pdf.add_page()
+        pk.cover(pdf, "СПИСАНИЯ БАЗЫ ПО КОНТРАГЕНТАМ")
+        pk.callout(
+            pdf,
+            "Источник: расходы со статьёй «Списание». Они исключены из раздела "
+            "операционных расходов и учтены здесь один раз.",
+            kind="info",
+        )
+        pk.table(
+            pdf,
+            headers=["#", "Контрагент", "Док.", "Сумма", "Среднее"],
+            rows=[
+                [str(idx), str(agent)[:55], str(docs), _rub(total) + " ₽", _rub(avg) + " ₽"]
+                for idx, (agent, docs, total, avg) in enumerate(
+                    cashflow_writeoffs["by_agent"][:34], 1
+                )
+            ],
+            col_widths=[8, 84, 18, 34, 30],
+            aligns=["R", "L", "R", "R", "R"],
+            font_size=7.2,
+            max_rows=34,
+        )
+
     # Позиции документов
     pdf.add_page()
-    pk.cover(pdf, "Позиции списаний")
+    pk.cover(pdf, "Товарные позиции списаний")
     pk.section_header(pdf, "Позиции по документам")
     pk.table(
         pdf,

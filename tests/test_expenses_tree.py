@@ -63,3 +63,29 @@ def test_expense_tree_sorted():
     assert block.index("10:00 [Касса] 3 000 ₽") < block.index("09:00 [Касса] 500 ₽")
     # Заголовок статьи с суммой и числом операций.
     assert "▸ Аренда: 3 500 ₽ (2 опер.)" in text
+
+
+class _WriteoffConn:
+    def __init__(self):
+        self.queries = []
+
+    def cursor(self):
+        return _Cur(self)
+
+    def script(self, sql):
+        self.queries.append(sql)
+        if "COUNT(*)" in sql and "agent_name" in sql:
+            return [("Клиент А", 2, 1_500_000, 750_000)]
+        return [("База Воровского 107/1", 1_500_000)]
+
+
+def test_cashflow_writeoffs_grouped_by_counterparty_and_store():
+    conn = _WriteoffConn()
+    data = report_cashflow.get_cashflow_writeoffs(
+        conn, date(2026, 8, 1), date(2026, 8, 5),
+    )
+
+    assert data["total"] == 1_500_000
+    assert data["by_project"] == {"База Воровского 107/1": 1_500_000}
+    assert data["by_agent"] == [("Клиент А", 2, 1_500_000, 750_000)]
+    assert all("lower(btrim" in sql for sql in conn.queries)

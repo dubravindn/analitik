@@ -125,7 +125,7 @@ def build_expenses_report(
     lines: list[str] = []
     store_label = store_name or "Все склады"
     lines.append(f"💸 Расходы {period_str} · {store_label}")
-    lines.append("(кассовые и банковские исходящие документы)")
+    lines.append("(кассовые и банковские исходящие документы; статья «Списание» перенесена в списания)")
     lines.append("")
 
     # Фильтр по складу.
@@ -139,13 +139,26 @@ def build_expenses_report(
         _proj_filter = ""
         _extra = ()
 
+    from . import config
+    writeoff_items = sorted({
+        name.strip().lower()
+        for name in (getattr(config, "CASHFLOW_WRITEOFF_ITEMS", ()) or ())
+        if name.strip()
+    })
+    _writeoff_filter = (
+        "AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)"
+        if writeoff_items else ""
+    )
+    _params = (d_from, d_to) + ((writeoff_items,) if writeoff_items else ()) + _extra
+
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT SUM(amount_kop), COUNT(*)
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
+            {_writeoff_filter}
             {_proj_filter}
-        """, (d_from, d_to) + _extra)
+        """, _params)
         row = cur.fetchone()
         out_kop = float(row[0] or 0)
         out_cnt = int(row[1] or 0)
@@ -167,10 +180,11 @@ def build_expenses_report(
                        (project_name IS NULL OR project_name = '') AS no_proj
                 FROM cashflow_event
                 WHERE day BETWEEN %s AND %s AND direction = 'out'
+                {_writeoff_filter}
                 {_proj_filter}
                 GROUP BY 1, 4
                 ORDER BY no_proj ASC, 2 DESC
-            """, (d_from, d_to) + _extra)
+            """, _params)
             by_project = cur.fetchall()
         if len(by_project) > 1:
             lines.append("── По складам (сводка) ──")
@@ -190,9 +204,10 @@ def build_expenses_report(
                    project_name, amount_kop
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
+            {_writeoff_filter}
             {_proj_filter}
             ORDER BY amount_kop DESC
-        """, (d_from, d_to) + _extra)
+        """, _params)
         out_docs = cur.fetchall()
 
     # Сгруппировать по статье, сохранив порядок «по убыванию суммы» внутри статьи
@@ -258,16 +273,20 @@ def get_owner_withdrawals(conn, d_from: date, d_to: date) -> int:
 
 
 def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
-    """Операционные расходы за период без изъятий собственника.
+    """Операционные расходы без изъятий и расходов, являющихся списаниями.
 
     Returns {"total": int (копейки), "by_project": {"склад": int, "__general__": int}}
     '__general__' — расходы без проекта (None / пустая строка).
     """
     from . import config
     owner = list(config.OWNER_EXPENSE_ITEMS or [])
-    excl = ("AND (expense_item_name IS NULL OR NOT (expense_item_name = ANY(%s)))"
-            if owner else "")
-    params = (d_from, d_to) + ((owner,) if owner else ())
+    writeoffs = list(getattr(config, "CASHFLOW_WRITEOFF_ITEMS", ()) or ())
+    excluded = sorted({name.strip().lower() for name in owner + writeoffs if name.strip()})
+    excl = (
+        "AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)"
+        if excluded else ""
+    )
+    params = (d_from, d_to) + ((excluded,) if excluded else ())
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -287,3 +306,56 @@ def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
         by_project[proj] = v
         total += v
     return {"total": total, "by_project": by_project}
+
+
+def get_cashflow_writeoffs(conn, d_from: date, d_to: date) -> dict:
+    """Списания, оформленные расходом со статьёй «Списание».
+
+    Returns ``total``, суммы ``by_project`` и рейтинг ``by_agent`` в формате
+    ``(контрагент, документов, сумма, средняя сумма)``.
+    """
+    from . import config
+    items = sorted({
+        name.strip().lower()
+        for name in (getattr(config, "CASHFLOW_WRITEOFF_ITEMS", ()) or ())
+        if name.strip()
+    })
+    if not items:
+        return {"total": 0, "by_project": {}, "by_agent": []}
+
+    condition = """
+        day BETWEEN %s AND %s AND direction = 'out'
+        AND lower(btrim(COALESCE(expense_item_name, ''))) = ANY(%s)
+    """
+    params = (d_from, d_to, items)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(project_name, ''), '__general__'),
+                   COALESCE(SUM(amount_kop), 0)
+            FROM cashflow_event
+            WHERE {condition}
+            GROUP BY 1
+        """, params)
+        project_rows = cur.fetchall()
+
+    by_project = {str(project): int(kop or 0) for project, kop in project_rows}
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(agent_name, ''), 'Контрагент не указан'),
+                   COUNT(*), COALESCE(SUM(amount_kop), 0),
+                   COALESCE(AVG(amount_kop), 0)
+            FROM cashflow_event
+            WHERE {condition}
+            GROUP BY 1
+            ORDER BY SUM(amount_kop) DESC, 1
+        """, params)
+        agent_rows = [
+            (str(agent), int(docs or 0), int(total or 0), int(avg or 0))
+            for agent, docs, total, avg in cur.fetchall()
+        ]
+
+    return {
+        "total": sum(by_project.values()),
+        "by_project": by_project,
+        "by_agent": agent_rows,
+    }

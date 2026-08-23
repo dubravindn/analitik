@@ -13,7 +13,11 @@ from datetime import date
 from . import calc, config
 from . import pdf_kit as pk
 from .costs import unit_cost  # noqa: F401
-from .report_cashflow import get_operational_expenses, get_owner_withdrawals
+from .report_cashflow import (
+    get_cashflow_writeoffs,
+    get_operational_expenses,
+    get_owner_withdrawals,
+)
 from .report_sales import _sales_purchase_data, _store_id_for
 
 # Корневая группа шаров (НЕ внутри Ассортимента — отдельный корень ШАРЫ).
@@ -571,6 +575,45 @@ def _append_top_clients(
     )
 
 
+def _append_writeoff_clients(pdf: pk.HermesPDF, rows: list[tuple]) -> None:
+    """Один лист A4: контрагенты БАЗЫ по расходной статье «Списание»."""
+    if not rows:
+        return
+    visible = rows[:34]
+    pdf.add_page()
+    pk.cover(pdf, "ТОП КЛИЕНТОВ ПО СПИСАНИЯМ · БАЗА")
+    pk.callout(
+        pdf,
+        "Источник: кассовые и банковские расходы со статьёй «Списание». "
+        "Эти суммы перенесены из операционных расходов в обычные списания и "
+        "уменьшают прибыль только один раз. Контрагент показывает, у какого "
+        "клиента произошло списание. На листе показаны первые 34 по сумме.",
+        kind="info",
+    )
+    total = sum(int(row[2] or 0) for row in rows)
+    pk.kpi_row(pdf, [
+        ("Контрагентов", str(len(rows)), ""),
+        ("Документов", str(sum(int(row[1] or 0) for row in rows)), ""),
+        ("Сумма", _rub(total), "₽"),
+    ])
+    table_rows = [
+        [
+            str(index), _trunc(agent or "Контрагент не указан", 55),
+            str(int(docs or 0)), _rub(amount) + " ₽", _rub(avg) + " ₽",
+        ]
+        for index, (agent, docs, amount, avg) in enumerate(visible, 1)
+    ]
+    pk.table(
+        pdf,
+        headers=["#", "Контрагент", "Списаний", "Сумма", "Среднее"],
+        rows=table_rows,
+        col_widths=[8, 84, 20, 32, 30],
+        aligns=["R", "L", "R", "R", "R"],
+        font_size=7.2,
+        max_rows=34,
+    )
+
+
 def _append_churn_clients(pdf: pk.HermesPDF, rows: list[tuple]) -> None:
     """Все клиенты БАЗЫ: без заказа >10 дней, средний чек >=10 000 ₽."""
     pdf.add_page()
@@ -674,6 +717,9 @@ def _append_period_changes(
     prev_loss = int(_get_losses_by_store(
         conn, prev_from, prev_to, discount_pids=discount_pids,
     ).get("__total__", 0))
+    prev_loss += int(get_cashflow_writeoffs(
+        conn, prev_from, prev_to,
+    )["total"] or 0)
     prev_checks = sum(int(r[4] or 0) for r in prev_biz)
     prev = {
         "rev": prev_rev,
@@ -747,6 +793,7 @@ def _period_metrics(conn, d_from: date, d_to: date, store_name: str | None,
     losses = int(_get_losses_by_store(
         conn, d_from, d_to, discount_pids=discount_pids,
     ).get("__total__", 0))
+    losses += int(get_cashflow_writeoffs(conn, d_from, d_to)["total"] or 0)
     checks = sum(int(r[4] or 0) for r in business)
     before_losses = gross - expenses
     return {
@@ -904,6 +951,21 @@ def build_sales_pdf(
         conn, d_from, d_to,
         discount_pids=discount_pids,
         inventory_doc_ids=inventory_loss_ids,
+    )
+    cashflow_writeoffs = get_cashflow_writeoffs(conn, d_from, d_to)
+    base_writeoff_store = getattr(
+        config, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
+    )
+    known_store_names = {str(row[1]) for row in stores}
+    for writeoff_project, writeoff_kop in cashflow_writeoffs["by_project"].items():
+        target_store = (
+            writeoff_project
+            if writeoff_project in known_store_names
+            else base_writeoff_store
+        )
+        losses[target_store] = losses.get(target_store, 0) + int(writeoff_kop or 0)
+    losses["__total__"] = losses.get("__total__", 0) + int(
+        cashflow_writeoffs["total"] or 0
     )
     losses_total = losses.get("__total__", 0)
     all_loss_details = (
@@ -1290,6 +1352,7 @@ def build_sales_pdf(
         _append_loss_details_by_store(
             pdf, ordinary_loss_details, reuse_current_page=True,
         )
+    _append_writeoff_clients(pdf, cashflow_writeoffs["by_agent"])
     if inventory_loss_details:
         _append_loss_details_by_store(
             pdf, inventory_loss_details, inventory=True,

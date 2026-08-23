@@ -145,6 +145,7 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
     from . import calc
     from .report_sales_pdf import _period_metrics
     from .report_clients import get_churn_clients
+    from .report_cashflow import get_cashflow_writeoffs
 
     facts: list[dict[str, Any]] = []
     discount_pids = calc.discount_product_ids(conn)
@@ -159,6 +160,18 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
         facts.append(_fact(
             f"period.selected.{key}", "financial", label,
             selected.get(key, 0), unit, period=selected_label,
+        ))
+
+    # Денежные списания БАЗЫ: ИИ получает контрагента, количество документов и
+    # сумму, а не видит их как безымянные операционные расходы.
+    for index, (agent, docs, amount, avg) in enumerate(
+        get_cashflow_writeoffs(conn, d_from, d_to)["by_agent"][:35], 1
+    ):
+        facts.append(_fact(
+            f"period.writeoff_agent.{index}", "loss",
+            f"Списание у контрагента: {agent}", amount, "kop",
+            store="База Воровского 107/1", period=selected_label,
+            details={"documents": docs, "average_kop": avg, "source": "cashflow"},
         ))
 
     # Сравнения день/неделя/месяц/год используют одинаковую методику отчёта.
