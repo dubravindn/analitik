@@ -643,7 +643,7 @@ def _append_period_changes(
             GROUP BY store_id, store_name, channel
         """, params)
         prev_stores = cur_db.fetchall()
-    prev_biz = [r for r in prev_stores if r[2] in ("розница", "опт", "ресторан")]
+    prev_biz = [r for r in prev_stores if r[2] in config.PROFIT_CHANNELS]
     prev_rev = sum(int(r[3] or 0) for r in prev_biz)
     prev_cost = sum(int(by_store.get(r[0], {}).get("pc", 0)) for r in prev_biz)
     prev_profit = prev_rev - prev_cost
@@ -716,7 +716,7 @@ def _period_metrics(conn, d_from: date, d_to: date, store_name: str | None,
             GROUP BY store_id, store_name, channel
         """, params)
         stores = cur_db.fetchall()
-    business = [r for r in stores if r[2] in ("розница", "опт", "ресторан")]
+    business = [r for r in stores if r[2] in config.PROFIT_CHANNELS]
     revenue = sum(int(r[3] or 0) for r in business)
     purchase_cost = sum(int(by_store.get(r[0], {}).get("pc", 0)) for r in business)
     gross = revenue - purchase_cost
@@ -905,7 +905,7 @@ def build_sales_pdf(
         share  = round(general_exp * rev_s / total_rev_for_alloc)
         return _gross(sid, rev_s) - direct - share
 
-    _biz = [r for r in stores if r[2] in ("розница", "опт", "ресторан")]
+    _biz = [r for r in stores if r[2] in config.PROFIT_CHANNELS]
     grand_rev      = sum(r[3] for r in _biz)
     grand_cost_raw = sum(by_store.get(r[0], {}).get("pc_raw", 0) for r in _biz)
     discount_total = sum(by_store.get(r[0], {}).get("discount", 0) for r in _biz)
@@ -1038,7 +1038,7 @@ def build_sales_pdf(
             f"прибыль {_rub(ms_profit)} ₽. Управленческая валовая прибыль выше "
             f"на {_rub(management_adjustment)} ₽ из-за другой себестоимости "
             "(цена закупки из карточки + скидка 7%). Это две разные методики, "
-            "а не потерянные склады. СОБРАНИЕ и ФАБРИКА учитываются в перемещениях."
+            "а не потерянные склады."
         ),
         kind="info",
     )
@@ -1070,7 +1070,7 @@ def build_sales_pdf(
     chan_styles: list[str | None] = []
     mixed_in_table: list[str] = []
 
-    for channel in ("розница", "опт", "ресторан"):
+    for channel in config.PROFIT_CHANNELS:
         chan = [r for r in stores if r[2] == channel]
         c_rev = sum(r[3] for r in chan)
         if c_rev == 0:
@@ -1303,17 +1303,6 @@ def build_sales_pdf(
                 aligns=["L", "R", "R", "R"],
                 font_size=7.8,
             )
-            pdf.set_x(pk._MARGIN)
-            pdf.set_font("DejaVu", size=7.5)
-            pdf.set_text_color(*pk.SAGE)
-            pdf.multi_cell(
-                pk._INNER_W,
-                4,
-                "СОБРАНИЕ и ФАБРИКА показаны с нулевой продажей: "
-                "эти точки получают товар перемещениями, а не отгрузками.",
-                align="L",
-            )
-            pdf.set_text_color(*pk.INK)
 
     # Полная детализация нужна в управленческом «Отчёте за период»:
     # отдельный лист каждого отдела, без лимита строк и без исключения БАЗЫ.

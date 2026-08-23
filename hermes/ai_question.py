@@ -203,7 +203,7 @@ def _append_business_breakdowns(conn, facts: list[dict], d_from: date, d_to: dat
             SELECT store_name, product_name, qty, revenue
             FROM ranked WHERE rn <= 8 ORDER BY store_name, rn
             """,
-            (d_from, d_to, ["розница", "опт", "ресторан"]),
+            (d_from, d_to, list(config.PROFIT_CHANNELS)),
         )
         for idx, (store, product, qty, revenue) in enumerate(cur.fetchall(), 1):
             facts.append(_fact(

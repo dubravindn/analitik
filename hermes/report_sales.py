@@ -211,7 +211,7 @@ def build_sales_analytics(conn, d_from: date, d_to: date, store_name: str | None
     retail_margins: list[tuple[str, float, int]] = []   # (склад, маржа%, разрыв-база ₽) чистой розницы
 
     grand_rev = grand_cost = grand_chk = 0
-    for channel in ("розница", "опт", "ресторан"):
+    for channel in config.PROFIT_CHANNELS:
         chan = [r for r in stores if r[2] == channel]
         c_rev = sum(r[3] for r in chan)
         if c_rev == 0:

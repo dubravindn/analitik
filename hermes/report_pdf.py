@@ -56,7 +56,7 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
 
     # 1. Выручка и чеки — из sales_by_store_day (только бизнес-каналы).
     # M1: фильтр по channel совпадает с report_sales, иначе avg_check расходится.
-    _known_channels = ["розница", "опт", "ресторан"]
+    _known_channels = list(_cfg.PROFIT_CHANNELS)
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(revenue_kop), 0),

@@ -14,6 +14,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 
+from . import config
+
 
 _BASE_STORE = "База Воровского 107/1"
 _METRICS = (
@@ -259,7 +261,7 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
             WHERE day BETWEEN %s AND %s
               AND channel = ANY(%s)
             GROUP BY store_name ORDER BY SUM(revenue_kop) DESC
-        """, (d_from, d_to, ["розница", "опт", "ресторан"]))
+        """, (d_from, d_to, list(config.PROFIT_CHANNELS)))
         store_names = [row[0] for row in cur.fetchall()]
     for idx, store_name in enumerate(store_names, 1):
         store_metrics = summary(d_from, d_to, store_name)
