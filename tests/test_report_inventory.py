@@ -28,6 +28,21 @@ def test_inventory_sessions_exclude_ordinary_retail_spoilage(monkeypatch):
     assert sessions[0]["net_kop"] == -20_000
 
 
+def test_inventory_loss_ids_use_same_classification_as_sessions(monkeypatch):
+    day = date(2026, 8, 17)
+    retail = "Розница Воровского 107/1"
+    rows = [
+        _row("enter", retail, day, 40, 0, 50_000, "E1"),
+        _row("loss", retail, day, 22, 0, 70_000, "L-INV"),
+        _row("loss", retail, day, 10, 146_100, 146_100, "L-SPOIL"),
+    ]
+    monkeypatch.setattr(report_inventory, "_doc_rows", lambda *_: rows)
+
+    assert report_inventory.inventory_loss_doc_ids(
+        object(), day, day,
+    ) == {"L-INV"}
+
+
 def test_inventory_report_explains_both_sides_and_missing_points(monkeypatch):
     day = date(2026, 8, 17)
     retail = "Розница Воровского 107/1"

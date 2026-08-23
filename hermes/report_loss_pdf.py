@@ -19,10 +19,13 @@ def _qty(q: float) -> str:
 
 
 def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
-    """PDF «Списания» — порча розницы (без корректировок Базы)."""
+    """PDF «Списания» — обычная порча без корректировок инвентаризации."""
     period = f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}"
     days = max((date_to - date_from).days + 1, 1)
-    excl = list(config.ADJUSTMENT_STORES or [])
+    from .report_inventory import inventory_loss_doc_ids
+    excluded_docs = sorted(
+        inventory_loss_doc_ids(conn, date_from, date_to)
+    ) or ["__none__"]
 
     # ── скидка ООО «Поставщик» ───────────────────────────────────────────────
     discount_pids = calc.discount_product_ids(conn)
@@ -63,10 +66,10 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
                    COALESCE(SUM({_TOTAL}), 0) AS loss_kop
             {_JOIN}
             WHERE d.day BETWEEN %s AND %s
-              AND NOT (d.store_name = ANY(%s))
+              AND NOT (d.doc_id = ANY(%s))
             GROUP BY d.store_name
             ORDER BY loss_kop DESC
-        """, _dp() + [date_from, date_to, excl])
+        """, _dp() + [date_from, date_to, excluded_docs])
         store_rows = cur.fetchall()
 
     grand_kop = sum(int(r[2] or 0) for r in store_rows)
@@ -79,8 +82,8 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
             FROM loss_item i
             JOIN loss_doc d ON d.doc_id = i.doc_id
             WHERE d.day BETWEEN %s AND %s
-              AND NOT (d.store_name = ANY(%s))
-        """, [date_from, date_to, excl])
+              AND NOT (d.doc_id = ANY(%s))
+        """, [date_from, date_to, excluded_docs])
         grand_items = int(cur.fetchone()[0] or 0)
 
     # ── 3. Позиции документов (дата DESC) ────────────────────────────────────
@@ -90,9 +93,9 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
                    COALESCE({_TOTAL}, 0) AS item_kop
             {_JOIN}
             WHERE d.day BETWEEN %s AND %s
-              AND NOT (d.store_name = ANY(%s))
+              AND NOT (d.doc_id = ANY(%s))
             ORDER BY d.moment DESC, d.doc_id, i.product_name
-        """, _dp() + [date_from, date_to, excl])
+        """, _dp() + [date_from, date_to, excluded_docs])
         doc_rows = cur.fetchall()
 
     # ── 4. Топ-10 позиций по сумме (Ассортимент) ───────────────────────���────
@@ -104,12 +107,12 @@ def build_loss_pdf(conn, date_from: date, date_to: date) -> bytes:
                    COALESCE(SUM({_TOTAL}), 0) AS pos_kop
             {_JOIN}
             WHERE d.day BETWEEN %s AND %s
-              AND NOT (d.store_name = ANY(%s))
+              AND NOT (d.doc_id = ANY(%s))
               AND {asof}
             GROUP BY i.product_name
             ORDER BY pos_kop DESC
             LIMIT 15
-        """, _dp() + [date_from, date_to, excl])
+        """, _dp() + [date_from, date_to, excluded_docs])
         top_rows = cur.fetchall()
 
     # ── рендеринг ───────────���────────────────────────────────────────────────

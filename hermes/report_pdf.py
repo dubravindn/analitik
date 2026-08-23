@@ -48,7 +48,6 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
     from .report_stock import STALE_SREZKA_MIN_DAYS
     from . import config as _cfg, calc
 
-    adj = _cfg.ADJUSTMENT_STORES or ["__none__"]
     own = getattr(_cfg, "OWNER_EXPENSE_ITEMS", []) or []
 
     sf_sd = "AND store_name = %s" if store_name else ""
@@ -123,17 +122,22 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             op_expenses = int((cur.fetchone() or (0,))[0])
         owner_kop = 0
 
-    # 3. Списания — N3: порча розницы vs корректировки учёта (ADJUSTMENT_STORES)
+    # 3. Списания: обычная порча отдельно от технических документов
+    # инвентаризации на всех точках.
     sf_ls = "AND d.store_name = %s" if store_name else ""
     p_ls  = [d_from, d_to] + ([store_name] if store_name else [])
+    from .report_inventory import inventory_loss_doc_ids
+    inventory_ids = sorted(
+        inventory_loss_doc_ids(conn, d_from, d_to)
+    ) or ["__none__"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(SUM(i.total_kop), 0)
             FROM loss_doc d JOIN loss_item i ON i.doc_id = d.doc_id
             WHERE d.day BETWEEN %s AND %s {sf_ls}
-              AND NOT (d.store_name = ANY(%s))
-        """, p_ls + [adj])
+              AND NOT (d.doc_id = ANY(%s))
+        """, p_ls + [inventory_ids])
         loss_spoil = int((cur.fetchone() or (0,))[0])
 
     with conn.cursor() as cur:
@@ -141,11 +145,13 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
             SELECT COALESCE(SUM(i.total_kop), 0)
             FROM loss_doc d JOIN loss_item i ON i.doc_id = d.doc_id
             WHERE d.day BETWEEN %s AND %s {sf_ls}
-              AND (d.store_name = ANY(%s))
-        """, p_ls + [adj])
+              AND (d.doc_id = ANY(%s))
+        """, p_ls + [inventory_ids])
         loss_adj = int((cur.fetchone() or (0,))[0])
 
-    loss      = loss_spoil + loss_adj
+    # Корректировка инвентаризации — учётный документ, не обычная порча.
+    # Её нельзя повторно вычитать из прибыли.
+    loss      = loss_spoil
     result    = profit - op_expenses - loss
     avg_check = calc.avg_check(rev, checks)  # M1: единая формула round(), как в report_sales
 
@@ -342,7 +348,7 @@ def build_pdf(
         # N3: списания с разбивкой по типу
         _row("Порча (розничные точки)",        s["loss_spoil"], spoil_pct)
         if s["loss_adj"] > 0:
-            _row("Корректировки учёта (База)", s["loss_adj"], "")
+            _row("Технические списания инвентаризаций", s["loss_adj"], "справочно")
 
         # Горизонтальная черта
         pdf.ln(2)

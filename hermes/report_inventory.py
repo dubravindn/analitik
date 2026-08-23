@@ -108,6 +108,23 @@ def _is_inventory_loss(row: dict[str, Any], enter_days: set[tuple[str, date]]) -
     )
 
 
+def inventory_loss_doc_ids(conn, d_from: date, d_to: date) -> set[str]:
+    """IDs технических списаний, созданных инвентаризацией.
+
+    Это единая классификация для P&L, детализации списаний и блока
+    инвентаризации. Техническое списание показывается в инвентаризации, но не
+    считается обычной порчей и не уменьшает прибыль второй раз.
+    """
+    rows = _doc_rows(conn, d_from, d_to)
+    enter_days = {
+        (row["store"], row["day"]) for row in rows if row["kind"] == "enter"
+    }
+    return {
+        row["doc_id"] for row in rows
+        if row["kind"] == "loss" and _is_inventory_loss(row, enter_days)
+    }
+
+
 def load_inventory_sessions(conn, d_from: date, d_to: date) -> list[dict[str, Any]]:
     rows = _doc_rows(conn, d_from, d_to)
     enter_days = {

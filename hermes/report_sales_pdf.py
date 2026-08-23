@@ -132,14 +132,18 @@ def _get_svoi_purchases(conn, d_from: date, d_to: date) -> dict:
 def _get_losses_by_store(
     conn, d_from: date, d_to: date,
     discount_pids: frozenset | None = None,
+    inventory_doc_ids: set[str] | None = None,
 ) -> dict[str, int]:
-    """Списания по закупочной стоимости (исключая ADJUSTMENT_STORES).
+    """Обычная порча по закупочной стоимости, без инвентаризации.
 
     Для товаров ООО «Поставщик» применяет скидку 7% к цене из purchase_price_asof.
     Стоимость i.total_kop (если product_id неизвестен) оставляем без изменений —
     нет информации о поставщике.
     """
-    excl = list(config.ADJUSTMENT_STORES or [])
+    if inventory_doc_ids is None:
+        from .report_inventory import inventory_loss_doc_ids as _inventory_ids
+        inventory_doc_ids = _inventory_ids(conn, d_from, d_to)
+    excluded_docs = sorted(inventory_doc_ids) or ["__none__"]
     disc_list = sorted(discount_pids) if discount_pids else []
     has_disc = bool(disc_list)
 
@@ -148,7 +152,7 @@ def _get_losses_by_store(
         "THEN 0.93::numeric ELSE 1.0 END"
         if has_disc else ""
     )
-    params: list = ([disc_list] if has_disc else []) + [d_from, d_to, excl]
+    params: list = ([disc_list] if has_disc else []) + [d_from, d_to, excluded_docs]
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -168,7 +172,7 @@ def _get_losses_by_store(
                 ORDER BY p.priced_from DESC LIMIT 1
             ) pp ON true
             WHERE d.day BETWEEN %s AND %s
-              AND NOT (d.store_name = ANY(%s))
+              AND NOT (d.doc_id = ANY(%s))
             GROUP BY d.store_name
         """, params)
         rows = cur.fetchall()
@@ -342,12 +346,19 @@ def _append_loss_position_table(
 
 def _append_loss_details_by_store(
     pdf: pk.HermesPDF, details: dict[str, list[tuple]],
+    *, inventory: bool = False, reuse_current_page: bool = False,
 ) -> None:
-    """Отдельная страница каждого отдела со всеми списанными позициями."""
-    adjustment_stores = set(config.ADJUSTMENT_STORES or [])
-    for store_name, rows in details.items():
-        pdf.add_page()
-        pk.cover(pdf, "СПИСАНИЯ ПО ОТДЕЛУ")
+    """Отдельная страница каждого отдела с позициями одной категории."""
+    for detail_index, (store_name, rows) in enumerate(details.items()):
+        if detail_index or not reuse_current_page:
+            pdf.add_page()
+        else:
+            pdf.ln(7)
+        pk.cover(
+            pdf,
+            "ИНВЕНТАРИЗАЦИЯ — СПИСАНИЕ"
+            if inventory else "ОБЫЧНЫЕ СПИСАНИЯ (ПОРЧА)",
+        )
         pdf.set_x(pk._MARGIN)
         pdf.set_font("DejaVu_B", size=11)
         pdf.set_text_color(*pk.INK)
@@ -363,15 +374,27 @@ def _append_loss_details_by_store(
             ("Количество", _qty(total_qty), "ед."),
             ("Сумма", _rub(total_kop), "₽"),
         ])
-        if store_name in adjustment_stores:
+        if inventory:
             pk.callout(
                 pdf,
-                "Этот отдел используется для корректировок инвентаризации. "
-                "Строки показаны полностью, но их сумма не считается порчей "
-                "и не вычитается повторно из прибыли.",
+                "Это техническая часть инвентаризации: фактический остаток оказался "
+                "меньше учётного. Сумма не считается обычной порчей и не вычитается "
+                "из прибыли. Ниже в разделе инвентаризаций она сопоставляется с "
+                "оприходованием излишков; итог корректировки = оприходовано − списано.",
                 kind="info",
             )
-        pk.section_header(pdf, "Все списанные позиции")
+        else:
+            pk.callout(
+                pdf,
+                "Обычная порча. Сумма этого раздела входит в показатель «Списания» "
+                "и уменьшает прибыль после списаний.",
+                kind="info",
+            )
+        pk.section_header(
+            pdf,
+            "Позиции технического списания"
+            if inventory else "Все списанные позиции",
+        )
         _append_loss_position_table(pdf, store_name, rows)
 
 
@@ -875,14 +898,30 @@ def build_sales_pdf(
     # -- Расходы, изъятия, потери, шары, свои ----------------------------------
     exp = get_operational_expenses(conn, d_from, d_to)
     owner_kop = get_owner_withdrawals(conn, d_from, d_to)
-    losses = _get_losses_by_store(conn, d_from, d_to, discount_pids=discount_pids)
+    from .report_inventory import inventory_loss_doc_ids
+    inventory_loss_ids = inventory_loss_doc_ids(conn, d_from, d_to)
+    losses = _get_losses_by_store(
+        conn, d_from, d_to,
+        discount_pids=discount_pids,
+        inventory_doc_ids=inventory_loss_ids,
+    )
     losses_total = losses.get("__total__", 0)
-    loss_details = (
+    all_loss_details = (
         _get_loss_details_by_store(
             conn, d_from, d_to, discount_pids=discount_pids,
         )
         if include_management_sections else {}
     )
+    ordinary_loss_details: dict[str, list[tuple]] = {}
+    inventory_loss_details: dict[str, list[tuple]] = {}
+    for detail_store, detail_rows in all_loss_details.items():
+        for row in detail_rows:
+            target = (
+                inventory_loss_details
+                if row[2] in inventory_loss_ids
+                else ordinary_loss_details
+            )
+            target.setdefault(detail_store, []).append(row)
     balls_data = _get_balls_by_store(conn, d_from, d_to)
     svoi = _get_svoi_purchases(conn, d_from, d_to)
 
@@ -913,32 +952,6 @@ def build_sales_pdf(
     grand_prof     = grand_rev - grand_cost
     grand_net      = grand_prof - exp["total"]
     grand_after    = grand_net - losses_total
-
-    # Контрольная прибыль ровно по стандартной себестоимости отчёта МойСклад.
-    # Основной P&L ниже остаётся управленческим: закупочная цена из карточки,
-    # скидка поставщика 7% и фолбэк 60% для непокрытых позиций.
-    biz_store_ids = [r[0] for r in _biz]
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT store_id,
-                   COALESCE(SUM(revenue_kop), 0),
-                   COALESCE(SUM(cost_kop), 0)
-            FROM sales_by_store_day
-            WHERE day BETWEEN %s AND %s
-              AND store_id = ANY(%s::text[])
-            GROUP BY store_id
-            """,
-            (d_from, d_to, biz_store_ids),
-        )
-        ms_by_store = {
-            sid: (int(revenue or 0), int(cost or 0))
-            for sid, revenue, cost in cur.fetchall()
-        }
-    ms_rev = sum(row[0] for row in ms_by_store.values())
-    ms_cost = sum(row[1] for row in ms_by_store.values())
-    ms_profit = ms_rev - ms_cost
-    management_adjustment = grand_prof - ms_profit
 
     # -- Отдельный топ-40 по каждому складу -----------------------------------
     top_by_store: list[tuple[str, list[tuple]]] = []
@@ -1030,19 +1043,6 @@ def build_sales_pdf(
         )
     pdf.multi_cell(pk._INNER_W, 4, cov_note, align="L")
     pdf.set_text_color(*pk.INK)
-    pk.callout(
-        pdf,
-        (
-            "Контроль МойСклад по всем торговым складам: "
-            f"выручка {_rub(ms_rev)} ₽; себестоимость {_rub(ms_cost)} ₽; "
-            f"прибыль {_rub(ms_profit)} ₽. Управленческая валовая прибыль выше "
-            f"на {_rub(management_adjustment)} ₽ из-за другой себестоимости "
-            "(цена закупки из карточки + скидка 7%). Это две разные методики, "
-            "а не потерянные склады."
-        ),
-        kind="info",
-    )
-
     # -- Графики ---------------------------------------------------------------
     try:
         from . import charts as _ch
@@ -1105,14 +1105,18 @@ def build_sales_pdf(
                 chan_rows.append([f"  {ball_lbl}", _rub(ball_rev) + " ₽", "", "", ""])
                 chan_styles.append("detail")
 
-        chan_rows.append([
-            f"  Итого {channel}",
-            _rub(c_rev)   + " ₽",
-            _rub_pct(c_gross, c_rev),
-            _rub_pct(c_net, c_rev),
-            _rub_pct(c_after, c_rev),
-        ])
-        chan_styles.append(None)
+        # Подытог канала полезен, только когда он объединяет несколько складов.
+        # Для единственной строки «ОПТ База» он полностью дублировал цифры.
+        active_channel_rows = [r for r in chan if r[3] != 0]
+        if len(active_channel_rows) > 1:
+            chan_rows.append([
+                f"  Итого {channel}",
+                _rub(c_rev)   + " ₽",
+                _rub_pct(c_gross, c_rev),
+                _rub_pct(c_net, c_rev),
+                _rub_pct(c_after, c_rev),
+            ])
+            chan_styles.append(None)
 
     chan_rows.append([
         "ИТОГО",
@@ -1236,9 +1240,11 @@ def build_sales_pdf(
     store_losses = {k: v for k, v in losses.items() if k != "__total__"}
     if store_losses:
         # Заголовок и таблица должны начинаться на одной странице.
-        if pdf.get_y() + 42 > pdf.page_break_trigger:
+        # Заголовок + шапка + 4 склада + итог занимают около 55 мм. Не оставляем
+        # одну итоговую строку сиротой на следующей почти пустой странице.
+        if pdf.get_y() + 58 > pdf.page_break_trigger:
             pdf.add_page()
-        pk.section_header(pdf, "Списания и прибыль по складам")
+        pk.section_header(pdf, "Обычные списания (порча) и прибыль по складам")
         loss_tbl_rows = []
         sum_net = 0; sum_after = 0
         for sid, sn, ch, rev_s, _ in stores:
@@ -1262,7 +1268,7 @@ def build_sales_pdf(
         ])
         pk.table(
             pdf,
-            headers=["Склад", "Списания", "До списаний", "После списаний"],
+            headers=["Склад", "Порча", "До порчи", "После порчи"],
             rows=loss_tbl_rows,
             col_widths=[76, 28, 35, 35],
             aligns=["L", "R", "R", "R"],
@@ -1278,36 +1284,16 @@ def build_sales_pdf(
             )
         pdf.ln(1)
 
-        if not store_name:
-            pk.section_header(pdf, "Контроль прибыли МойСклад по складам")
-            ms_rows = []
-            for sid, sn, _channel, _rev, _checks in _biz:
-                revenue, cost = ms_by_store.get(sid, (0, 0))
-                ms_rows.append([
-                    _trunc(sn, 34),
-                    _rub(revenue) + " ₽",
-                    _rub(cost) + " ₽",
-                    _rub(revenue - cost) + " ₽",
-                ])
-            ms_rows.append([
-                "ИТОГО",
-                _rub(ms_rev) + " ₽",
-                _rub(ms_cost) + " ₽",
-                _rub(ms_profit) + " ₽",
-            ])
-            pk.table(
-                pdf,
-                headers=["Склад", "Выручка", "Себест. МС", "Прибыль МС"],
-                rows=ms_rows,
-                col_widths=[72, 34, 34, 34],
-                aligns=["L", "R", "R", "R"],
-                font_size=7.8,
-            )
-
     # Полная детализация нужна в управленческом «Отчёте за период»:
     # отдельный лист каждого отдела, без лимита строк и без исключения БАЗЫ.
-    if loss_details:
-        _append_loss_details_by_store(pdf, loss_details)
+    if ordinary_loss_details:
+        _append_loss_details_by_store(
+            pdf, ordinary_loss_details, reuse_current_page=True,
+        )
+    if inventory_loss_details:
+        _append_loss_details_by_store(
+            pdf, inventory_loss_details, inventory=True,
+        )
 
     # -- Топ товаров: отдельный лист A4 для каждого склада ---------------------
     for top_store_name, top_rev in top_by_store:
