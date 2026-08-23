@@ -10,7 +10,11 @@
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+import json
+from pathlib import Path
+import threading
 import time
 
 from .moysklad import MoyskladClient
@@ -41,7 +45,19 @@ _AUDIT_PAGE_SIZE = 100
 # события начала недели не вытеснялись концом периода, и не создаёт сотни
 # параллельных запросов, на которые МойСклад отвечает 429.
 _MAX_AUDIT_SUMMARIES_PER_DAY = 100
-_AUDIT_REQUEST_PAUSE_SECONDS = 0.15
+# Технические пользователи создают тысячи событий синхронизации в день. Это не
+# ручные правки сотрудников и не должно занимать минуты в управленческом PDF.
+_IGNORED_AUDIT_UIDS = frozenset({
+    "robots.nirguna@dubravin_flowers",
+    "system@system",
+})
+# У МойСклад общий лимит запросов на аккаунт. Два потока нужны только для
+# перекрытия сетевого ожидания; общий limiter запускает не более 2.5 запросов/с.
+# Более агрессивные режимы на production фактически получили HTTP 429.
+_AUDIT_EVENT_WORKERS = 2
+_AUDIT_REQUEST_START_INTERVAL_SECONDS = 0.40
+_AUDIT_CACHE_VERSION = 1
+_AUDIT_CACHE_DIR = Path("/var/cache/hermes/audit")
 # В служебных карточках встречается sentinel 99 999 999 999 ₽.
 # Цена товара выше миллиона рублей не считается валидной «Наличкой».
 _MAX_CASH_PRICE_RUB = 1_000_000
@@ -250,7 +266,7 @@ def _diff_lines(
     return lines
 
 
-def _load_sales_document_audit(
+def _load_sales_document_audit_live(
     client: MoyskladClient, d_from: date, d_to: date,
     entity_types: tuple[str, ...] = (_CUSTOMER_ORDER, _DEMAND),
 ) -> tuple[list[dict], int, bool]:
@@ -289,7 +305,8 @@ def _load_sales_document_audit(
                 total_size = int(page.get("meta", {}).get("size", len(batch)) or 0)
                 for summary in batch:
                     summary_id = str(summary.get("id") or "")
-                    if summary_id:
+                    uid = str(summary.get("uid") or "").lower()
+                    if summary_id and uid not in _IGNORED_AUDIT_UIDS:
                         summaries_by_id[summary_id] = summary
                 offset += len(batch)
                 if not batch or offset >= total_size:
@@ -298,24 +315,37 @@ def _load_sales_document_audit(
                 truncated = True
         day += timedelta(days=1)
 
-    # Раскрытие audit/{id}/events — сетевой N+1. Читаем последовательно с
-    # ограничением частоты: параллельные запросы стабильно получают HTTP 429.
+    # Раскрытие audit/{id}/events — сетевой N+1. Читаем тремя потоками, но
+    # начало каждого запроса пропускаем через общий rate limiter.
     event_pages: dict[str, list[dict]] = {}
+    rate_lock = threading.Lock()
+    next_request_at = [time.monotonic()]
 
     def _fetch_events(summary_id: str) -> tuple[str, list[dict]]:
+        with rate_lock:
+            now = time.monotonic()
+            wait = max(0.0, next_request_at[0] - now)
+            next_request_at[0] = max(now, next_request_at[0]) + (
+                _AUDIT_REQUEST_START_INTERVAL_SECONDS
+            )
+        if wait:
+            time.sleep(wait)
         rows = client._get(
             f"/audit/{summary_id}/events", {"limit": 100},
         ).get("rows", [])
-        # Лимит API общий для аккаунта; выдерживаем паузу даже в одном потоке.
-        time.sleep(_AUDIT_REQUEST_PAUSE_SECONDS)
         return summary_id, rows
 
-    for summary_id in summaries_by_id:
-        try:
-            fetched_id, rows = _fetch_events(summary_id)
-            event_pages[fetched_id] = rows
-        except Exception:
-            truncated = True
+    with ThreadPoolExecutor(max_workers=_AUDIT_EVENT_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_events, summary_id): summary_id
+            for summary_id in summaries_by_id
+        }
+        for future in as_completed(futures):
+            try:
+                fetched_id, rows = future.result()
+                event_pages[fetched_id] = rows
+            except Exception:
+                truncated = True
 
     allowed_entity_types = set(entity_types)
     for summary_id, summary in summaries_by_id.items():
@@ -357,6 +387,78 @@ def _load_sales_document_audit(
     if meaningful_total > _MAX_AUDIT_EVENTS:
         truncated = True
     return result[:_MAX_AUDIT_EVENTS], meaningful_total, truncated
+
+
+def _audit_cache_path(day: date, entity_types: tuple[str, ...]) -> Path:
+    entities = "-".join(sorted(entity_types))
+    return _AUDIT_CACHE_DIR / f"v{_AUDIT_CACHE_VERSION}_{day.isoformat()}_{entities}.json"
+
+
+def _read_audit_day_cache(
+    day: date, entity_types: tuple[str, ...],
+) -> tuple[list[dict], int, bool] | None:
+    """Завершённый день аудита неизменяем; читаем его из локального кэша."""
+    if day >= date.today():
+        return None
+    try:
+        payload = json.loads(_audit_cache_path(day, entity_types).read_text("utf-8"))
+        if payload.get("version") != _AUDIT_CACHE_VERSION:
+            return None
+        rows = payload.get("rows") or []
+        return rows, int(payload.get("total") or len(rows)), bool(payload.get("truncated"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_audit_day_cache(
+    day: date, entity_types: tuple[str, ...],
+    result: tuple[list[dict], int, bool],
+) -> None:
+    if day >= date.today():
+        return
+    try:
+        target = _audit_cache_path(day, entity_types)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".tmp")
+        rows, total, truncated = result
+        temporary.write_text(json.dumps({
+            "version": _AUDIT_CACHE_VERSION,
+            "rows": rows,
+            "total": total,
+            "truncated": truncated,
+        }, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except OSError:
+        # Кэш — ускорение, а не обязательный источник данных.
+        return
+
+
+def _load_sales_document_audit(
+    client: MoyskladClient, d_from: date, d_to: date,
+    entity_types: tuple[str, ...] = (_CUSTOMER_ORDER, _DEMAND),
+) -> tuple[list[dict], int, bool]:
+    """Собрать период из дневного кэша; загрузить только отсутствующие дни."""
+    combined: list[dict] = []
+    meaningful_total = 0
+    truncated = False
+    day = d_from
+    while day <= d_to:
+        day_result = _read_audit_day_cache(day, entity_types)
+        if day_result is None:
+            day_result = _load_sales_document_audit_live(
+                client, day, day, entity_types=entity_types,
+            )
+            _write_audit_day_cache(day, entity_types, day_result)
+        rows, total, day_truncated = day_result
+        combined.extend(rows)
+        meaningful_total += total
+        truncated = truncated or day_truncated
+        day += timedelta(days=1)
+
+    combined.sort(key=lambda row: str(row.get("moment") or ""), reverse=True)
+    if meaningful_total > _MAX_AUDIT_EVENTS:
+        truncated = True
+    return combined[:_MAX_AUDIT_EVENTS], meaningful_total, truncated
 
 
 def _load_customer_order_audit(

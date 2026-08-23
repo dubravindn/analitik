@@ -276,3 +276,84 @@ def test_multiday_audit_reads_later_pages_without_losing_early_event(monkeypatch
     assert client.offsets == [0, 2]
     assert "Заказ покупателя № 13619" in text
     assert "Дата заказа: 20.08.2026 09:00 → 21.08.2026 09:00" in text
+
+
+def test_technical_sync_events_are_skipped_before_detail_requests(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.event_paths = []
+
+        def _get(self, path, params):
+            if path == "/audit":
+                if "entityType=demand" in params["filter"]:
+                    return {"meta": {"size": 0}, "rows": []}
+                return {"meta": {"size": 2}, "rows": [
+                    {
+                        "id": "robot-event",
+                        "uid": "robots.nirguna@dubravin_flowers",
+                    },
+                    {"id": "human-event", "uid": "manager@example"},
+                ]}
+            self.event_paths.append(path)
+            if path == "/audit/robot-event/events":
+                raise AssertionError("Техническое событие раскрывать нельзя")
+            if path == "/audit/human-event/events":
+                return {"rows": [{
+                    "eventType": "update", "entityType": "customerorder",
+                    "moment": "2026-08-20 12:00:00", "uid": "manager@example",
+                    "name": "14111", "diff": {"moment": {
+                        "oldValue": "2026-08-20 09:00:00",
+                        "newValue": "2026-08-21 09:00:00",
+                    }},
+                }]}
+            return {"rows": [], "meta": {"size": 0}}
+
+    monkeypatch.setattr(report_audit, "_AUDIT_REQUEST_START_INTERVAL_SECONDS", 0)
+    client = Client()
+    text = report_audit.build_audit_report(
+        client, date(2026, 8, 20), date(2026, 8, 20),
+    )
+    audit_event_paths = [p for p in client.event_paths if p.startswith("/audit/")]
+    assert audit_event_paths == ["/audit/human-event/events"]
+    assert "Заказ покупателя № 14111" in text
+
+
+def test_completed_audit_days_are_reused_from_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_audit, "_AUDIT_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(report_audit, "_AUDIT_REQUEST_START_INTERVAL_SECONDS", 0)
+
+    class Client:
+        def __init__(self):
+            self.summary_calls = 0
+
+        def _get(self, path, params):
+            if path == "/audit":
+                self.summary_calls += 1
+                if "entityType=demand" in params["filter"]:
+                    return {"meta": {"size": 0}, "rows": []}
+                return {"meta": {"size": 1}, "rows": [{
+                    "id": "cached-event", "uid": "manager@example",
+                }]}
+            if path == "/audit/cached-event/events":
+                return {"rows": [{
+                    "eventType": "update", "entityType": "customerorder",
+                    "moment": "2026-08-20 12:00:00", "uid": "manager@example",
+                    "name": "14222", "diff": {"moment": {
+                        "oldValue": "2026-08-20 09:00:00",
+                        "newValue": "2026-08-21 09:00:00",
+                    }},
+                }]}
+            return {"rows": [], "meta": {"size": 0}}
+
+    client = Client()
+    first = report_audit._load_sales_document_audit(
+        client, date(2026, 8, 20), date(2026, 8, 20),
+    )
+    first_calls = client.summary_calls
+    second = report_audit._load_sales_document_audit(
+        client, date(2026, 8, 20), date(2026, 8, 20),
+    )
+
+    assert first == second
+    assert first_calls == 2
+    assert client.summary_calls == first_calls
