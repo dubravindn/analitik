@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import date, datetime, timedelta
 
@@ -16,6 +17,11 @@ from . import synclock
 from . import telegram as tg
 
 log = logging.getLogger("hermes.bot")
+
+# Тяжёлый управленческий PDF строится в фоне. Один активный отчёт на чат
+# защищает сервер от повторных нажатий, не блокируя Telegram long-polling.
+_PERIOD_REPORT_JOBS: set[str] = set()
+_PERIOD_REPORT_JOBS_LOCK = threading.Lock()
 
 # ─── описание секций и их шагов диалога ──────────────────────────────────────
 
@@ -879,23 +885,38 @@ def _run_forecast(conn_factory, client_factory, bot_token, chat_id):
 
 
 def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
-    """Build and send one period PDF without progress texts or separate charts."""
-    import threading
-    from .etl_sales import run as etl_sales
-    from .etl_stock import run as etl_stock
-    from .etl_loss import run as etl_loss
-    from .etl_enter import run as etl_enter
-    from .etl_cashflow import run as etl_cashflow
-    from .etl_clients import run as etl_clients
-    from .etl_move import run as etl_move
-    from .report_sales_pdf import build_sales_pdf
+    """Запустить сборку PDF в фоне, сохранив отзывчивость Telegram-бота."""
+    job_key = str(chat_id)
+    with _PERIOD_REPORT_JOBS_LOCK:
+        if job_key in _PERIOD_REPORT_JOBS:
+            tg.send_message(
+                bot_token, chat_id,
+                "⏳ Отчёт за период уже формируется. Бот продолжает работать; "
+                "готовый PDF придёт сюда автоматически.",
+                _main_keyboard(chat_id),
+            )
+            return
+        _PERIOD_REPORT_JOBS.add(job_key)
 
-    done = threading.Event()
-    result = [None]
-    error = [None]
+    tg.send_message(
+        bot_token, chat_id,
+        f"⏳ Формирую PDF в фоне за {_fmt_period(d_from, d_to)}. "
+        "Можно продолжать пользоваться ботом — файл придёт автоматически.",
+        _main_keyboard(chat_id),
+    )
 
     def _worker():
+        conn = None
         try:
+            from .etl_sales import run as etl_sales
+            from .etl_stock import run as etl_stock
+            from .etl_loss import run as etl_loss
+            from .etl_enter import run as etl_enter
+            from .etl_cashflow import run as etl_cashflow
+            from .etl_clients import run as etl_clients
+            from .etl_move import run as etl_move
+            from .report_sales_pdf import build_sales_pdf
+
             conn = conn_factory()
             client = client_factory()
             missing = _missing_days(conn, d_from, d_to)
@@ -965,35 +986,50 @@ def _run_period_pdf_only(conn_factory, client_factory, d_from, d_to, bot_token, 
                     )
                     if cur.fetchone()[0] == 0:
                         etl_cashflow(client, conn, cmp_from, cmp_to)
-            result[0] = build_sales_pdf(
+            pdf_bytes = build_sales_pdf(
                 conn, d_from, d_to, None, include_management_sections=True,
                 client=client,
             )
+            period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
+            tg.send_document(
+                bot_token, chat_id, pdf_bytes,
+                f"period_report_{period_safe}.pdf",
+                f"Отчёт за {_fmt_period(d_from, d_to)}",
+            )
+            _queue_ai_background(
+                conn_factory, chat_id,
+                lambda analysis_conn: __import__(
+                    "hermes.analysis_payload",
+                    fromlist=["build_period_analysis_payload"],
+                ).build_period_analysis_payload(
+                    analysis_conn, d_from, d_to, client_factory(),
+                ),
+                "period",
+            )
+            tg.send_message(
+                bot_token, chat_id, "✅ Отчёт за период готов.",
+                _main_keyboard(chat_id),
+            )
         except Exception as exc:
-            error[0] = exc
+            log.error("Ошибка PDF за период: %s", exc, exc_info=exc)
+            tg.send_message(
+                bot_token, chat_id, f"⚠️ Ошибка PDF: {exc}",
+                _main_keyboard(chat_id),
+            )
         finally:
-            done.set()
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            with _PERIOD_REPORT_JOBS_LOCK:
+                _PERIOD_REPORT_JOBS.discard(job_key)
 
-    threading.Thread(target=_worker, daemon=True).start()
-    if not done.wait(timeout=900):
-        tg.send_message(bot_token, chat_id, "⚠️ PDF не удалось собрать за 15 минут.")
-        return
-    if error[0]:
-        log.error("Ошибка PDF за период: %s", error[0], exc_info=error[0])
-        tg.send_message(bot_token, chat_id, f"⚠️ Ошибка PDF: {error[0]}")
-        return
-    period_safe = f"{d_from.strftime('%Y%m%d')}-{d_to.strftime('%Y%m%d')}"
-    tg.send_document(
-        bot_token, chat_id, result[0], f"period_report_{period_safe}.pdf",
-        f"Отчёт за {_fmt_period(d_from, d_to)}",
-    )
-    _queue_ai_background(
-        conn_factory, chat_id,
-        lambda conn: __import__(
-            "hermes.analysis_payload", fromlist=["build_period_analysis_payload"]
-        ).build_period_analysis_payload(conn, d_from, d_to, client_factory()),
-        "period",
-    )
+    threading.Thread(
+        target=_worker,
+        name=f"hermes-period-report-{job_key}",
+        daemon=True,
+    ).start()
 
 
 def _run_current_state_pdf_only(conn_factory, bot_token, chat_id):
