@@ -3,10 +3,10 @@
 Приёмки, платежи, расходные ордера и торговые документы остаются в общем
 контроле изменений и удалений. Документы списания намеренно исключены.
 
-Для заказов покупателей и отгрузок используется настоящий журнал ``/audit``.
-Показываются только изменение даты документа и снижение фактической цены позиции
-ниже действующей цены «Наличка». Количество, резерв, статус и добавление/удаление
-позиций намеренно скрыты.
+Для заказов, отгрузок и финансовых документов используется журнал ``/audit``.
+Показываются изменения даты и снижения цены ниже «Налички». Если заказ или отгрузку
+изменили позже даты документа, также показываются состав и количество позиций. Обычные
+правки черновика в день создания, резерв и статус скрыты.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -31,12 +32,24 @@ _DOC_TYPES = {
 
 _CUSTOMER_ORDER = "customerorder"
 _DEMAND = "demand"
+_CASHIN = "cashin"
+_CASHOUT = "cashout"
+_PAYMENTIN = "paymentin"
+_PAYMENTOUT = "paymentout"
 _CUSTOMER_ORDER_LABEL = "Заказ покупателя"
 _DEMAND_LABEL = "Отгрузка"
 _AUDIT_ENTITY_LABELS = {
     _CUSTOMER_ORDER: _CUSTOMER_ORDER_LABEL,
     _DEMAND: _DEMAND_LABEL,
+    _CASHIN: "Приходный ордер",
+    _CASHOUT: "Расходный ордер",
+    _PAYMENTIN: "Входящий платёж",
+    _PAYMENTOUT: "Исходящий платёж",
 }
+_AUDITED_ENTITY_TYPES = (
+    _CUSTOMER_ORDER, _DEMAND,
+    _CASHIN, _CASHOUT, _PAYMENTIN, _PAYMENTOUT,
+)
 _MAX_AUDIT_EVENTS = 100
 _MAX_ORDER_EVENTS = _MAX_AUDIT_EVENTS  # совместимость со старыми тестами
 _MAX_POSITION_CHANGES = 12
@@ -61,6 +74,9 @@ _AUDIT_CACHE_DIR = Path("/var/cache/hermes/audit")
 # В служебных карточках встречается sentinel 99 999 999 999 ₽.
 # Цена товара выше миллиона рублей не считается валидной «Наличкой».
 _MAX_CASH_PRICE_RUB = 1_000_000
+_DOCUMENT_MOMENT_RE = re.compile(
+    r"(?:^|\s)от\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}:\d{2}))?"
+)
 
 _NO_STORE = "(без склада)"
 # updated считается «изменением», если он позже moment минимум на столько
@@ -157,6 +173,35 @@ def _effective_line_price(value: dict) -> float | None:
     return round(price * (1 - discount / 100), 2)
 
 
+def _quantity(value: dict | None) -> float | None:
+    if not value or value.get("quantity") is None:
+        return None
+    try:
+        return float(value["quantity"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _qty_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:g}"
+
+
+def _document_moment(event: dict) -> datetime | None:
+    """Дата самого документа из ``additionalInfo`` журна МойСклад."""
+    match = _DOCUMENT_MOMENT_RE.search(str(event.get("additionalInfo") or ""))
+    if not match:
+        return None
+    return _dt(f"{match.group(1)} {match.group(2) or '00:00:00'}")
+
+
+def _is_backdated_edit(event: dict, summary: dict) -> tuple[bool, datetime | None]:
+    document_dt = _document_moment(event)
+    event_dt = _dt(str(event.get("moment") or summary.get("moment") or ""))
+    return bool(
+        document_dt and event_dt and document_dt.date() < event_dt.date()
+    ), document_dt
+
+
 def _cash_price_rub(
     client: MoyskladClient, value: dict, cache: dict[str, float | None],
 ) -> float | None:
@@ -196,16 +241,38 @@ def _cash_price_rub(
 def _position_diff_lines(
     changes: list[dict], client: MoyskladClient | None = None,
     cash_cache: dict[str, float | None] | None = None,
+    *, include_quantity_changes: bool = False,
 ) -> list[str]:
-    """Показать только реальное снижение цены ниже «Налички»."""
-    if client is None:
-        return []
+    """Утечки цены и состав/количество для правок задним числом."""
     cache = cash_cache if cash_cache is not None else {}
     lines: list[str] = []
     for item in changes:
         old = item.get("oldValue")
         new = item.get("newValue")
-        # Добавление и удаление позиций намеренно не показываем.
+        if include_quantity_changes and not old and new:
+            name = _position_name(new)
+            qty = _quantity(new)
+            price = _effective_line_price(new)
+            suffix = f" × {_money_rub(price)} ₽" if price is not None else ""
+            lines.append(
+                f"ЗАДНИМ ЧИСЛОМ добавлена позиция «{name}»: "
+                f"{_qty_text(qty)} ед.{suffix}"
+            )
+            if len(lines) >= _MAX_POSITION_CHANGES:
+                break
+            continue
+        if include_quantity_changes and old and not new:
+            name = _position_name(old)
+            qty = _quantity(old)
+            price = _effective_line_price(old)
+            suffix = f" × {_money_rub(price)} ₽" if price is not None else ""
+            lines.append(
+                f"ЗАДНИМ ЧИСЛОМ удалена позиция «{name}»: "
+                f"{_qty_text(qty)} ед.{suffix}"
+            )
+            if len(lines) >= _MAX_POSITION_CHANGES:
+                break
+            continue
         if not old or not new:
             continue
         old_name = _position_name(old)
@@ -213,9 +280,27 @@ def _position_diff_lines(
         if old_name != new_name:
             continue
 
+        old_qty = _quantity(old)
+        new_qty = _quantity(new)
+        if (
+            include_quantity_changes
+            and old_qty is not None and new_qty is not None
+            and old_qty != new_qty
+        ):
+            delta = new_qty - old_qty
+            lines.append(
+                f"ЗАДНИМ ЧИСЛОМ изменено количество «{new_name}»: "
+                f"{_qty_text(old_qty)} → {_qty_text(new_qty)} ед. "
+                f"(изменение {delta:+g})"
+            )
+            if len(lines) >= _MAX_POSITION_CHANGES:
+                break
+
         old_price = _effective_line_price(old)
         new_price = _effective_line_price(new)
         if old_price is None or new_price is None or new_price >= old_price:
+            continue
+        if client is None:
             continue
         cash_price = _cash_price_rub(client, new, cache)
         if cash_price is None or new_price >= cash_price:
@@ -239,8 +324,9 @@ def _diff_lines(
     diff: dict, *, entity_type: str = _CUSTOMER_ORDER,
     client: MoyskladClient | None = None,
     cash_cache: dict[str, float | None] | None = None,
+    include_quantity_changes: bool = False,
 ) -> list[str]:
-    """Даты + снижение цены ниже «Налички»; остальной шум скрыт."""
+    """Значимые изменения; обычная правка черновика остаётся скрытой."""
     lines: list[str] = []
     date_fields = ["moment"]
     if entity_type == _CUSTOMER_ORDER:
@@ -254,21 +340,37 @@ def _diff_lines(
         if old == new:
             continue
         if field == "moment":
-            label = "Дата отгрузки" if entity_type == _DEMAND else "Дата заказа"
+            label = {
+                _DEMAND: "Дата отгрузки",
+                _CUSTOMER_ORDER: "Дата заказа",
+            }.get(entity_type, "Дата документа")
         else:
             label = "Плановая дата доставки"
         lines.append(
             f"{label}: {_audit_value(old, field)} → {_audit_value(new, field)}"
         )
     positions = diff.get("positions")
-    if isinstance(positions, list):
-        lines.extend(_position_diff_lines(positions, client, cash_cache))
+    if isinstance(positions, list) and entity_type in {_CUSTOMER_ORDER, _DEMAND}:
+        lines.extend(_position_diff_lines(
+            positions, client, cash_cache,
+            include_quantity_changes=include_quantity_changes,
+        ))
+    if entity_type in {_CASHIN, _CASHOUT, _PAYMENTIN, _PAYMENTOUT}:
+        sum_change = diff.get("sum")
+        if isinstance(sum_change, dict):
+            old_sum = sum_change.get("oldValue")
+            new_sum = sum_change.get("newValue")
+            if old_sum != new_sum:
+                lines.append(
+                    f"Сумма документа: {_audit_value(old_sum, 'sum')} → "
+                    f"{_audit_value(new_sum, 'sum')}"
+                )
     return lines
 
 
 def _load_sales_document_audit_live(
     client: MoyskladClient, d_from: date, d_to: date,
-    entity_types: tuple[str, ...] = (_CUSTOMER_ORDER, _DEMAND),
+    entity_types: tuple[str, ...] = _AUDITED_ENTITY_TYPES,
 ) -> tuple[list[dict], int, bool]:
     """Получить важные update-события заказов и отгрузок.
 
@@ -356,9 +458,11 @@ def _load_sales_document_audit_live(
             if (event.get("eventType") or summary.get("eventType")) != "update":
                 continue
             diff = event.get("diff") or {}
+            backdated, document_dt = _is_backdated_edit(event, summary)
             details = _diff_lines(
                 diff, entity_type=entity_type,
                 client=client, cash_cache=cash_cache,
+                include_quantity_changes=backdated,
             )
             if not details:
                 continue
@@ -378,6 +482,9 @@ def _load_sales_document_audit_live(
                 "moment": event.get("moment") or summary.get("moment") or "",
                 "uid": event.get("uid") or summary.get("uid") or "—",
                 "number": event.get("name") or "—",
+                "document_moment": document_dt.isoformat() if document_dt else "",
+                "backdated": backdated,
+                "additional_info": event.get("additionalInfo") or "",
                 "diff": diff,
                 "details": details,
             })
@@ -435,7 +542,7 @@ def _write_audit_day_cache(
 
 def _load_sales_document_audit(
     client: MoyskladClient, d_from: date, d_to: date,
-    entity_types: tuple[str, ...] = (_CUSTOMER_ORDER, _DEMAND),
+    entity_types: tuple[str, ...] = _AUDITED_ENTITY_TYPES,
 ) -> tuple[list[dict], int, bool]:
     """Собрать период из дневного кэша; загрузить только отсутствующие дни."""
     combined: list[dict] = []
@@ -476,7 +583,10 @@ def _render_sales_document_audit(
     if not rows:
         return []
     count_label = f"не менее {total}" if truncated else str(total)
-    lines = [f"🧾 ЗАКАЗЫ И ОТГРУЗКИ — ВАЖНЫЕ ИЗМЕНЕНИЯ ({count_label}):"]
+    lines = [
+        f"🧾 ЗАКАЗЫ, ОТГРУЗКИ И ФИНАНСЫ — "
+        f"ВАЖНЫЕ ИЗМЕНЕНИЯ ({count_label}):"
+    ]
 
     prepared: list[tuple[dict, str, list[str], tuple]] = []
     groups: dict[tuple, list[tuple[dict, str, list[str], tuple]]] = {}
@@ -503,7 +613,14 @@ def _render_sales_document_audit(
                 continue
             rendered_groups.add(key)
             entity_type = row.get("entity_type") or _CUSTOMER_ORDER
-            plural = "отгрузок" if entity_type == _DEMAND else "заказов"
+            plural = {
+                _DEMAND: "отгрузок",
+                _CUSTOMER_ORDER: "заказов",
+                _CASHIN: "приходных ордеров",
+                _CASHOUT: "расходных ордеров",
+                _PAYMENTIN: "входящих платежей",
+                _PAYMENTOUT: "исходящих платежей",
+            }.get(entity_type, "документов")
             lines.append(
                 f"  • Массовое изменение: {len(same)} {plural} · изменены "
                 f"{event_label} · кто: {row.get('uid') or '—'}"
@@ -517,9 +634,16 @@ def _render_sales_document_audit(
 
         entity_type = row.get("entity_type") or _CUSTOMER_ORDER
         document_label = _AUDIT_ENTITY_LABELS.get(entity_type, "Документ")
+        document_dt = _dt(str(row.get("document_moment") or ""))
+        backdated_note = ""
+        if document_dt:
+            backdated_note = f" · документ от {document_dt:%d.%m.%Y}"
+        if row.get("backdated"):
+            backdated_note += " · правка задним числом"
         lines.append(
             f"  • {document_label} № {row.get('number') or '—'} · "
-            f"изменён {event_label} · кто: {row.get('uid') or '—'}"
+            f"изменён {event_label}{backdated_note} · "
+            f"кто: {row.get('uid') or '—'}"
         )
         lines.extend(f"      – {detail}" for detail in details)
     # ``truncated`` can mean two different things: either the final list really
@@ -602,6 +726,11 @@ def build_audit_report(client: MoyskladClient, d_from: date, d_to: date) -> str:
     )
     modified: list[tuple] = []
     for doc_type, label in _DOC_TYPES.items():
+        # These documents are already controlled above by their actual audit
+        # moment with exact old/new sums and dates.  The generic ``updated``
+        # fallback would duplicate them and cannot explain what changed.
+        if doc_type in {_CASHIN, _CASHOUT, _PAYMENTIN, _PAYMENTOUT}:
+            continue
         try:
             rows: list[dict] = []
             offset = 0

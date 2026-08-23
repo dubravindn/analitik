@@ -380,7 +380,7 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
 
             for idx, line in enumerate(audit.splitlines(), 1):
                 stripped = line.strip()
-                if stripped.startswith("🧾 ЗАКАЗЫ И ОТГРУЗКИ"):
+                if stripped.startswith("🧾 ЗАКАЗЫ"):
                     flush_audit_event()
                     audit_kind = "sales_change"
                     continue

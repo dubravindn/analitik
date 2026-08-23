@@ -189,7 +189,7 @@ def test_orders_and_shipments_show_only_dates_and_prices_below_cash():
     text = report_audit.build_audit_report(
         _SalesDocumentAuditClient(), date(2026, 8, 5), date(2026, 8, 5),
     )
-    assert "ЗАКАЗЫ И ОТГРУЗКИ — ВАЖНЫЕ ИЗМЕНЕНИЯ (2)" in text
+    assert "ЗАКАЗЫ, ОТГРУЗКИ И ФИНАНСЫ — ВАЖНЫЕ ИЗМЕНЕНИЯ (2)" in text
     assert "Заказ покупателя № 13999" in text
     assert "Плановая дата доставки: 06.08.2026 10:00 → 07.08.2026 11:00" in text
     assert "«Роза Эксплорер»: цена снижена 120 → 80 ₽" in text
@@ -227,6 +227,45 @@ def test_discount_change_uses_actual_price_but_price_increase_is_hidden():
         "newValue": _position("Служебная позиция", "p3", 50),
     }], client)
     assert sentinel_cash_price == []
+
+
+def test_backdated_position_changes_show_add_remove_and_quantity():
+    changes = [
+        {
+            "oldValue": _position("Хризантема Алтай", "p1", 112.53, quantity=1),
+            "newValue": _position("Хризантема Алтай", "p1", 112.53, quantity=5),
+        },
+        {"newValue": _position("Добавленная роза", "p2", 90, quantity=4)},
+        {"oldValue": _position("Удалённая роза", "p2", 90, quantity=2)},
+    ]
+    # Обычная правка черновика остаётся скрытой.
+    assert report_audit._position_diff_lines(changes) == []
+
+    shown = report_audit._position_diff_lines(
+        changes, include_quantity_changes=True,
+    )
+    assert "1 → 5 ед. (изменение +4)" in shown[0]
+    assert "ЗАДНИМ ЧИСЛОМ добавлена позиция «Добавленная роза»: 4 ед." in shown[1]
+    assert "ЗАДНИМ ЧИСЛОМ удалена позиция «Удалённая роза»: 2 ед." in shown[2]
+
+
+def test_backdated_event_and_financial_sum_are_explained():
+    event = {
+        "moment": "2026-08-23 06:01:46",
+        "additionalInfo": (
+            "от 2026-08-18 07:49:00 "
+            "ИП Дубравин Дмитрий Николаевич 562.65 руб"
+        ),
+    }
+    backdated, document_dt = report_audit._is_backdated_edit(event, {})
+    assert backdated is True
+    assert document_dt.strftime("%d.%m.%Y") == "18.08.2026"
+
+    details = report_audit._diff_lines(
+        {"sum": {"oldValue": 112.53, "newValue": 562.65}},
+        entity_type="cashin",
+    )
+    assert details == ["Сумма документа: 112.53 ₽ → 562.65 ₽"]
 
 
 def test_mass_same_date_change_is_grouped_but_keeps_order_numbers():
@@ -388,5 +427,5 @@ def test_completed_audit_days_are_reused_from_cache(monkeypatch, tmp_path):
     )
 
     assert first == second
-    assert first_calls == 2
+    assert first_calls == len(report_audit._AUDITED_ENTITY_TYPES)
     assert client.summary_calls == first_calls
