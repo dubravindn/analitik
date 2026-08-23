@@ -400,24 +400,25 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     replied_message_id = int(replied.get("message_id") or 0)
     if replied_message_id and _is_reply_to_bot(msg, "CBDanalitik_bot"):
         try:
-            from .ai_queue import store_guidance_reply
-            conn = conn_factory()
-            saved = store_guidance_reply(
-                conn, chat_id, user_id, replied_message_id, text,
-            )
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if saved:
-                tg.send_message(
-                    bot_token, chat_id,
-                    "✅ Рекомендация сохранена. Следующие анализы будут учитывать "
-                    "её как указание владельца, но цифры по-прежнему будут браться "
-                    "только из отчётов и МойСклад.",
-                    _main_keyboard(chat_id),
+            from .ai_queue import is_dialogue_guidance, store_guidance_reply
+            if is_dialogue_guidance(text):
+                conn = conn_factory()
+                saved = store_guidance_reply(
+                    conn, chat_id, user_id, replied_message_id, text,
                 )
-                return
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if saved:
+                    tg.send_message(
+                        bot_token, chat_id,
+                        "✅ Я запомнил это как правило руководителя. Следующие "
+                        "анализы будут его учитывать, а цифры по-прежнему будут "
+                        "браться только из отчётов и МойСклад.",
+                        _main_keyboard(chat_id),
+                    )
+                    return
         except Exception as exc:
             log.warning("AI reply guidance failed: %s", exc)
 
@@ -489,7 +490,7 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
     state = _get_state(state_key)
     if state and state.get("section") == "ai_question":
         _clear_state(state_key)
-        _run_ai_question(conn_factory, text, bot_token, chat_id)
+        _run_ai_question(conn_factory, text, bot_token, chat_id, user_id)
         return
 
     if is_group and not command and not state:
@@ -530,7 +531,7 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         return
 
     # ── Прямые команды (без диалога) ──
-    _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id)
+    _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id, user_id)
 
 
 # ─── диалог: начало ───────────────────────────────────────────────────────────
@@ -1576,7 +1577,9 @@ def _run_loss(conn_factory, client_factory, d_from, d_to, store_name, bot_token,
 
 # ─── прямые команды (без диалога) ────────────────────────────────────────────
 
-def _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id):
+def _dispatch_command(
+    text, conn_factory, client_factory, bot_token, chat_id, user_id: str = "",
+):
     parts = text.strip().split()
     cmd   = parts[0].lower().lstrip("/").split("@")[0]
     args  = parts[1:]
@@ -1595,14 +1598,16 @@ def _dispatch_command(text, conn_factory, client_factory, bot_token, chat_id):
         if cmd in ("ask", "спросить"):
             question = " ".join(args).strip()
         if question:
-            _run_ai_question(conn_factory, question, bot_token, chat_id)
+            _run_ai_question(conn_factory, question, bot_token, chat_id, user_id)
         else:
             tg.send_message(bot_token, chat_id,
                             "Напишите вопрос после команды или обычным сообщением.",
                             _main_keyboard(chat_id))
 
 
-def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) -> None:
+def _run_ai_question(
+    conn_factory, question: str, bot_token: str, chat_id: str, user_id: str = "",
+) -> None:
     """Build a read-only fact pack and enqueue one conversational AI answer."""
     import threading
 
@@ -1644,10 +1649,22 @@ def _run_ai_question(conn_factory, question: str, bot_token: str, chat_id: str) 
         work_conn = None
         try:
             from .ai_question import build_question_analysis_payload
+            from .ai_queue import learn_from_dialogue
             work_conn = conn_factory()
             payload = build_question_analysis_payload(work_conn, question, chat_id)
             run_id = enqueue_analysis(work_conn, payload, chat_id, force_mode="live")
+            learned = bool(
+                run_id and learn_from_dialogue(
+                    work_conn, run_id, chat_id, user_id or chat_id, question,
+                )
+            )
             log.info("AI question queued: %s chat=%s", run_id, chat_id)
+            if learned:
+                tg.send_message(
+                    bot_token, chat_id,
+                    "🧠 Это правило сохранено в памяти руководителя и будет "
+                    "учитываться в следующих анализах.",
+                )
         except Exception as exc:
             log.exception("AI question enqueue failed: %s", exc)
             try:

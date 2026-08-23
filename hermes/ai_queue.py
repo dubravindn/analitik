@@ -165,6 +165,42 @@ def store_guidance_reply(
     return store_guidance(conn, str(row[0]), chat_id, user_id, guidance)
 
 
+_STRONG_LEARNING_MARKERS = (
+    "запомни", "это неверно", "это неправильно", "ты неверно", "ты неправильно",
+    "нет, неверно", "нет, неправильно", "нет это неверно", "нет это неправильно",
+    "исправление", "правильно считать", "правильно так", "новое правило",
+    "в дальнейшем", "всегда учитывай", "никогда не", "не считай",
+)
+_LEARNING_MARKERS = (
+    "учитывай", "обращай внимание", "для нас важно", "приоритет",
+    "правило", "нужно проверять", "надо проверять", "должен проверять",
+)
+_QUESTION_PREFIXES = (
+    "кто ", "что ", "где ", "когда ", "почему ", "зачем ", "как ",
+    "какой ", "какая ", "какие ", "сколько ", "покажи ", "сравни ",
+)
+
+
+def is_dialogue_guidance(text: str) -> bool:
+    """Отличить устойчивое правило владельца от обычного вопроса к аналитику."""
+    norm = " ".join(str(text or "").casefold().split()).strip()
+    if not norm:
+        return False
+    if any(marker in norm for marker in _STRONG_LEARNING_MARKERS):
+        return True
+    looks_like_question = "?" in norm or norm.startswith(_QUESTION_PREFIXES)
+    return not looks_like_question and any(marker in norm for marker in _LEARNING_MARKERS)
+
+
+def learn_from_dialogue(
+    conn, run_id: str, chat_id: str, user_id: str, text: str,
+) -> bool:
+    """Сохранить только явно сформулированное правило из диалога руководителя."""
+    if not is_dialogue_guidance(text):
+        return False
+    return store_guidance(conn, run_id, chat_id, user_id, text)
+
+
 def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
     from . import telegram as tg
 

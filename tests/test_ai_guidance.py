@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from hermes.ai_analyst import _compact_payload, render_telegram_summary
-from hermes.ai_queue import _feedback_markup, _with_owner_guidance, store_guidance_reply
+from hermes.ai_queue import (
+    _feedback_markup,
+    _with_owner_guidance,
+    is_dialogue_guidance,
+    learn_from_dialogue,
+    store_guidance_reply,
+)
 
 
 class _Cursor:
@@ -101,3 +107,23 @@ def test_report_summary_tells_owner_how_to_correct_analysis():
     }})
     assert "Ответьте на это сообщение" in text
 
+
+def test_dialogue_learning_distinguishes_rules_from_follow_up_questions():
+    assert is_dialogue_guidance("Запомни: Фабрика не участвует в прибыли")
+    assert is_dialogue_guidance("Это неверно, сначала учитывай списания БАЗЫ")
+    assert is_dialogue_guidance("Для нас важно проверять старые отгрузки")
+    assert not is_dialogue_guidance("Почему прибыль БАЗЫ снизилась?")
+    assert not is_dialogue_guidance("Покажи это по складам")
+
+
+def test_explicit_rule_from_dialogue_is_saved_for_future_runs():
+    conn = _Conn()
+    learned = learn_from_dialogue(
+        conn, "run-1", "-1001", "42",
+        "В дальнейшем учитывай изменения старых отгрузок",
+    )
+    assert learned is True
+    assert conn.inserted == (
+        "run-1", "-1001", "42",
+        "В дальнейшем учитывай изменения старых отгрузок",
+    )

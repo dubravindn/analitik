@@ -13,8 +13,8 @@ from typing import Any
 from .anomaly_rules import evaluate_payload
 
 
-PROMPT_VERSION = "hermes-ai-v3-guidance"
-QUESTION_PROMPT_VERSION = "hermes-question-v2-guidance"
+PROMPT_VERSION = "hermes-ai-v4-dialog-memory"
+QUESTION_PROMPT_VERSION = "hermes-question-v3-dialog-memory"
 _SCHEMA = Path(__file__).with_name("ai_output_schema.json")
 _QUESTION_SCHEMA = Path(__file__).with_name("ai_question_output_schema.json")
 _NUMBER_RE = re.compile(r"(?<![\w.-])[-+]?\d+(?:[.,]\d+)?")
@@ -440,4 +440,8 @@ def render_telegram_answer(result: dict[str, Any]) -> str:
     follow_up = str(answer.get("follow_up") or "").strip()
     if follow_up:
         lines.extend(["", f"Можно уточнить: {follow_up}"])
+    lines.extend([
+        "", "Продолжайте диалог ответом на это сообщение. Если напишете "
+        "«запомни», «учитывай» или исправите мой вывод, правило сохранится.",
+    ])
     return "\n".join(lines)
