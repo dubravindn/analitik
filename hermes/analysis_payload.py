@@ -345,21 +345,63 @@ def build_period_analysis_payload(conn, d_from: date, d_to: date, client=None) -
             from .report_audit import build_audit_report
             audit = build_audit_report(client, d_from, d_to)
             audit_kind = "modified"
+            current_event: dict[str, Any] | None = None
+
+            def flush_audit_event() -> None:
+                nonlocal current_event
+                if not current_event:
+                    return
+                event_idx = current_event["idx"]
+                document = current_event["document"]
+                changes = current_event["changes"]
+                evidence = document
+                if changes:
+                    evidence += "; " + "; ".join(changes)
+                fact = _fact(
+                    f"audit.{current_event['kind']}.{event_idx}",
+                    "document_audit",
+                    "Удалённый документ"
+                    if current_event["kind"] == "deleted"
+                    else "Изменённый документ",
+                    1, "count", period=selected_label,
+                    details={
+                        "document": document,
+                        "changes": changes,
+                        "analysis_required": (
+                            "Объяснить, что изменили, оценить риск, "
+                            "назвать возможную причину только как гипотезу "
+                            "и дать действие для проверки."
+                        ),
+                    },
+                )
+                fact["evidence"] = evidence
+                facts.append(fact)
+                current_event = None
+
             for idx, line in enumerate(audit.splitlines(), 1):
                 stripped = line.strip()
+                if stripped.startswith("🧾 ЗАКАЗЫ И ОТГРУЗКИ"):
+                    flush_audit_event()
+                    audit_kind = "sales_change"
+                    continue
                 if stripped.startswith("🗑 УДАЛЁННЫЕ"):
+                    flush_audit_event()
                     audit_kind = "deleted"
                     continue
                 if stripped.startswith("✏️ ИЗМЕНЁННЫЕ"):
+                    flush_audit_event()
                     audit_kind = "modified"
                     continue
                 if stripped.startswith("•"):
-                    facts.append(_fact(
-                        f"audit.{audit_kind}.{idx}", "document_audit",
-                        "Удалённый документ" if audit_kind == "deleted" else "Изменённый документ",
-                        1, "count", period=selected_label,
-                        details={"document": stripped.lstrip("• ")},
-                    ))
+                    flush_audit_event()
+                    current_event = {
+                        "idx": idx, "kind": audit_kind,
+                        "document": stripped.lstrip("• "), "changes": [],
+                    }
+                    continue
+                if current_event and stripped.startswith("–"):
+                    current_event["changes"].append(stripped.lstrip("– "))
+            flush_audit_event()
         except Exception as exc:
             facts.append(_fact(
                 "data.audit.unavailable", "data_quality", "Аудит документов недоступен",

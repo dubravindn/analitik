@@ -522,9 +522,19 @@ def _render_sales_document_audit(
             f"изменён {event_label} · кто: {row.get('uid') or '—'}"
         )
         lines.extend(f"      – {detail}" for detail in details)
-    if truncated:
+    # ``truncated`` can mean two different things: either the final list really
+    # exceeded the report limit, or MoySklad did not return the complete source
+    # journal.  Do not claim that 100 events are shown when only a few meaningful
+    # changes were actually found.
+    if total > len(rows):
         lines.append(
-            f"  … показаны последние {_MAX_AUDIT_EVENTS} значимых событий"
+            f"  … показано {len(rows)} из {total} найденных "
+            "значимых событий"
+        )
+    elif truncated:
+        lines.append(
+            "  ⚠ Журнал МойСклад загружен не полностью; "
+            "выше перечислены все найденные важные изменения."
         )
     return lines
 

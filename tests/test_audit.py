@@ -1,7 +1,15 @@
 """Аудит документов: общий контроль и точечные сигналы по заказам/отгрузкам."""
 from datetime import date
 
+import pytest
+
 from hermes import report_audit
+
+
+@pytest.fixture(autouse=True)
+def _isolated_audit_cache(monkeypatch, tmp_path):
+    """One fake client must never receive another test's cached audit rows."""
+    monkeypatch.setattr(report_audit, "_AUDIT_CACHE_DIR", tmp_path)
 
 
 class _FakeClient:
@@ -238,6 +246,31 @@ def test_mass_same_date_change_is_grouped_but_keeps_order_numbers():
     assert "Массовое изменение: 3 заказов" in rendered
     assert "Номера: 12188, 12211, 12854" in rendered
     assert "Дата заказа: 05.08.2026 09:00 → 06.08.2026 09:00" in rendered
+
+
+def test_truncated_source_does_not_claim_that_100_events_are_shown():
+    rows = [{
+        "entity_type": "customerorder", "moment": "2026-08-05 08:00:00",
+        "uid": "manager", "number": "15001",
+        "details": ["Дата заказа: 05.08.2026 09:00 → 06.08.2026 09:00"],
+    }]
+    rendered = "\n".join(report_audit._render_sales_document_audit(
+        rows, total=1, truncated=True,
+    ))
+    assert "последние 100" not in rendered
+    assert "все найденные важные изменения" in rendered
+
+
+def test_real_result_limit_reports_exact_shown_and_total():
+    rows = [{
+        "entity_type": "demand", "moment": "2026-08-05 08:00:00",
+        "uid": "manager", "number": "15002",
+        "details": ["Дата отгрузки: 05.08.2026 09:00 → 04.08.2026 09:00"],
+    }]
+    rendered = "\n".join(report_audit._render_sales_document_audit(
+        rows, total=101, truncated=True,
+    ))
+    assert "показано 1 из 101" in rendered
 
 
 def test_multiday_audit_reads_later_pages_without_losing_early_event(monkeypatch):
