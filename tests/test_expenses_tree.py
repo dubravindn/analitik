@@ -19,6 +19,8 @@ class _Cur:
         return False
 
     def execute(self, sql, params=None):
+        if hasattr(self.conn, "params"):
+            self.conn.params.append(params)
         self._rows = self.conn.script(sql)
 
     def fetchone(self):
@@ -68,6 +70,7 @@ def test_expense_tree_sorted():
 class _WriteoffConn:
     def __init__(self):
         self.queries = []
+        self.params = []
 
     def cursor(self):
         return _Cur(self)
@@ -89,3 +92,18 @@ def test_cashflow_writeoffs_grouped_by_counterparty_and_store():
     assert data["by_project"] == {"База Воровского 107/1": 1_500_000}
     assert data["by_agent"] == [("Клиент А", 2, 1_500_000, 750_000)]
     assert all("lower(btrim" in sql for sql in conn.queries)
+    assert all("project_name = %s" in sql for sql in conn.queries)
+    assert all("База Воровского 107/1" in params for params in conn.params)
+    assert all(set(params[-1]) == {"списание", "возврат"} for params in conn.params)
+
+
+def test_base_writeoff_categories_are_excluded_from_operational_expenses_only_on_base():
+    conn = _WriteoffConn()
+    report_cashflow.get_operational_expenses(
+        conn, date(2026, 8, 1), date(2026, 8, 5),
+    )
+    sql = conn.queries[-1]
+    params = conn.params[-1]
+    assert "AND NOT (project_name = %s" in sql
+    assert "База Воровского 107/1" in params
+    assert {"списание", "возврат"}.issubset(set(params[-1]))

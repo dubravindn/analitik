@@ -125,7 +125,10 @@ def build_expenses_report(
     lines: list[str] = []
     store_label = store_name or "Все склады"
     lines.append(f"💸 Расходы {period_str} · {store_label}")
-    lines.append("(кассовые и банковские исходящие документы; статья «Списание» перенесена в списания)")
+    lines.append(
+        "(кассовые и банковские исходящие документы; на БАЗЕ статьи "
+        "«Списание» и «Возврат» перенесены в списания)"
+    )
     lines.append("")
 
     # Фильтр по складу.
@@ -145,11 +148,19 @@ def build_expenses_report(
         for name in (getattr(config, "CASHFLOW_WRITEOFF_ITEMS", ()) or ())
         if name.strip()
     })
+    base_writeoff_store = getattr(
+        config, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
+    )
     _writeoff_filter = (
-        "AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)"
+        "AND NOT (project_name = %s "
+        "AND lower(btrim(COALESCE(expense_item_name, ''))) = ANY(%s))"
         if writeoff_items else ""
     )
-    _params = (d_from, d_to) + ((writeoff_items,) if writeoff_items else ()) + _extra
+    _params = (
+        (d_from, d_to)
+        + ((base_writeoff_store, writeoff_items) if writeoff_items else ())
+        + _extra
+    )
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -281,12 +292,27 @@ def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
     from . import config
     owner = list(config.OWNER_EXPENSE_ITEMS or [])
     writeoffs = list(getattr(config, "CASHFLOW_WRITEOFF_ITEMS", ()) or ())
-    excluded = sorted({name.strip().lower() for name in owner + writeoffs if name.strip()})
-    excl = (
-        "AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)"
-        if excluded else ""
+    owner_excluded = sorted({name.strip().lower() for name in owner if name.strip()})
+    writeoff_excluded = sorted({
+        name.strip().lower() for name in writeoffs if name.strip()
+    })
+    base_writeoff_store = getattr(
+        config, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
     )
-    params = (d_from, d_to) + ((excluded,) if excluded else ())
+    owner_clause = (
+        "AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)"
+        if owner_excluded else ""
+    )
+    writeoff_clause = (
+        "AND NOT (project_name = %s "
+        "AND lower(btrim(COALESCE(expense_item_name, ''))) = ANY(%s))"
+        if writeoff_excluded else ""
+    )
+    params = (
+        (d_from, d_to)
+        + ((owner_excluded,) if owner_excluded else ())
+        + ((base_writeoff_store, writeoff_excluded) if writeoff_excluded else ())
+    )
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -294,7 +320,8 @@ def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
                    SUM(amount_kop)
             FROM cashflow_event
             WHERE day BETWEEN %s AND %s AND direction = 'out'
-              {excl}
+              {owner_clause}
+              {writeoff_clause}
             GROUP BY 1
         """, params)
         rows = cur.fetchall()
@@ -309,7 +336,7 @@ def get_operational_expenses(conn, d_from: date, d_to: date) -> dict:
 
 
 def get_cashflow_writeoffs(conn, d_from: date, d_to: date) -> dict:
-    """Списания, оформленные расходом со статьёй «Списание».
+    """Списания БАЗЫ, оформленные расходом («Списание» или «Возврат»).
 
     Returns ``total``, суммы ``by_project`` и рейтинг ``by_agent`` в формате
     ``(контрагент, документов, сумма, средняя сумма)``.
@@ -322,12 +349,16 @@ def get_cashflow_writeoffs(conn, d_from: date, d_to: date) -> dict:
     })
     if not items:
         return {"total": 0, "by_project": {}, "by_agent": []}
+    base_writeoff_store = getattr(
+        config, "BASE_CASHFLOW_WRITEOFF_STORE", "База Воровского 107/1",
+    )
 
     condition = """
         day BETWEEN %s AND %s AND direction = 'out'
+        AND project_name = %s
         AND lower(btrim(COALESCE(expense_item_name, ''))) = ANY(%s)
     """
-    params = (d_from, d_to, items)
+    params = (d_from, d_to, base_writeoff_store, items)
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COALESCE(NULLIF(project_name, ''), '__general__'),

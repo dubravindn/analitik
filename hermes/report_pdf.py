@@ -95,30 +95,12 @@ def _pdf_summary(conn, d_from: date, d_to: date, store_name: str | None) -> dict
     sf_cf = "AND project_name = %s" if store_name else ""
     p_cf  = [d_from, d_to] + ([store_name] if store_name else [])
 
-    cashflow_writeoff_items = list(
-        getattr(_cfg, "CASHFLOW_WRITEOFF_ITEMS", ()) or ()
+    from .report_cashflow import get_operational_expenses
+    operational = get_operational_expenses(conn, d_from, d_to)
+    op_expenses = int(
+        operational["by_project"].get(store_name, 0)
+        if store_name else operational["total"]
     )
-    op_excluded = sorted({
-        name.strip().lower()
-        for name in own + cashflow_writeoff_items if name.strip()
-    })
-    if op_excluded:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT COALESCE(SUM(amount_kop), 0)
-                FROM cashflow_event
-                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
-                  AND lower(btrim(COALESCE(expense_item_name, ''))) != ALL(%s)
-            """, p_cf + [op_excluded])
-            op_expenses = int((cur.fetchone() or (0,))[0])
-    else:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT COALESCE(SUM(amount_kop), 0)
-                FROM cashflow_event
-                WHERE day BETWEEN %s AND %s AND direction = 'out' {sf_cf}
-            """, p_cf)
-            op_expenses = int((cur.fetchone() or (0,))[0])
 
     if own:
         with conn.cursor() as cur:

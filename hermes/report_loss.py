@@ -197,15 +197,12 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     spoil_cnt, spoil_qty, spoil_kop = _loss_sum("AND NOT (d.store_name = ANY(%s))", [adj])
     adj_cnt, adj_qty, adj_kop = _loss_sum("AND (d.store_name = ANY(%s))", [adj])
 
-    # Возвраты клиентам — из расходов (cashflow), статья «Возврат».
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COUNT(*), COALESCE(SUM(amount_kop), 0)
-            FROM cashflow_event
-            WHERE day BETWEEN %s AND %s AND direction = 'out'
-              AND expense_item_name ILIKE '%%возврат%%'
-        """, [d_from, d_to])
-        ret_cnt, ret_kop = cur.fetchone()
+    # Денежные списания БАЗЫ оформляются расходными документами со статьями
+    # «Списание»/«Возврат», но из операционных расходов исключены.
+    from .report_cashflow import get_cashflow_writeoffs
+    cashflow_writeoffs = get_cashflow_writeoffs(conn, d_from, d_to)
+    ret_kop = int(cashflow_writeoffs["total"] or 0)
+    ret_cnt = sum(int(row[1] or 0) for row in cashflow_writeoffs["by_agent"])
 
     if not spoil_cnt and not adj_cnt and not ret_kop:
         lines.append("Данных о списаниях за этот период нет.")
@@ -216,8 +213,10 @@ def build_loss_report(conn, d_from: date, d_to: date, store_name: str | None = N
     lines.append(f"📋 Корректировки инвентаризации (База): {_rub(float(adj_kop))} ₽ · "
                  f"{adj_cnt} докум. — учёт, НЕ потери")
     if ret_kop:
-        lines.append(f"💸 Возвраты клиентам: {_rub(float(ret_kop))} ₽ · {int(ret_cnt)} опер. "
-                     f"(те же операции в разделе «Расходы»)")
+        lines.append(
+            f"💸 Списания БАЗЫ из расходов: {_rub(float(ret_kop))} ₽ · "
+            f"{int(ret_cnt)} опер. (из раздела «Расходы» исключены)"
+        )
     lines.append("")
 
     # J2: полный блок инвентаризации Базы (списания + оприходования в обе стороны).
