@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import threading
@@ -40,6 +41,7 @@ def enqueue_analysis(conn, payload: dict[str, Any], chat_id: str, *, force_mode:
     run_mode = force_mode or mode()
     if run_mode == "off":
         return None
+    payload = _with_owner_guidance(conn, payload)
     run_id = str(uuid.uuid4())
     jobs, _processing, _results = ensure_spool()
     prompt_version = (
@@ -71,11 +73,39 @@ def enqueue_analysis(conn, payload: dict[str, Any], chat_id: str, *, force_mode:
 
 def _feedback_markup(run_id: str) -> dict:
     return {
-        "inline_keyboard": [[
-            {"text": "👍 Полезно", "callback_data": f"ai_feedback:{run_id}:up"},
-            {"text": "👎 Неважно", "callback_data": f"ai_feedback:{run_id}:down"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "👍 Полезно", "callback_data": f"ai_feedback:{run_id}:up"},
+                {"text": "👎 Неважно", "callback_data": f"ai_feedback:{run_id}:down"},
+            ],
+            [{"text": "✍️ Исправить или дать рекомендацию", "callback_data": f"ai_guidance:{run_id}"}],
+        ]
     }
+
+
+def _with_owner_guidance(conn, payload: dict[str, Any], limit: int = 30) -> dict[str, Any]:
+    """Добавить последние указания владельцев и обновить hash payload."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT guidance, created_at, run_id
+            FROM ai_guidance
+            ORDER BY created_at DESC LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+    enriched = dict(payload)
+    enriched["owner_guidance"] = [
+        {
+            "text": str(text),
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            "source_run_id": str(source_run_id),
+        }
+        for text, created_at, source_run_id in reversed(rows)
+    ]
+    canonical_body = dict(enriched)
+    canonical_body.pop("payload_hash", None)
+    canonical = json.dumps(canonical_body, ensure_ascii=False, sort_keys=True, default=str)
+    enriched["payload_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return enriched
 
 
 def store_feedback(conn, run_id: str, chat_id: str, value: str) -> bool:
@@ -96,6 +126,43 @@ def store_feedback(conn, run_id: str, chat_id: str, value: str) -> bool:
         """, (run_id, str(chat_id), value))
     conn.commit()
     return True
+
+
+def store_guidance(
+    conn, run_id: str, chat_id: str, user_id: str, guidance: str,
+) -> bool:
+    text = " ".join(str(guidance or "").split()).strip()[:2000]
+    if not text:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM ai_analysis_run
+            WHERE id=%s
+              AND POSITION(',' || %s || ',' IN ',' || chat_id || ',') > 0
+        """, (run_id, str(chat_id)))
+        if cur.fetchone() is None:
+            return False
+        cur.execute("""
+            INSERT INTO ai_guidance
+                (run_id, chat_id, user_id, guidance, created_at)
+            VALUES (%s, %s, %s, %s, now())
+        """, (run_id, str(chat_id), str(user_id), text))
+    conn.commit()
+    return True
+
+
+def store_guidance_reply(
+    conn, chat_id: str, user_id: str, reply_message_id: int, guidance: str,
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT run_id FROM ai_delivery
+            WHERE chat_id=%s AND message_id=%s
+        """, (str(chat_id), int(reply_message_id)))
+        row = cur.fetchone()
+    if not row:
+        return False
+    return store_guidance(conn, str(row[0]), chat_id, user_id, guidance)
 
 
 def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
@@ -125,13 +192,24 @@ def _consume_result(conn_factory: Callable, bot_token: str, path: Path) -> None:
         elif run_mode == "live" and result.get("status") == "validated":
             for target in str(result.get("chat_id") or "").split(","):
                 if target.strip():
-                    tg.send_message(
+                    sent = tg.send_message(
                         bot_token, target.strip(),
                         render_telegram_answer(result)
                         if result.get("report_type") == "question"
                         else render_telegram_summary(result),
                         _feedback_markup(run_id),
                     )
+                    message_id = int(((sent or {}).get("result") or {}).get("message_id") or 0)
+                    if message_id:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO ai_delivery
+                                    (run_id, chat_id, message_id, delivered_at)
+                                VALUES (%s, %s, %s, now())
+                                ON CONFLICT (chat_id, message_id)
+                                DO UPDATE SET run_id=EXCLUDED.run_id, delivered_at=now()
+                            """, (run_id, target.strip(), message_id))
+                        conn.commit()
             log.info("AI live result delivered: %s", run_id)
         elif run_mode == "live":
             for target in str(result.get("chat_id") or "").split(","):

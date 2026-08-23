@@ -301,6 +301,28 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
             except Exception as exc:
                 log.warning("AI feedback failed: %s", exc)
             return
+        if authorized and data.startswith("ai_guidance:"):
+            try:
+                _prefix, run_id = data.split(":", 1)
+                guidance_state_key = (
+                    f"{callback_chat}:{actor_id}" if is_group else callback_chat
+                )
+                _set_state(
+                    guidance_state_key, "ai_guidance", "text", {"run_id": run_id},
+                )
+                tg.answer_callback_query(
+                    bot_token, str(callback.get("id") or ""),
+                    "Напишите исправление или рекомендацию.",
+                )
+                tg.send_message(
+                    bot_token, callback_chat,
+                    "✍️ Ответьте, что ИИ понял неправильно или на что ему нужно "
+                    "обращать внимание в следующих анализах.",
+                    tg.question_force_reply(),
+                )
+            except Exception as exc:
+                log.warning("AI guidance dialog failed: %s", exc)
+            return
     if "message" not in upd:
         return
     msg = upd["message"]
@@ -372,6 +394,33 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         )
         return
 
+    # Ответ непосредственно на ранее доставленный анализ ИИ считается
+    # рекомендацией владельца. На прочие сообщения бота это правило не влияет.
+    replied = msg.get("reply_to_message") or {}
+    replied_message_id = int(replied.get("message_id") or 0)
+    if replied_message_id and _is_reply_to_bot(msg, "CBDanalitik_bot"):
+        try:
+            from .ai_queue import store_guidance_reply
+            conn = conn_factory()
+            saved = store_guidance_reply(
+                conn, chat_id, user_id, replied_message_id, text,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if saved:
+                tg.send_message(
+                    bot_token, chat_id,
+                    "✅ Рекомендация сохранена. Следующие анализы будут учитывать "
+                    "её как указание владельца, но цифры по-прежнему будут браться "
+                    "только из отчётов и МойСклад.",
+                    _main_keyboard(chat_id),
+                )
+                return
+        except Exception as exc:
+            log.warning("AI reply guidance failed: %s", exc)
+
     if norm in ("🧠 спросить ии", "спросить ии", _ANALYTICS_QUESTION_BUTTON) or (
         command in ("спросить", "ask") and len(text.split(maxsplit=1)) == 1
     ):
@@ -407,6 +456,35 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
         )
         return
 
+
+    state = _get_state(state_key)
+    if state and state.get("section") == "ai_guidance":
+        _clear_state(state_key)
+        try:
+            from .ai_queue import store_guidance
+            conn = conn_factory()
+            saved = store_guidance(
+                conn, str(state.get("params", {}).get("run_id") or ""),
+                chat_id, user_id, text,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            tg.send_message(
+                bot_token, chat_id,
+                "✅ Рекомендация сохранена. Она будет учтена в следующих анализах."
+                if saved else "⚠️ Не удалось связать рекомендацию с анализом. Ответьте прямо на сообщение ИИ.",
+                _main_keyboard(chat_id),
+            )
+        except Exception as exc:
+            log.warning("AI guidance save failed: %s", exc)
+            tg.send_message(
+                bot_token, chat_id,
+                "⚠️ Не удалось сохранить рекомендацию. Попробуйте ответить прямо на сообщение ИИ.",
+                _main_keyboard(chat_id),
+            )
+        return
 
     state = _get_state(state_key)
     if state and state.get("section") == "ai_question":

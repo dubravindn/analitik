@@ -13,8 +13,8 @@ from typing import Any
 from .anomaly_rules import evaluate_payload
 
 
-PROMPT_VERSION = "hermes-ai-v2"
-QUESTION_PROMPT_VERSION = "hermes-question-v1"
+PROMPT_VERSION = "hermes-ai-v3-guidance"
+QUESTION_PROMPT_VERSION = "hermes-question-v2-guidance"
 _SCHEMA = Path(__file__).with_name("ai_output_schema.json")
 _QUESTION_SCHEMA = Path(__file__).with_name("ai_question_output_schema.json")
 _NUMBER_RE = re.compile(r"(?<![\w.-])[-+]?\d+(?:[.,]\d+)?")
@@ -61,6 +61,7 @@ def _compact_payload(payload: dict[str, Any], rules: dict[str, Any]) -> dict[str
         "report_type": payload.get("report_type"),
         "report_id": payload.get("report_id"),
         "period": payload.get("period"),
+        "owner_guidance": (payload.get("owner_guidance") or [])[-30:],
         "facts": selected[:350],
         "deterministic_rules": rules,
     }
@@ -108,6 +109,7 @@ def _compact_question_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "period": payload.get("period"),
         "question": payload.get("question"),
         "conversation": (payload.get("conversation") or [])[-4:],
+        "owner_guidance": (payload.get("owner_guidance") or [])[-30:],
         "facts": selected,
         "deterministic_signals": evaluate_payload({**payload, "facts": selected}),
     }
@@ -131,6 +133,9 @@ def _question_prompt(payload: dict[str, Any], repair: str | None = None) -> str:
 8. Учитывай выбранный период и актуальность источников. Не смешивай разные периоды.
 9. Не предлагай менять документы, остатки или оформлять заказ автоматически.
 10. Ответ на русском, спокойно и по делу, до 1200 знаков.
+11. owner_guidance — рекомендации владельца по трактовке и приоритетам. Учитывай их,
+    но не выдавай за измеренный факт и не используй как подтверждение цифр. Более новая
+    рекомендация имеет приоритет над старой. При конфликте с фактами прямо укажи расхождение.
 {repair_note}
 report_id верни строго {payload['report_id']}; report_type — question.
 
@@ -214,6 +219,9 @@ def _prompt(payload: dict[str, Any], rules: dict[str, Any], repair: str | None =
 13. Для правок задним числом отдельно проверь добавление, удаление и изменение количества.
     Если в фактах есть списание того же товара, укажи возможное повторное списание только как риск
     и попроси сверить документы. Без точного совпадения товара и периода не утверждай нарушение.
+14. owner_guidance — рекомендации владельца по трактовке и приоритетам. Используй их,
+    чтобы выбирать, на что обращать внимание, но не считай их источником цифр. Более новая
+    рекомендация приоритетнее старой; при конфликте с фактами сообщи о расхождении.
 {repair_note}
 В поле report_id верни строго {payload['report_id']}.
 В поле report_type верни строго {payload['report_type']}.
@@ -410,7 +418,10 @@ def render_telegram_summary(result: dict[str, Any]) -> str:
     if data_warnings:
         lines.extend(["", "⚠️ Качество данных:"])
         lines.extend(f"• {item.get('title', '')}" for item in data_warnings[:3])
-    lines.extend(["", "ИИ ничего не меняет в МойСклад и не оформляет заказы."])
+    lines.extend([
+        "", "ИИ ничего не меняет в МойСклад и не оформляет заказы.",
+        "Ответьте на это сообщение или нажмите кнопку ниже, чтобы исправить вывод или дать рекомендацию.",
+    ])
     return "\n".join(lines)
 
 

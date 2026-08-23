@@ -369,3 +369,26 @@ CREATE TABLE IF NOT EXISTS ai_feedback (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, chat_id)
 );
+
+-- Связь результата AI с сообщением Telegram: позволяет владельцу ответить
+-- непосредственно на конкретный анализ.
+CREATE TABLE IF NOT EXISTS ai_delivery (
+    run_id       text        NOT NULL REFERENCES ai_analysis_run(id) ON DELETE CASCADE,
+    chat_id      text        NOT NULL,
+    message_id   bigint      NOT NULL,
+    delivered_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ai_delivery_run ON ai_delivery (run_id);
+
+-- Текстовая обратная связь владельца. Это управленческое правило/приоритет,
+-- но не источник фактических цифр.
+CREATE TABLE IF NOT EXISTS ai_guidance (
+    id          bigserial   PRIMARY KEY,
+    run_id      text        NOT NULL REFERENCES ai_analysis_run(id) ON DELETE CASCADE,
+    chat_id     text        NOT NULL,
+    user_id     text        NOT NULL,
+    guidance    text        NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_ai_guidance_created ON ai_guidance (created_at DESC);
