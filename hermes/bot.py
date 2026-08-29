@@ -80,6 +80,7 @@ _BUTTON_TO_SECTION = {
     "🏷 цены":       "prices",
     "📄 отчёт pdf":  "pdf",
     "❓ помощь":     "help",
+    "🌐 открыть дашборд": "dashboard",
     "/меню":         "show",
     "меню":          "show",
 }
@@ -112,6 +113,10 @@ _HELP_TEXT = """\
 📦 Состояние на сегодня
   Без выбора периода → PDF по каждому складу:
   прогноз закупки, остатки, залежалые, резервы.
+
+🌐 Дашборд
+  Закрытая интерактивная сводка для руководителей: прибыль,
+  B2B-клиенты БАЗЫ, дебиторка, незакрытые заказы и выводы ИИ.
 
 🧠 Спросить ИИ
   Напишите вопрос обычным сообщением, например:
@@ -235,6 +240,7 @@ def run(conn_factory, client_factory, bot_token: str, chat_id: str) -> None:
             ("period", "Сформировать PDF за период"),
             ("today", "Состояние БАЗЫ на сегодня"),
             ("forecast", "Прогноз закупки"),
+            ("dashboard", "Открыть закрытый дашборд"),
             ("help", "Помощь"),
         ]
         tg.set_my_commands(bot_token, commands)
@@ -392,6 +398,22 @@ def _handle(upd, conn_factory, client_factory, bot_token, chat_id):
             _GROUP_MENU_TEXT if is_group else _HELP_TEXT,
             tg.shared_group_keyboard() if is_group else tg.main_reply_keyboard(),
         )
+        return
+
+    if norm == "🌐 открыть дашборд" or command == "dashboard":
+        _clear_state(state_key)
+        dashboard_url = config.DASHBOARD_URL()
+        if dashboard_url:
+            tg.send_message(
+                bot_token, chat_id,
+                "🌐 Закрытый управленческий дашборд. Доступ разрешён только руководителям.",
+                tg.dashboard_link_keyboard(dashboard_url),
+            )
+        else:
+            tg.send_message(
+                bot_token, chat_id,
+                "⚠️ Ссылка на дашборд ещё не настроена.", _main_keyboard(chat_id),
+            )
         return
 
     # Ответ непосредственно на ранее доставленный анализ ИИ считается

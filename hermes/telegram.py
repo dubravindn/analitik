@@ -65,6 +65,7 @@ def main_reply_keyboard() -> dict:
             [{"text": "📊 Отчёт за период"}],
             [{"text": "📦 Состояние на сегодня"}],
             [{"text": "🧠 Спросить ИИ"}],
+            [{"text": "🌐 Открыть дашборд"}],
             [{"text": "❓ Помощь"}],
         ],
         "resize_keyboard": True,
@@ -94,10 +95,20 @@ def analytics_group_keyboard() -> dict:
                 {"text": "🛒 Прогноз"},
             ],
             [{"text": "🧠 Задать вопрос аналитику"}],
+            [{"text": "🌐 Открыть дашборд"}],
             [{"text": "⬅️ Общее меню"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
+    }
+
+
+def dashboard_link_keyboard(url: str) -> dict:
+    """Одноразовая inline-кнопка с закрытой ссылкой на дашборд."""
+    return {
+        "inline_keyboard": [[
+            {"text": "🌐 Открыть управленческий дашборд", "url": url},
+        ]],
     }
 
 

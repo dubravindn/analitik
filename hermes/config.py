@@ -73,6 +73,7 @@ DATABASE_URL = lambda: get("DATABASE_URL", required=True)      # noqa: E731
 TELEGRAM_BOT_TOKEN = lambda: get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = lambda: get("TELEGRAM_CHAT_ID")
 TELEGRAM_GROUP_CHAT_ID = lambda: get("TELEGRAM_GROUP_CHAT_ID")
+DASHBOARD_URL = lambda: get("DASHBOARD_URL")
 
 
 # --- Список складов для меню бота и фильтрации ---
