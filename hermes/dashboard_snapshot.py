@@ -351,16 +351,24 @@ def build_dashboard_snapshot(
     }
 
 
-def post_dashboard_snapshot(url: str, token: str, payload: dict[str, Any]) -> dict:
+def post_dashboard_snapshot(
+    url: str,
+    token: str,
+    payload: dict[str, Any],
+    site_bypass_token: str | None = None,
+) -> dict:
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    if site_bypass_token:
+        headers["OAI-Sites-Authorization"] = f"Bearer {site_bypass_token}"
     request = Request(
         url,
         data=body,
         method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
+        headers=headers,
     )
     with urlopen(request, timeout=30) as response:  # noqa: S310 - URL is admin config
         return json.loads(response.read().decode("utf-8"))
@@ -385,6 +393,7 @@ def main() -> None:
         parser.error("дата --from должна быть не позже --to")
     target_url = args.url or config.get("DASHBOARD_URL")
     target_token = args.token or config.get("DASHBOARD_SYNC_TOKEN")
+    site_bypass_token = config.get("DASHBOARD_SITE_BYPASS_TOKEN")
     if target_url and not target_url.rstrip("/").endswith("/api/sync"):
         target_url = target_url.rstrip("/") + "/api/sync"
     if not args.output and not (target_url and target_token):
@@ -400,7 +409,12 @@ def main() -> None:
             encoding="utf-8",
         )
     else:
-        result = post_dashboard_snapshot(target_url, target_token, snapshot)
+        result = post_dashboard_snapshot(
+            target_url,
+            target_token,
+            snapshot,
+            site_bypass_token=site_bypass_token,
+        )
         if not result.get("ok"):
             raise RuntimeError(f"дашборд отклонил обновление: {result}")
     print(f"Дашборд обновлён: {snapshot['period']['label']}")
