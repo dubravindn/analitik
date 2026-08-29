@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes read-only dashboard snapshot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hermes/app
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/opt/hermes/venv/bin/python -m hermes.dashboard_snapshot
+TimeoutStartSec=10min
+Nice=10

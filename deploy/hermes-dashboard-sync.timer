@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Hermes dashboard every morning
+
+[Timer]
+OnCalendar=*-*-* 06:10:00 Europe/Moscow
+Persistent=true
+RandomizedDelaySec=2min
+Unit=hermes-dashboard-sync.service
+
+[Install]
+WantedBy=timers.target

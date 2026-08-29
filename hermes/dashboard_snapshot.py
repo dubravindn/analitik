@@ -383,7 +383,11 @@ def main() -> None:
 
     if args.d_from > args.d_to:
         parser.error("дата --from должна быть не позже --to")
-    if not args.output and not (args.url and args.token):
+    target_url = args.url or config.get("DASHBOARD_URL")
+    target_token = args.token or config.get("DASHBOARD_SYNC_TOKEN")
+    if target_url and not target_url.rstrip("/").endswith("/api/sync"):
+        target_url = target_url.rstrip("/") + "/api/sync"
+    if not args.output and not (target_url and target_token):
         parser.error("нужны --url и --token либо --output")
     conn = db.connect(config.DATABASE_URL())
     try:
@@ -396,7 +400,7 @@ def main() -> None:
             encoding="utf-8",
         )
     else:
-        result = post_dashboard_snapshot(args.url, args.token, snapshot)
+        result = post_dashboard_snapshot(target_url, target_token, snapshot)
         if not result.get("ok"):
             raise RuntimeError(f"дашборд отклонил обновление: {result}")
     print(f"Дашборд обновлён: {snapshot['period']['label']}")
