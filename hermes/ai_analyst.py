@@ -7,6 +7,8 @@ import re
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,56 @@ _NUMBER_RE = re.compile(r"(?<![\w.-])[-+]?\d+(?:[.,]\d+)?")
 
 class AIValidationError(ValueError):
     pass
+
+
+def _extract_json_text(text: str) -> str:
+    """Accept plain JSON and a single Markdown JSON fence from agent runtimes."""
+    value = str(text or "").strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", value, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else value
+
+
+def _openclaw_completion(prompt: str, *, session_key: str, timeout: int) -> tuple[str, str]:
+    """Call the loopback-only OpenClaw gateway without exposing business credentials."""
+    base_url = os.environ.get(
+        "AI_OPENCLAW_URL", "http://127.0.0.1:18789/v1/chat/completions",
+    ).strip()
+    token_file = Path(os.environ.get(
+        "AI_OPENCLAW_TOKEN_FILE", "/var/lib/hermes-ai/openclaw.token",
+    ))
+    token = token_file.read_text(encoding="utf-8").strip()
+    if not token:
+        raise AIValidationError("пустой токен OpenClaw")
+    body = json.dumps({
+        "model": os.environ.get("AI_OPENCLAW_AGENT", "openclaw/default"),
+        "user": session_key,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        base_url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+        raise AIValidationError(f"OpenClaw недоступен: {exc}") from exc
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AIValidationError("OpenClaw вернул ответ неизвестного формата") from exc
+    model = str(payload.get("model") or os.environ.get("AI_OPENCLAW_MODEL", "openclaw"))
+    return _extract_json_text(content), model
+
+
+def _use_openclaw() -> bool:
+    return os.environ.get("AI_RUNTIME", "codex").strip().casefold() == "openclaw"
 
 
 def _compact_payload(payload: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
@@ -293,6 +345,24 @@ def run_codex_analysis(
     raw = ""
 
     for attempt in (1, 2):
+        if _use_openclaw():
+            try:
+                raw, runtime_model = _openclaw_completion(
+                    _prompt(payload, rules, last_error if attempt == 2 else None),
+                    session_key=f"hermes-analysis:{payload['report_id']}:{attempt}",
+                    timeout=timeout,
+                )
+                response = json.loads(raw)
+                validated = validate_response(response, payload, rules)
+                return {
+                    "status": "validated", "validated": validated, "raw": raw,
+                    "rules": rules, "prompt_version": PROMPT_VERSION,
+                    "model": runtime_model, "attempts": attempt,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                }
+            except (OSError, json.JSONDecodeError, AIValidationError) as exc:
+                last_error = str(exc)
+                continue
         with tempfile.TemporaryDirectory(prefix="hermes-ai-") as tmp:
             output_path = Path(tmp) / "last.json"
             cmd = [
@@ -358,6 +428,23 @@ def run_codex_question(
     last_error = ""
     raw = ""
     for attempt in (1, 2):
+        if _use_openclaw():
+            try:
+                raw, runtime_model = _openclaw_completion(
+                    _question_prompt(payload, last_error if attempt == 2 else None),
+                    session_key=f"hermes-question:{payload['report_id']}:{attempt}",
+                    timeout=timeout,
+                )
+                validated = validate_question_response(json.loads(raw), payload)
+                return {
+                    "status": "validated", "validated": validated, "raw": raw,
+                    "rules": {}, "prompt_version": QUESTION_PROMPT_VERSION,
+                    "model": runtime_model, "attempts": attempt,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                }
+            except (OSError, json.JSONDecodeError, AIValidationError) as exc:
+                last_error = str(exc)
+                continue
         with tempfile.TemporaryDirectory(prefix="hermes-question-") as tmp:
             output_path = Path(tmp) / "last.json"
             cmd = [
