@@ -16,6 +16,9 @@ Environment=CODEX_BIN=/var/lib/hermes-ai/.local/bin/codex
 Environment=AI_SPOOL_DIR=/var/lib/hermes-ai/spool
 Environment=AI_CODEX_WORKDIR=/tmp
 Environment=AI_CODEX_TIMEOUT=300
+Environment=AI_RUNTIME=openclaw
+Environment=AI_OPENCLAW_URL=http://127.0.0.1:18789/v1/chat/completions
+Environment=AI_OPENCLAW_TOKEN_FILE=/var/lib/hermes-ai/openclaw.token
 ExecStart=/usr/bin/python3 -m hermes.ai_worker
 Restart=on-failure
 RestartSec=10
