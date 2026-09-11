@@ -1,0 +1,142 @@
+--- a/hermes/ai_worker.py
++++ b/hermes/ai_worker.py
+@@ -40,6 +40,35 @@
+     temporary.replace(path)
+ 
+ 
++def _source_refresh(payload: object) -> dict | None:
++    """Keep delivery metadata without copying business facts into the result."""
++    if not isinstance(payload, dict):
++        return None
++    source = payload.get("live_source")
++    if not isinstance(source, dict):
++        return None
++    return {
++        key: source.get(key)
++        for key in ("requested", "refreshed", "errors", "refreshed_at")
++    }
++
++
++def _transport_fields(job: object, run_id: str) -> dict:
++    """Preserve the address and source state on both success and failure."""
++    job = job if isinstance(job, dict) else {}
++    payload = job.get("payload")
++    payload = payload if isinstance(payload, dict) else {}
++    return {
++        "run_id": run_id,
++        "chat_id": str(job.get("chat_id") or ""),
++        "thread_id": str(job.get("thread_id") or ""),
++        "source_refresh": _source_refresh(payload),
++        "mode": job.get("mode", "shadow"),
++        "report_type": payload.get("report_type"),
++        "report_id": payload.get("report_id"),
++    }
++
++
+ def process_one() -> bool:
+     jobs, processing, results = ensure_spool()
+     candidates = sorted(jobs.glob("*.json"), key=lambda p: p.stat().st_mtime)
+@@ -53,6 +82,7 @@
+         return True
+ 
+     run_id = active.stem
++    job: dict = {}
+     try:
+         job = json.loads(active.read_text(encoding="utf-8"))
+         run_id = str(job["run_id"])
+@@ -60,19 +90,10 @@
+             result = run_codex_question(job["payload"])
+         else:
+             result = run_codex_analysis(job["payload"])
+-        result.update({
+-            "run_id": run_id,
+-            "chat_id": str(job.get("chat_id") or ""),
+-            "mode": job.get("mode", "shadow"),
+-            "report_type": job["payload"].get("report_type"),
+-            "report_id": job["payload"].get("report_id"),
+-        })
++        result.update(_transport_fields(job, run_id))
+     except Exception as exc:
+         log.exception("AI job %s failed", run_id)
+-        result = {
+-            "run_id": run_id,
+-            "chat_id": "",
+-            "mode": "shadow",
++        result = _transport_fields(job, run_id) | {
+             "status": "failed",
+             "error": f"{type(exc).__name__}: {exc}",
+         }
+
+--- a/hermes/ai_analyst.py
++++ b/hermes/ai_analyst.py
+@@ -122,6 +122,13 @@
+ def _compact_question_payload(payload: dict[str, Any]) -> dict[str, Any]:
+     """Keep Q&A context broad but bounded, with question-specific facts first."""
+     facts = payload.get("facts") or []
++    stock_product = [
++        fact for fact in facts
++        if str(fact.get("category") or "") == "stock_product" and fact.get("id")
++    ]
++    selected_stock_products = stock_product[:30]
++    selected: list[dict[str, Any]] = list(selected_stock_products)
++    seen: set[str] = {str(fact["id"]) for fact in selected}
+     priorities = (
+         {"entity_product", "entity_client"},
+         {"financial", "comparison", "store", "definition"},
+@@ -136,8 +143,6 @@
+         "stale_stock": 35,
+         "client_churn": 35, "history": 90, "product_sales": 50,
+     }
+-    selected: list[dict[str, Any]] = []
+-    seen: set[str] = set()
+     counts: dict[str, int] = {}
+     for categories in priorities:
+         for fact in facts:
+@@ -163,10 +168,26 @@
+         "conversation": (payload.get("conversation") or [])[-4:],
+         "owner_guidance": (payload.get("owner_guidance") or [])[-30:],
+         "facts": selected,
++        "context_limits": {
++            "max_facts": 430,
++            "stock_product_included": len(selected_stock_products),
++            "stock_product_omitted": max(0, len(stock_product) - 30),
++            "facts_omitted": max(0, len(facts) - len(selected)),
++        },
++        "live_source": _compact_live_source(payload.get("live_source")),
+         "deterministic_signals": evaluate_payload({**payload, "facts": selected}),
+     }
+ 
+ 
++def _compact_live_source(value: object) -> dict[str, Any] | None:
++    if not isinstance(value, dict):
++        return None
++    return {
++        key: value.get(key)
++        for key in ("requested", "refreshed", "errors", "refreshed_at")
++    }
++
++
+ def _question_prompt(payload: dict[str, Any], repair: str | None = None) -> str:
+     compact = _compact_question_payload(payload)
+     repair_note = f"\nПредыдущий ответ отклонён: {repair}. Исправь ответ.\n" if repair else ""
+@@ -524,6 +545,18 @@
+     if caveats:
+         lines.extend(["", "⚠️ Ограничения данных:"])
+         lines.extend(f"• {item}" for item in caveats[:3])
++    source_refresh = result.get("source_refresh") or {}
++    source_errors = source_refresh.get("errors") if isinstance(source_refresh, dict) else []
++    if source_errors:
++        domains = ", ".join(
++            str(item.get("domain") or "источник")
++            for item in source_errors if isinstance(item, dict)
++        )
++        lines.extend([
++            "", "⚠️ Актуальность данных:",
++            "• Не удалось обновить: "
++            f"{domains or 'один или несколько источников'}. Данные могут быть несвежими.",
++        ])
+     follow_up = str(answer.get("follow_up") or "").strip()
+     if follow_up:
+         lines.extend(["", f"Можно уточнить: {follow_up}"])
+
+
