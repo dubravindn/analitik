@@ -1,0 +1,659 @@
+diff --git a/hermes/ai_worker.py b/hermes/ai_worker.py
+index f2179a7..95d1f7b 100644
+--- a/hermes/ai_worker.py
++++ b/hermes/ai_worker.py
+@@ -12,6 +12,13 @@ from .ai_analyst import run_codex_analysis, run_codex_question
+ 
+ log = logging.getLogger("hermes.ai_worker")
+ 
++_CACHE_ONLY_CAVEAT = (
++    "Живое обновление МойСклада пропущено. Ответ построен по сохранённым "
++    "локальным строкам за выбранный период; их покрытие по дням и торговым "
++    "точкам проверено, запись об успешном sync_sales найдена, но полнота "
++    "данных относительно МойСклада не подтверждена."
++)
++
+ 
+ def spool_root() -> Path:
+     return Path(os.environ.get("AI_SPOOL_DIR", "/var/lib/hermes-ai/spool"))
+@@ -69,6 +76,36 @@ def _transport_fields(job: object, run_id: str) -> dict:
+     }
+ 
+ 
++def _apply_cache_only_caveat(result: dict) -> None:
++    """Make the cache-only limitation deterministic before exact rendering."""
++    source = result.get("source_refresh")
++    if not isinstance(source, dict):
++        return
++    errors = source.get("errors")
++    if not isinstance(errors, list):
++        return
++    cache_only = [
++        item for item in errors
++        if isinstance(item, dict)
++        and item.get("error_type") == "LiveRefreshSkippedCacheOnly"
++    ]
++    if not cache_only:
++        return
++    answer = result.get("validated")
++    if not isinstance(answer, dict):
++        answer = result
++    caveats = answer.get("caveats")
++    caveats = list(caveats) if isinstance(caveats, list) else []
++    answer["caveats"] = [_CACHE_ONLY_CAVEAT] + [
++        item for item in caveats if str(item) != _CACHE_ONLY_CAVEAT
++    ]
++    # The installed renderer treats every remaining error as a failed refresh.
++    # Preserve the structured cache-only evidence separately and suppress only
++    # that misleading generic warning; unrelated source errors stay untouched.
++    source["cache_only_limitations"] = cache_only
++    source["errors"] = [item for item in errors if item not in cache_only]
++
++
+ def process_one() -> bool:
+     jobs, processing, results = ensure_spool()
+     candidates = sorted(jobs.glob("*.json"), key=lambda p: p.stat().st_mtime)
+@@ -91,6 +128,7 @@ def process_one() -> bool:
+         else:
+             result = run_codex_analysis(job["payload"])
+         result.update(_transport_fields(job, run_id))
++        _apply_cache_only_caveat(result)
+     except Exception as exc:
+         log.exception("AI job %s failed", run_id)
+         result = _transport_fields(job, run_id) | {
+diff --git a/hermes/bot.py b/hermes/bot.py
+index 76de7f5..b011bd1 100644
+--- a/hermes/bot.py
++++ b/hermes/bot.py
+@@ -1752,8 +1752,11 @@ def _run_ai_question(
+     conn_factory, question: str, bot_token: str, chat_id: str, user_id: str = "",
+     client_factory=None,
+ ) -> None:
+-    """Build a read-only fact pack and enqueue one conversational AI answer."""
++    """Build a bounded cache-only fact pack and enqueue one AI answer."""
+     from .ai_queue import enqueue_analysis, mode
++    from .prequeue_guard import (
++        max_parallel, prepare_with_deadline, release, reserve, timeout_seconds,
++    )
+ 
+     if mode() != "live":
+         tg.send_message(
+@@ -1763,46 +1766,82 @@ def _run_ai_question(
+         )
+         return
+ 
+-    conn = conn_factory()
+-    try:
+-        with conn.cursor() as cur:
+-            cur.execute(
+-                """
+-                SELECT COUNT(*) FROM ai_analysis_run
+-                WHERE report_type='question' AND chat_id=%s AND status='queued'
+-                  AND created_at > now() - interval '7 minutes'
+-                """,
+-                (str(chat_id),),
+-            )
+-            pending = int((cur.fetchone() or (0,))[0])
+-    finally:
+-        conn.close()
+-    if pending:
++    current_thread = getattr(tg, "current_reply_thread", lambda: "")() or ""
++    preparation_key = f"{chat_id}:{current_thread}"
++    reservation = reserve(preparation_key, capacity=max_parallel())
++    if reservation == "duplicate":
+         tg.send_message(bot_token, chat_id, "⏳ Предыдущий вопрос ещё анализируется.")
+         return
++    if reservation == "capacity":
++        tg.send_message(
++            bot_token, chat_id,
++            "⏳ Сейчас готовятся другие ответы. Попробуйте ещё раз чуть позже.",
++            _main_keyboard(chat_id),
++        )
++        return
+ 
+-    tg.send_message(
+-        bot_token, chat_id,
+-        "🧠 Проверяю цифры и источники. Обычно ответ занимает до минуты.",
+-        _main_keyboard(chat_id),
+-    )
++    try:
++        tg.send_message(
++            bot_token, chat_id,
++            "🧠 Проверяю цифры и источники. Обычно ответ занимает до минуты.",
++            _main_keyboard(chat_id),
++        )
++    except Exception:
++        release(preparation_key)
++        raise
+ 
+     def _worker() -> None:
+-        work_conn = None
+         try:
+-            from .ai_question import build_question_analysis_payload
+             from .ai_queue import learn_from_dialogue
+-            work_conn = conn_factory()
+-            client = client_factory() if client_factory is not None else None
+-            payload = build_question_analysis_payload(
+-                work_conn, question, chat_id, client=client,
++
++            log.info("AI question preparation started: chat=%s", chat_id)
++            outcome = prepare_with_deadline(
++                {"question": question, "chat_id": str(chat_id)},
++                deadline_seconds=timeout_seconds(),
+             )
+-            run_id = enqueue_analysis(work_conn, payload, chat_id, force_mode="live")
+-            learned = bool(
+-                run_id and learn_from_dialogue(
+-                    work_conn, run_id, chat_id, user_id or chat_id, question,
++            if outcome.status != "prepared":
++                log.warning(
++                    "AI question preparation %s: chat=%s error_type=%s",
++                    outcome.status, chat_id, outcome.error_type,
+                 )
+-            )
++                tg.send_message(
++                    bot_token, chat_id,
++                    "⚠️ Не удалось вовремя подготовить данные. "
++                    "Ответ без проверенных цифр не сформирован. Попробуйте ещё раз позже.",
++                    _main_keyboard(chat_id),
++                )
++                return
++            prepared = outcome.value or {}
++            if prepared.get("state") == "already_queued":
++                tg.send_message(bot_token, chat_id, "⏳ Предыдущий вопрос ещё анализируется.")
++                return
++            if prepared.get("state") == "cache_unavailable":
++                log.warning("AI question cache evidence insufficient: chat=%s", chat_id)
++                tg.send_message(
++                    bot_token, chat_id,
++                    "⚠️ Быстрый ответ безопасно недоступен: живое обновление не "
++                    "запускалось, а локальных доказательств для этого вопроса "
++                    "недостаточно. Ответ с цифрами не сформирован.",
++                    _main_keyboard(chat_id),
++                )
++                return
++            payload = prepared.get("payload")
++            if not isinstance(payload, dict):
++                raise RuntimeError("preparation returned no payload")
++
++            work_conn = conn_factory()
++            try:
++                run_id = enqueue_analysis(
++                    work_conn, payload, chat_id, force_mode="live",
++                    thread_id=current_thread,
++                )
++                learned = bool(
++                    run_id and learn_from_dialogue(
++                        work_conn, run_id, chat_id, user_id or chat_id, question,
++                    )
++                )
++            finally:
++                work_conn.close()
+             log.info("AI question queued: %s chat=%s", run_id, chat_id)
+             if learned:
+                 tg.send_message(
+@@ -1821,13 +1860,21 @@ def _run_ai_question(
+             except Exception:
+                 pass
+         finally:
+-            if work_conn is not None:
+-                try:
+-                    work_conn.close()
+-                except Exception:
+-                    pass
++            release(preparation_key)
+ 
+-    _spawn(_worker, name="hermes-ai-question")
++    try:
++        _spawn(_worker, name="hermes-ai-question")
++    except Exception as exc:
++        release(preparation_key)
++        log.exception("AI question worker start failed: %s", exc)
++        try:
++            tg.send_message(
++                bot_token, chat_id,
++                "⚠️ Не удалось начать подготовку данных. Попробуйте ещё раз позже.",
++                _main_keyboard(chat_id),
++            )
++        except Exception:
++            pass
+ 
+ 
+ def _exec_cashflow(conn_factory, client_factory, d_from, d_to, bot_token, chat_id):
+diff --git a/hermes/prequeue_guard.py b/hermes/prequeue_guard.py
+new file mode 100644
+index 0000000..300f523
+--- /dev/null
++++ b/hermes/prequeue_guard.py
+@@ -0,0 +1,125 @@
++"""Run prequeue preparation in a fresh, bounded Python interpreter."""
++from __future__ import annotations
++
++import json
++import os
++import stat
++import subprocess
++import sys
++import tempfile
++import threading
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++
++_ACTIVE: set[str] = set()
++_ACTIVE_LOCK = threading.Lock()
++_MAX_REQUEST_BYTES = 16 * 1024
++_MAX_RESULT_BYTES = 8 * 1024 * 1024
++
++
++@dataclass(frozen=True)
++class PreparationOutcome:
++    status: str
++    value: dict[str, Any] | None = None
++    error_type: str = ""
++
++
++def timeout_seconds() -> float:
++    try:
++        value = float(os.environ.get("AI_QUESTION_PREP_TIMEOUT_SECONDS", "50"))
++    except ValueError:
++        value = 50.0
++    return min(120.0, max(5.0, value))
++
++
++def max_parallel() -> int:
++    try:
++        value = int(os.environ.get("AI_QUESTION_PREP_MAX_PARALLEL", "2"))
++    except ValueError:
++        value = 2
++    return min(4, max(1, value))
++
++
++def reserve(key: str, *, capacity: int | None = None) -> str:
++    """Return accepted, duplicate, or capacity without starting work."""
++    limit = capacity if capacity is not None else max_parallel()
++    with _ACTIVE_LOCK:
++        if key in _ACTIVE:
++            return "duplicate"
++        if len(_ACTIVE) >= limit:
++            return "capacity"
++        _ACTIVE.add(key)
++        return "accepted"
++
++
++def release(key: str) -> None:
++    with _ACTIVE_LOCK:
++        _ACTIVE.discard(key)
++
++
++def active_count() -> int:
++    with _ACTIVE_LOCK:
++        return len(_ACTIVE)
++
++
++def runner_command() -> list[str]:
++    return [sys.executable, "-m", "hermes.prequeue_runner"]
++
++
++def _read_result(path: Path) -> PreparationOutcome:
++    try:
++        metadata = path.stat()
++        if stat.S_IMODE(metadata.st_mode) & 0o077:
++            return PreparationOutcome("failed", error_type="PreparationResultPermissions")
++        size = metadata.st_size
++        if size <= 0 or size > _MAX_RESULT_BYTES:
++            return PreparationOutcome("failed", error_type="PreparationResultSize")
++        envelope = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return PreparationOutcome("failed", error_type="PreparationResultError")
++    if not isinstance(envelope, dict):
++        return PreparationOutcome("failed", error_type="PreparationResultType")
++    state = str(envelope.get("state") or "")
++    if state not in {"ready", "already_queued", "cache_unavailable"}:
++        return PreparationOutcome(
++            "failed", error_type=str(envelope.get("error_type") or "PreparationError"),
++        )
++    return PreparationOutcome("prepared", value=envelope)
++
++
++def prepare_with_deadline(
++    request: dict[str, Any], *, deadline_seconds: float | None = None,
++) -> PreparationOutcome:
++    """Exec a fresh runner, kill only it on timeout, and return bounded JSON."""
++    deadline = timeout_seconds() if deadline_seconds is None else max(0.01, deadline_seconds)
++    request_bytes = json.dumps(request, ensure_ascii=False).encode("utf-8")
++    if len(request_bytes) > _MAX_REQUEST_BYTES:
++        return PreparationOutcome("failed", error_type="PreparationRequestSize")
++
++    with tempfile.TemporaryDirectory(prefix="hermes-prequeue-") as directory:
++        root = Path(directory)
++        request_path, result_path = root / "request.json", root / "result.json"
++        request_path.write_bytes(request_bytes)
++        request_path.chmod(0o600)
++        command = [*runner_command(), "--request", str(request_path), "--result", str(result_path)]
++        try:
++            process = subprocess.Popen(
++                command,
++                stdin=subprocess.DEVNULL,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                close_fds=True,
++            )
++        except (OSError, RuntimeError, ValueError) as exc:
++            return PreparationOutcome("failed", error_type=type(exc).__name__)
++        try:
++            process.communicate(timeout=deadline)
++        except subprocess.TimeoutExpired:
++            process.kill()
++            process.communicate()
++            return PreparationOutcome("timeout", error_type="PreparationTimeout")
++        if process.returncode != 0:
++            return PreparationOutcome("failed", error_type="PreparationRunnerError")
++        return _read_result(result_path)
+diff --git a/hermes/prequeue_runner.py b/hermes/prequeue_runner.py
+new file mode 100644
+index 0000000..2e93074
+--- /dev/null
++++ b/hermes/prequeue_runner.py
+@@ -0,0 +1,299 @@
++"""Fresh-process, read-only, cache-limited preparation for a question."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from datetime import date, datetime, timedelta, timezone
++from pathlib import Path
++from typing import Any
++
++from . import config, db
++from .ai_question import build_question_analysis_payload, question_source_domains
++
++
++_ONLY_CACHE_DOMAIN = "sales"
++_MAX_REPORTED_MISSING_PAIRS = 40
++_SALES_METRICS = {"rev", "profit", "checks", "avg_check", "gross_margin"}
++
++
++def _iso(value: Any) -> str | None:
++    if value is None:
++        return None
++    return value.isoformat() if hasattr(value, "isoformat") else str(value)
++
++
++def _date_range(d_from: date, d_to: date):
++    current = d_from
++    while current <= d_to:
++        yield current
++        current += timedelta(days=1)
++
++
++def _period(payload: dict[str, Any]) -> tuple[date, date] | None:
++    value = payload.get("period") or {}
++    try:
++        d_from = date.fromisoformat(str(value["from"]))
++        d_to = date.fromisoformat(str(value["to"]))
++    except (KeyError, TypeError, ValueError):
++        return None
++    return (d_from, d_to) if d_from <= d_to else None
++
++
++def _unavailable_scope(domains: set[str], reason: str) -> dict[str, Any]:
++    rejected = sorted(domains - {_ONLY_CACHE_DOMAIN})
++    return {
++        "decision": "unavailable",
++        "answer_allowed": False,
++        "reason": reason,
++        "requested_domains": sorted(domains),
++        "allowed_cache_domains": [_ONLY_CACHE_DOMAIN],
++        "rejected_domains": rejected,
++        "local_fact_availability": {"status": "not_checked", "row_count": 0},
++        "local_coverage": {"status": "not_checked"},
++        "successful_sync_record": {"status": "not_checked"},
++        "source_completeness": {"status": "unknown"},
++        "live_refresh": {"status": "skipped"},
++    }
++
++
++def assess_sales_cache(
++    conn, payload: dict[str, Any], domains: set[str],
++) -> dict[str, Any]:
++    """Assess local evidence without claiming freshness or source completeness."""
++    if domains != {_ONLY_CACHE_DOMAIN}:
++        return _unavailable_scope(domains, "unsupported_or_extra_domains")
++    period = _period(payload)
++    if period is None:
++        return _unavailable_scope(domains, "period_unknown")
++    d_from, d_to = period
++    expected_store_ids = sorted(
++        store_id for store_id, channel in config.STORE_CHANNELS.items()
++        if channel in config.PROFIT_CHANNELS
++    )
++    if not expected_store_ids:
++        return _unavailable_scope(domains, "expected_store_scope_unknown")
++
++    with conn.cursor() as cur:
++        cur.execute(
++            """
++            SELECT day, store_id, synced_at
++            FROM sales_by_store_day
++            WHERE day BETWEEN %s AND %s
++              AND store_id = ANY(%s)
++              AND channel = ANY(%s)
++            """,
++            (d_from, d_to, expected_store_ids, list(config.PROFIT_CHANNELS)),
++        )
++        rows = cur.fetchall()
++
++    observed_pairs = {
++        (row[0], str(row[1])) for row in rows
++        if row and isinstance(row[0], date) and len(row) >= 2
++    }
++    expected_pairs = {
++        (day, store_id)
++        for day in _date_range(d_from, d_to)
++        for store_id in expected_store_ids
++    }
++    missing_pairs = sorted(expected_pairs - observed_pairs)
++    availability_status = "present" if rows else "absent"
++    coverage_status = "complete" if not missing_pairs else "incomplete"
++
++    with conn.cursor() as cur:
++        cur.execute(
++            """
++            SELECT period_from, period_to, rows_loaded, started_at
++            FROM sync_log
++            WHERE task = 'sync_sales' AND ok IS TRUE
++              AND period_from <= %s AND period_to >= %s
++            ORDER BY started_at DESC
++            LIMIT 1
++            """,
++            (d_from, d_to),
++        )
++        sync_row = cur.fetchone()
++    sync_status = "present" if sync_row else "absent"
++    allowed = bool(rows) and not missing_pairs and sync_row is not None
++    if not rows:
++        reason = "local_facts_absent"
++    elif missing_pairs:
++        reason = "local_coverage_incomplete"
++    elif sync_row is None:
++        reason = "successful_sync_record_absent"
++    else:
++        reason = "available_with_limitations"
++
++    return {
++        "decision": "available_with_limitations" if allowed else "unavailable",
++        "answer_allowed": allowed,
++        "reason": reason,
++        "requested_domains": sorted(domains),
++        "allowed_cache_domains": [_ONLY_CACHE_DOMAIN],
++        "rejected_domains": [],
++        "period": {"from": d_from.isoformat(), "to": d_to.isoformat()},
++        "local_fact_availability": {
++            "status": availability_status,
++            "row_count": len(rows),
++            "latest_local_row_synced_at": max(
++                (_iso(row[2]) for row in rows if len(row) >= 3 and row[2] is not None),
++                default=None,
++            ),
++        },
++        "local_coverage": {
++            "status": coverage_status,
++            "expected_pair_count": len(expected_pairs),
++            "observed_pair_count": len(observed_pairs & expected_pairs),
++            "missing_pair_count": len(missing_pairs),
++            "missing_pairs": [
++                {"day": day.isoformat(), "store_id": store_id}
++                for day, store_id in missing_pairs[:_MAX_REPORTED_MISSING_PAIRS]
++            ],
++            "missing_pairs_truncated": len(missing_pairs) > _MAX_REPORTED_MISSING_PAIRS,
++        },
++        "successful_sync_record": {
++            "status": sync_status,
++            "task": "sync_sales",
++            "period_from": _iso(sync_row[0]) if sync_row else None,
++            "period_to": _iso(sync_row[1]) if sync_row else None,
++            "rows_loaded": sync_row[2] if sync_row else None,
++            "recorded_at": _iso(sync_row[3]) if sync_row else None,
++        },
++        # Local rows and a success record do not prove that the remote source was complete.
++        "source_completeness": {"status": "unknown"},
++        "live_refresh": {"status": "skipped"},
++    }
++
++
++def _sales_fact_allowed(fact: Any) -> bool:
++    if not isinstance(fact, dict):
++        return False
++    category = str(fact.get("category") or "")
++    fact_id = str(fact.get("id") or "")
++    metric = fact_id.rsplit(".", 1)[-1]
++    if category == "financial":
++        return fact_id.startswith("period.selected.") and metric in _SALES_METRICS
++    if category == "store":
++        return metric in _SALES_METRICS
++    if category == "definition":
++        return fact_id == "definition.gross"
++    if category in {"source_status", "data_quality"}:
++        return str((fact.get("details") or {}).get("source_table") or "") == "sales_by_store_day"
++    return False
++
++
++def _restrict_to_sales(payload: dict[str, Any]) -> None:
++    payload["facts"] = [
++        fact for fact in payload.get("facts") or [] if _sales_fact_allowed(fact)
++    ]
++    # Conversation may contain facts from domains or periods not assessed here.
++    payload["conversation"] = []
++
++
++def _begin_business_read_only(conn) -> None:
++    # db.connect first performs a session-local timezone SET and COMMIT. Every
++    # following business-table statement in this runner is inside this read-only tx.
++    with conn.cursor() as cur:
++        cur.execute("SET TRANSACTION READ ONLY")
++        cur.execute("SHOW transaction_read_only")
++        state = str((cur.fetchone() or ("",))[0]).casefold()
++    if state not in {"on", "true", "1"}:
++        raise RuntimeError("database transaction is not read-only")
++
++
++def prepare(request: dict[str, Any]) -> dict[str, Any]:
++    question = str(request.get("question") or "").strip()[:1500]
++    chat_id = str(request.get("chat_id") or "").strip()
++    if not question or not chat_id:
++        return {"state": "failed", "error_type": "InvalidRequest"}
++    conn = db.connect(config.DATABASE_URL())
++    try:
++        _begin_business_read_only(conn)
++        with conn.cursor() as cur:
++            cur.execute(
++                """
++                SELECT COUNT(*) FROM ai_analysis_run
++                WHERE report_type='question' AND chat_id=%s AND status='queued'
++                  AND created_at > now() - interval '7 minutes'
++                """,
++                (chat_id,),
++            )
++            if int((cur.fetchone() or (0,))[0]):
++                return {"state": "already_queued"}
++
++        domains = question_source_domains(question)
++        if domains != {_ONLY_CACHE_DOMAIN}:
++            return {
++                "state": "cache_unavailable",
++                "cache_evidence": _unavailable_scope(
++                    domains, "unsupported_or_extra_domains",
++                ),
++            }
++
++        # client=None is deliberate: refresh_question_sources and all ETL are skipped.
++        payload = build_question_analysis_payload(conn, question, chat_id, client=None)
++        cache_evidence = assess_sales_cache(conn, payload, domains)
++        if not cache_evidence["answer_allowed"]:
++            return {"state": "cache_unavailable", "cache_evidence": cache_evidence}
++
++        _restrict_to_sales(payload)
++        checked_at = datetime.now(timezone.utc).isoformat()
++        limitation = {
++            "domain": "sales",
++            "error_type": "LiveRefreshSkippedCacheOnly",
++            "local_fact_availability": cache_evidence["local_fact_availability"]["status"],
++            "local_coverage": cache_evidence["local_coverage"]["status"],
++            "successful_sync_record": cache_evidence["successful_sync_record"]["status"],
++            "source_completeness": "unknown",
++            "live_refresh": "skipped",
++        }
++        payload["live_source"] = {
++            "requested": ["sales"],
++            "refreshed": [],
++            "errors": [limitation],
++            "refreshed_at": None,
++            "local_evidence_checked_at": checked_at,
++        }
++        canonical_body = dict(payload)
++        canonical_body.pop("payload_hash", None)
++        canonical = json.dumps(
++            canonical_body, ensure_ascii=False, sort_keys=True, default=str,
++        )
++        payload["payload_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++        return {
++            "state": "ready",
++            "payload": payload,
++            "cache_evidence": cache_evidence,
++        }
++    finally:
++        conn.close()
++
++
++def _write_result(path: Path, value: dict[str, Any]) -> None:
++    temporary = path.with_suffix(".tmp")
++    temporary.write_text(json.dumps(value, ensure_ascii=False, default=str), encoding="utf-8")
++    temporary.chmod(0o600)
++    temporary.replace(path)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--request", required=True)
++    parser.add_argument("--result", required=True)
++    args = parser.parse_args(argv)
++    request_path, result_path = Path(args.request), Path(args.result)
++    try:
++        if request_path.stat().st_size > 16 * 1024:
++            raise ValueError("request too large")
++        request = json.loads(request_path.read_text(encoding="utf-8"))
++        if not isinstance(request, dict):
++            raise ValueError("request must be an object")
++        result = prepare(request)
++    except BaseException as exc:
++        result = {"state": "failed", "error_type": type(exc).__name__}
++    _write_result(result_path, result)
++    return 0 if result.get("state") != "failed" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+
