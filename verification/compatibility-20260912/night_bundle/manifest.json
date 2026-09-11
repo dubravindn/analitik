@@ -1,0 +1,36 @@
+{
+  "format": "hermes-night-bundle-v1",
+  "purpose": "Offline package verification and synthetic restore-algorithm test only; not a production installer.",
+  "targets": [
+    {
+      "id": "worker_ai_worker",
+      "source_path": "08_НАПРАВЛЕНИЯ/B04/local_compatibility_check/patched_full/hermes/ai_worker.py",
+      "package_path": "files/worker/hermes/ai_worker.py",
+      "target_path": "/var/lib/hermes-ai/app/hermes/ai_worker.py",
+      "synthetic_relative_path": "var/lib/hermes-ai/app/hermes/ai_worker.py",
+      "expected_previous_sha256": "1be5a20a41464e65154c3e8af183e7bb740ae6367dd645408f818cdf56b8b439",
+      "source_sha256": "6f3acadeebdd54f7a703c61d5298f2085fef4683fbaf2f13eb5a31f9f8690171",
+      "target_sha256": "6f3acadeebdd54f7a703c61d5298f2085fef4683fbaf2f13eb5a31f9f8690171"
+    },
+    {
+      "id": "worker_ai_analyst",
+      "source_path": "08_НАПРАВЛЕНИЯ/B04/local_compatibility_check/patched_full/hermes/ai_analyst.py",
+      "package_path": "files/worker/hermes/ai_analyst.py",
+      "target_path": "/var/lib/hermes-ai/app/hermes/ai_analyst.py",
+      "synthetic_relative_path": "var/lib/hermes-ai/app/hermes/ai_analyst.py",
+      "expected_previous_sha256": "8675efa855c284c8635a42d766fe8e64650b59834c270713e7286fc5bde05e61",
+      "source_sha256": "1bff538fb61a116a650c5210d22f125b2bfd993ffb62be74e2e0c3a75559560b",
+      "target_sha256": "1bff538fb61a116a650c5210d22f125b2bfd993ffb62be74e2e0c3a75559560b"
+    },
+    {
+      "id": "renderer_ai_analyst",
+      "source_path": "07_ЧАТЫ/renderer_compatibility_check/patched/hermes/ai_analyst.py",
+      "package_path": "files/renderer/hermes/ai_analyst.py",
+      "target_path": "/opt/hermes/app/hermes/ai_analyst.py",
+      "synthetic_relative_path": "opt/hermes/app/hermes/ai_analyst.py",
+      "expected_previous_sha256": "9f837ec597b109329d8caf9477881a01e6cec791eef8130354950588385c3242",
+      "source_sha256": "8815da3bc31a4bb4c9a398c7c03b73f3c73daae319ab77bb9eac272bfc6ef41d",
+      "target_sha256": "8815da3bc31a4bb4c9a398c7c03b73f3c73daae319ab77bb9eac272bfc6ef41d"
+    }
+  ]
+}
